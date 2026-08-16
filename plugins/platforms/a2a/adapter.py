@@ -60,7 +60,8 @@ from . import protocol, security
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PORT = 9900
-_ORPHAN_TIMEOUT = 300  # seconds before a pending task is considered orphaned
+_ORPHAN_TIMEOUT = 300  # floor: seconds before a pending task is considered orphaned
+_ORPHAN_GRACE = 60  # slack added on top of a served agent's configured route timeout
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
@@ -72,6 +73,14 @@ def _reply_timeout() -> float:
         return max(1.0, float(os.getenv("A2A_REPLY_TIMEOUT", "300")))
     except (ValueError, TypeError):
         return 300.0
+
+
+def _truthy(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def _default_agent_name() -> str:
@@ -354,6 +363,11 @@ class A2AAdapter(BasePlatformAdapter):
         ]
         self._active_profile = _active_profile_name()
         self._agents = self._load_served_agents(extra)
+        # Hollow-reply guard: a forwarded profile that answers without a single
+        # tool call has no tool-backed evidence for its claims (a zero-tool
+        # worker fabricated OS error strings and was recorded a2a_complete).
+        # Default on; ``platforms.a2a.extra.require_tools: false`` disables.
+        self._require_tools = _truthy(extra.get("require_tools", True))
 
         self._httpd: Optional[_A2AServer] = None
         self._server_thread: Optional[threading.Thread] = None
@@ -472,12 +486,29 @@ class A2AAdapter(BasePlatformAdapter):
 
     # ── Orphaned task watchdog ─────────────────────────────────────────────
 
+    def _orphan_timeout_for(self, agent_slug: str) -> int:
+        """Orphan deadline for a task routed to ``agent_slug``.
+
+        A forwarded profile may legitimately run for its configured route
+        ``timeout`` (e.g. 900 s); the watchdog must not fail the task at the
+        300 s floor while the subprocess is still allowed to run.
+        """
+        agent = self._agents.get(agent_slug or "") or {}
+        try:
+            route_timeout = int(agent.get("timeout") or 0)
+        except (TypeError, ValueError):
+            route_timeout = 0
+        return max(_ORPHAN_TIMEOUT, route_timeout + _ORPHAN_GRACE)
+
     def _watchdog_loop(self) -> None:
         """Background thread that fails orphaned tasks (keeps them queryable)."""
         while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
             try:
-                for tid in self.tasks.fail_orphans(_ORPHAN_TIMEOUT):
-                    logger.warning("A2A: orphaned task %s marked failed (timeout %ds)", tid, _ORPHAN_TIMEOUT)
+                for tid in self.tasks.fail_orphans(
+                    _ORPHAN_TIMEOUT,
+                    timeout_for=lambda rec: self._orphan_timeout_for(rec.get("agent_slug", "")),
+                ):
+                    logger.warning("A2A: orphaned task %s marked failed", tid)
                     protocol.metrics.tasks_failed += 1
             except Exception:
                 logger.debug("A2A: watchdog error", exc_info=True)
@@ -748,7 +779,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._register_inline_push(task_id, params, agent=agent)
 
         if not agent.get("local", True):
-            reply, state = self._forward_to_profile(agent, peer, context_id, framed)
+            reply, state = self._forward_to_profile(agent, peer, context_id, framed, task_id=task_id)
             self.tasks.complete(task_id, state, reply)
             protocol.persist_message(context_id, "agent", reply, task_id)
             security.audit("outbound", peer, task_id, reply)
@@ -885,6 +916,47 @@ class A2AAdapter(BasePlatformAdapter):
             logger.debug("A2A: could not read forwarded reply", exc_info=True)
             return ""
 
+    def _forward_tool_call_count(
+        self, profile: str, session_id: str, after_id: int = 0
+    ) -> Optional[int]:
+        """Return how many tool calls the forwarded turn made, or None if unreadable.
+
+        Prefers per-turn evidence (tool rows persisted after the transcript
+        boundary, so a resumed session's earlier turns do not vouch for this
+        one); falls back to the session-level ``tool_call_count`` counter.
+        """
+        db = self._profile_state_db(profile)
+        if not db or not os.path.exists(db) or not session_id:
+            return None
+        con = None
+        try:
+            con = sqlite3.connect(db, timeout=5)
+            try:
+                row = con.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE session_id = ? AND id > ? "
+                    "AND (role = 'tool' OR TRIM(COALESCE(tool_calls, '')) NOT IN ('', '[]', 'null'))",
+                    (session_id, after_id),
+                ).fetchone()
+                if row is not None:
+                    return int(row[0])
+            except sqlite3.OperationalError:
+                # Legacy/foreign schema without messages.tool_calls — fall back
+                # to the session-level counter (cumulative across turns).
+                logger.debug("A2A: per-turn tool-call query unavailable", exc_info=True)
+            row = con.execute(
+                "SELECT tool_call_count FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            return int(row[0])
+        except Exception:
+            logger.debug("A2A: could not read forwarded tool_call_count", exc_info=True)
+            return None
+        finally:
+            if con is not None:
+                con.close()
+
     def _title_forward_session(self, profile: str, session_id: str, title: str) -> None:
         db = self._profile_state_db(profile)
         if not db or not os.path.exists(db) or not session_id:
@@ -980,7 +1052,25 @@ class A2AAdapter(BasePlatformAdapter):
             raise
         return proc.returncode, stdout or "", stderr or ""
 
-    def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str) -> tuple[str, str]:
+    @staticmethod
+    def _nonzero_exit_reply(slug: str, returncode: int, stderr: str) -> str:
+        """Structured failure text for a forwarded CLI that exited nonzero.
+
+        Only the last non-empty stderr line (capped at 200 chars) is quoted —
+        stdout is never returned as if it were the profile's answer.
+        """
+        last = ""
+        for line in reversed((stderr or "").splitlines()):
+            if line.strip():
+                last = line.strip()
+                break
+        last = security.redact_outbound(last)[:200]
+        detail = f": {last}" if last else ""
+        return f"[profile {slug} failed rc={returncode}{detail}]"
+
+    def _forward_to_profile(
+        self, agent: dict, peer: str, context_id: str, framed_text: str, task_id: str = ""
+    ) -> tuple[str, str]:
         """Forward a routed A2A task to another local Hermes profile.
 
         First contact creates a normal ``source=a2a`` CLI session, records its
@@ -1050,8 +1140,10 @@ class A2AAdapter(BasePlatformAdapter):
                     self._profile_sessions[key] = session_id
                     self._title_forward_session(profile, session_id, session_title)
                     self._end_forward_session(profile, session_id, "a2a_failed")
-                msg = (stderr or stdout or f"profile exited {returncode}").strip()
-                return security.redact_outbound(msg[-2000:]), protocol.STATE_FAILED
+                # Never surface stdout as an answer: a failed CLI run prints
+                # its session banner (``session_id: …``) and that used to be
+                # returned as if it were the reply.
+                return self._nonzero_exit_reply(slug, returncode, stderr), protocol.STATE_FAILED
             if not session_id:
                 session_id = self._latest_a2a_session(profile, start)
                 if session_id:
@@ -1063,6 +1155,24 @@ class A2AAdapter(BasePlatformAdapter):
             if not reply:
                 self._end_forward_session(profile, session_id, "a2a_reply_missing")
                 return "[profile produced no persisted reply]", protocol.STATE_FAILED
+            if self._require_tools:
+                tool_calls = self._forward_tool_call_count(
+                    profile, session_id, after_id=message_watermark
+                )
+                if not tool_calls:
+                    detail = "0 tool calls" if tool_calls == 0 else "tool_call_count unreadable"
+                    reason = "HOLLOW: profile produced no tool-backed evidence"
+                    logger.warning(
+                        "A2A: forwarded task to profile %r (agent %r, session %s) %s — %s; "
+                        "reply discarded (%d chars). Set platforms.a2a.extra.require_tools=false to allow.",
+                        profile, slug, session_id, detail, reason, len(reply),
+                    )
+                    security.audit(
+                        "hollow", peer, task_id or "",
+                        f"{reason} ({detail}); profile={profile} agent={slug} session={session_id}",
+                    )
+                    self._end_forward_session(profile, session_id, "a2a_hollow")
+                    return f"[profile {slug} HOLLOW: {detail}]", protocol.STATE_FAILED
             if not self._end_forward_session(profile, session_id, "a2a_complete"):
                 return "[profile reply session could not be finalized]", protocol.STATE_FAILED
             return security.redact_outbound(reply), protocol.STATE_COMPLETED

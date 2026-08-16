@@ -35,21 +35,50 @@ from hermes_cli.tools_config import (
 
 
 
-def test_all_invalid_platform_toolsets_logs_runtime_warning(caplog):
-    """#38798: an explicit platform config whose toolset names are all invalid
-    (e.g. 'hermes' instead of 'hermes-cli') must warn at resolve time so an
-    already-corrupted config is caught at runtime, not just during migration."""
+def test_all_invalid_platform_toolsets_raises_toolset_config_error():
+    """#38798 (local patch): an explicit platform config whose toolset names are
+    all invalid (e.g. 'hermes' instead of 'hermes-cli') is a fatal config error
+    at resolve time — a zero-tool platform must never start silently."""
+    from hermes_cli.tools_config import ToolsetConfigError
+
+    config = {"platform_toolsets": {"cli": ["hermes", "bogus"]}}
+    with pytest.raises(ToolsetConfigError) as exc_info:
+        _get_platform_tools(config, "cli")
+    err = exc_info.value
+    assert err.platform == "cli"
+    assert err.invalid_names == ["hermes", "bogus"]
+    msg = str(err)
+    assert "hermes" in msg and "bogus" in msg
+    assert err.config_path and err.config_path in msg
+    assert "#38798" in msg
+    assert isinstance(err, ValueError)
+
+
+def test_all_invalid_platform_toolsets_lenient_mode_logs_runtime_warning(caplog):
+    """The reconfiguration UI resolves with strict=False so the operator can
+    still repair the list; that path keeps the once-per-platform WARNING."""
     import hermes_cli.tools_config as _tc
-    # The runtime warning fires once per platform per process; clear the guard
-    # so this test is deterministic regardless of prior resolutions.
     _tc._warned_invalid_platform_toolsets.discard("cli")
     config = {"platform_toolsets": {"cli": ["hermes"]}}
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.tools_config"):
-        _get_platform_tools(config, "cli")
+        _get_platform_tools(config, "cli", strict=False)
 
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("#38798" in m and "hermes" in m for m in warnings), warnings
+
+
+def test_intentionally_empty_platform_toolsets_stays_allowed():
+    """An explicit empty list is a legitimate 'no configurable tools' choice."""
+    config = {"platform_toolsets": {"cli": []}}
+    _get_platform_tools(config, "cli")  # must not raise
+
+
+def test_platform_toolset_summary_survives_all_invalid_platform():
+    """Summary/reconfigure helpers must not crash on a corrupt platform entry."""
+    config = {"platform_toolsets": {"cli": ["hermes"]}}
+    summary = _platform_toolset_summary(config, platforms=["cli"])
+    assert "cli" in summary
 
 
 def test_valid_platform_toolsets_no_runtime_warning(caplog):

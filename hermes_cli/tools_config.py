@@ -79,6 +79,23 @@ def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
 # every tool resolution for a persistently-corrupt config (#38798).
 _warned_invalid_platform_toolsets: Set[str] = set()
 
+
+class ToolsetConfigError(ValueError):
+    """Raised when a platform's explicit ``platform_toolsets`` list names only
+    unknown toolsets, so the platform would silently run with zero tools
+    (#38798). Carries ``platform``, ``invalid_names`` and ``config_path``."""
+
+    def __init__(self, platform: str, invalid_names: list, config_path: str):
+        self.platform = platform
+        self.invalid_names = list(invalid_names)
+        self.config_path = config_path
+        super().__init__(
+            f"platform_toolsets.{platform} in {config_path} names only unknown "
+            f"toolset(s): {', '.join(self.invalid_names)} — the platform would run "
+            f"with NO tools. Fix the name(s) (e.g. 'hermes-{platform}') or run "
+            f"`hermes tools` to reconfigure. See issue #38798."
+        )
+
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 
@@ -2504,7 +2521,7 @@ def _platform_toolset_summary(config: dict, platforms: Optional[List[str]] = Non
 
     summary: Dict[str, Set[str]] = {}
     for pkey in platforms:
-        summary[pkey] = _get_platform_tools(config, pkey)
+        summary[pkey] = _get_platform_tools(config, pkey, strict=False)
     return summary
 
 
@@ -2648,8 +2665,17 @@ def _get_platform_tools(
     platform: str,
     *,
     include_default_mcp_servers: bool = True,
+    strict: bool = True,
 ) -> Set[str]:
-    """Resolve which individual toolset names are enabled for a platform."""
+    """Resolve which individual toolset names are enabled for a platform.
+
+    ``strict`` (default): raise :class:`ToolsetConfigError` when the platform's
+    explicit toolset list is non-empty but every name is unknown (#38798), so
+    a corrupted config fails loudly instead of silently yielding zero tools.
+    The ``hermes tools`` reconfiguration UI passes ``strict=False`` so the
+    operator can still repair the list; an intentionally empty list is always
+    allowed.
+    """
     from toolsets import resolve_toolset, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}
@@ -2934,19 +2960,23 @@ def _get_platform_tools(
         from toolsets import validate_toolset
 
         _named = [str(t) for t in _explicit if isinstance(t, str) and t]
-        if (
-            _named
-            and not any(validate_toolset(t) for t in _named)
-            and platform not in _warned_invalid_platform_toolsets
-        ):
-            _warned_invalid_platform_toolsets.add(platform)
-            logger.warning(
-                "platform '%s' has no valid toolsets configured (unknown "
-                "name(s): %s) - tools will be unavailable. Run `hermes tools` "
-                "to reconfigure. See issue #38798.",
-                platform,
-                ", ".join(_named),
-            )
+        if _named and not any(validate_toolset(t) for t in _named):
+            if strict:
+                try:
+                    from hermes_cli.config import get_config_path
+                    _cfg_path = str(get_config_path())
+                except Exception:
+                    _cfg_path = "config.yaml"
+                raise ToolsetConfigError(platform, _named, _cfg_path)
+            if platform not in _warned_invalid_platform_toolsets:
+                _warned_invalid_platform_toolsets.add(platform)
+                logger.warning(
+                    "platform '%s' has no valid toolsets configured (unknown "
+                    "name(s): %s) - tools will be unavailable. Run `hermes tools` "
+                    "to reconfigure. See issue #38798.",
+                    platform,
+                    ", ".join(_named),
+                )
 
     return enabled_toolsets
 
@@ -5302,6 +5332,7 @@ def _toolset_enabled_for_reconfigure(ts_key: str, config: dict) -> bool:
                 config,
                 platform,
                 include_default_mcp_servers=False,
+                strict=False,
             )
         except Exception:
             continue
@@ -5668,7 +5699,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     if first_install:
         for pkey in enabled_platforms:
             pinfo = PLATFORMS[pkey]
-            current_enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
+            current_enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False, strict=False)
 
             # Uncheck toolsets that should be off by default
             checklist_preselected = current_enabled - _DEFAULT_OFF_TOOLSETS
@@ -5737,7 +5768,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     platform_keys = []
     for pkey in enabled_platforms:
         pinfo = PLATFORMS[pkey]
-        current = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
+        current = _get_platform_tools(config, pkey, include_default_mcp_servers=False, strict=False)
         count = len(current)
         total = len(_get_effective_configurable_toolsets())
         platform_choices.append(f"Configure {pinfo['label']}  ({count}/{total} enabled)")
@@ -5784,7 +5815,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             # Use the union of all platforms' current tools as the starting state
             all_current = set()
             for pk in platform_keys:
-                all_current |= _get_platform_tools(config, pk, include_default_mcp_servers=False)
+                all_current |= _get_platform_tools(config, pk, include_default_mcp_servers=False, strict=False)
             new_enabled = _prompt_toolset_checklist(
                 "All platforms",
                 all_current,
@@ -5815,7 +5846,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
 
             if new_enabled != all_current or selected_to_configure:
                 for pk in platform_keys:
-                    prev = _get_platform_tools(config, pk, include_default_mcp_servers=False)
+                    prev = _get_platform_tools(config, pk, include_default_mcp_servers=False, strict=False)
                     # Scope the printed diff to the checklist's universe (see
                     # _checklist_toolset_keys) so non-configurable toolsets like
                     # ``kanban`` aren't reported as added/removed.
@@ -5850,7 +5881,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                 print(color("  ✓ Saved configuration for all platforms", Colors.GREEN))
                 # Update choice labels
                 for ci, pk in enumerate(platform_keys):
-                    new_count = len(_get_platform_tools(config, pk, include_default_mcp_servers=False))
+                    new_count = len(_get_platform_tools(config, pk, include_default_mcp_servers=False, strict=False))
                     total = len(_get_effective_configurable_toolsets())
                     platform_choices[ci] = f"Configure {PLATFORMS[pk]['label']}  ({new_count}/{total} enabled)"
             else:
@@ -5862,7 +5893,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         pinfo = PLATFORMS[pkey]
 
         # Get current enabled toolsets for this platform
-        current_enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
+        current_enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False, strict=False)
 
         # Show checklist
         new_enabled = _prompt_toolset_checklist(
@@ -5935,7 +5966,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         print()
 
         # Update the choice label with new count
-        new_count = len(_get_platform_tools(config, pkey, include_default_mcp_servers=False))
+        new_count = len(_get_platform_tools(config, pkey, include_default_mcp_servers=False, strict=False))
         total = len(_get_effective_configurable_toolsets())
         platform_choices[idx] = f"Configure {pinfo['label']}  ({new_count}/{total} enabled)"
 
@@ -6133,7 +6164,7 @@ def _configure_mcp_tools_interactive(config: dict):
 
 def _apply_toolset_change(config: dict, platform: str, toolset_names: List[str], action: str):
     """Add or remove built-in toolsets for a platform."""
-    enabled = _get_platform_tools(config, platform, include_default_mcp_servers=False)
+    enabled = _get_platform_tools(config, platform, include_default_mcp_servers=False, strict=False)
     if action == "disable":
         updated = enabled - set(toolset_names)
     else:
@@ -6245,7 +6276,7 @@ def tools_disable_enable_command(args):
         return
 
     if action == "list":
-        _print_tools_list(_get_platform_tools(config, platform, include_default_mcp_servers=False),
+        _print_tools_list(_get_platform_tools(config, platform, include_default_mcp_servers=False, strict=False),
                           config.get("mcp_servers") or {}, platform)
         return
 

@@ -30,7 +30,7 @@ from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 PROTOCOL_VERSION = "1.0"
 
@@ -748,13 +748,30 @@ class TaskStore:
             return page, next_offset, total
         return page, next_offset
 
-    def fail_orphans(self, timeout_seconds: int = 300) -> list[str]:
+    def fail_orphans(
+        self,
+        timeout_seconds: int = 300,
+        timeout_for: Optional[Callable[[dict], int]] = None,
+    ) -> list[str]:
+        """Fail non-terminal tasks older than their deadline.
+
+        ``timeout_for(rec)`` may return a per-task deadline (seconds); when it
+        is absent or raises, ``timeout_seconds`` applies.
+        """
+        def _deadline(rec: dict) -> float:
+            if timeout_for is not None:
+                try:
+                    return float(timeout_for(rec))
+                except Exception:
+                    pass
+            return float(timeout_seconds)
+
         with self._lock:
             now = time.time()
             stale = [
                 tid for tid, rec in self._tasks.items()
                 if rec["state"] not in TERMINAL_STATES
-                and now - rec["created_at"] > timeout_seconds
+                and now - rec["created_at"] > _deadline(rec)
             ]
         failed = []
         for tid in stale:

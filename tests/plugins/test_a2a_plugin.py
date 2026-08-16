@@ -26,6 +26,12 @@ import pytest
 
 from plugins.platforms.a2a import protocol, security, tools
 
+# One tool call — the minimum tool-backed evidence the hollow-reply guard
+# accepts from a forwarded profile (adapter.require_tools, default on).
+_FAKE_TOOL_CALLS = [
+    {"id": "call-1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+]
+
 
 def _free_port() -> int:
     s = socket.socket()
@@ -1408,7 +1414,7 @@ class TestMultiAgentRouting:
         }))
         agent = adapter._agents["dev"]
 
-        def fake_forward(agent_arg, peer, context_id, framed_text):
+        def fake_forward(agent_arg, peer, context_id, framed_text, task_id=""):
             assert agent_arg["slug"] == "dev"
             assert peer == "peer-x"
             assert "hello" in framed_text
@@ -1624,7 +1630,7 @@ class TestV1SpecRegressionFixes:
         con = sqlite3.connect(db)
         con.execute(
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, "
-            "title TEXT, ended_at REAL, end_reason TEXT)"
+            "title TEXT, ended_at REAL, end_reason TEXT, tool_call_count INTEGER DEFAULT 0)"
         )
         con.execute(
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
@@ -1646,6 +1652,7 @@ con = sqlite3.connect(os.path.join(home, 'state.db'))
 if '--resume' not in sys.argv:
     con.execute('INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)', ('sess-1', 'a2a', time.time(), None))
 con.execute('INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)', ('sess-1', 'assistant', 'fake reply'))
+con.execute('UPDATE sessions SET tool_call_count = tool_call_count + 1 WHERE id = ?', ('sess-1',))
 con.commit()
 print('fake reply')
 """, encoding="utf-8")
@@ -1689,6 +1696,9 @@ print('fake reply')
             calls.append(cmd)
             store = SessionDB(state_path)
             store.create_session("sess-route-pin", "a2a", model="subs/codex")
+            store.append_message(
+                "sess-route-pin", "assistant", content="", tool_calls=_FAKE_TOOL_CALLS
+            )
             store.append_message(
                 "sess-route-pin", "assistant", content="route pin reply"
             )
@@ -1754,6 +1764,9 @@ print('fake reply')
             store = SessionDB(state_path)
             store.create_session(session_id, "a2a", model="test-model")
             store.append_message(
+                session_id, "assistant", content="", tool_calls=_FAKE_TOOL_CALLS
+            )
+            store.append_message(
                 session_id, "assistant", content=f"reply-{index}"
             )
             store.close()
@@ -1813,6 +1826,9 @@ print('fake reply')
         def fake_run_command(cmd, timeout, env):
             store = SessionDB(state_path)
             store.create_session("sess-clean", "a2a", model="test-model")
+            store.append_message(
+                "sess-clean", "assistant", content="", tool_calls=_FAKE_TOOL_CALLS
+            )
             store.append_message(
                 "sess-clean", "assistant", content="", reasoning="private reasoning"
             )
@@ -1996,7 +2012,8 @@ print('fake reply')
         )
 
         assert state == protocol.STATE_FAILED
-        assert reply == "provider failed"
+        assert reply == "[profile dev failed rc=7: provider failed]"
+        assert "internal stdout" not in reply
         store = SessionDB(state_path, read_only=True)
         session = store.get_session("sess-error")
         store.close()
@@ -2088,6 +2105,9 @@ print('fake reply')
             store = SessionDB(state_path)
             store.create_session("sess-final", "a2a", model="test-model")
             store.append_message(
+                "sess-final", "assistant", content="", tool_calls=_FAKE_TOOL_CALLS
+            )
+            store.append_message(
                 "sess-final", "assistant", content="final reply"
             )
             store.close()
@@ -2133,6 +2153,9 @@ print('fake reply')
             store = SessionDB(state_path)
             store.create_session("sess-agent-close", "a2a", model="test-model")
             store.append_message(
+                "sess-agent-close", "assistant", content="", tool_calls=_FAKE_TOOL_CALLS
+            )
+            store.append_message(
                 "sess-agent-close", "assistant", content="final reply"
             )
             store.end_session("sess-agent-close", "agent_close")
@@ -2177,6 +2200,9 @@ print('fake reply')
         def fake_run_command(cmd, timeout, env):
             store = SessionDB(state_path)
             store.create_session("sess-compressed", "a2a", model="test-model")
+            store.append_message(
+                "sess-compressed", "assistant", content="", tool_calls=_FAKE_TOOL_CALLS
+            )
             store.append_message(
                 "sess-compressed", "assistant", content="stale reply"
             )
@@ -2276,3 +2302,197 @@ time.sleep(60)
         assert session is not None
         assert session["ended_at"] is not None
         assert session["end_reason"] == "a2a_timeout"
+
+
+class TestForwardHollowGuardAndFailures:
+    """Local patches 2026-08-17: hollow-reply guard, structured nonzero-exit
+    replies, and a watchdog that honors the served agent's route timeout."""
+
+    @staticmethod
+    def _adapter(monkeypatch, tmp_path, fake_run_command, extra_agent=None, extra_top=None):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir(exist_ok=True)
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        agent_cfg = {"profile": "dev", "tenant": "dev", "timeout": 5}
+        agent_cfg.update(extra_agent or {})
+        extra = {"agents": {"dev": agent_cfg}}
+        extra.update(extra_top or {})
+        return A2AAdapter(PlatformConfig(enabled=True, extra=extra)), state_path
+
+    def test_zero_tool_calls_is_hollow_and_failed(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+
+        audit_path = tmp_path / "audit.jsonl"
+        monkeypatch.setattr("plugins.platforms.a2a.security._audit_path", lambda: audit_path)
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(tmp_path / "profile" / "state.db")
+            store.create_session("sess-hollow", "a2a", model="test-model")
+            # One API call, no tools — the fabricated-OS-error shape.
+            store.append_message(
+                "sess-hollow", "assistant",
+                content="Error: getaddrinfo failed; mktemp /tmp Operation not permitted",
+            )
+            store.close()
+            return 0, "session_id: sess-hollow", ""
+
+        adapter, state_path = self._adapter(monkeypatch, tmp_path, fake_run_command)
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-hollow", "verify the build", task_id="task-h"
+        )
+
+        assert state == protocol.STATE_FAILED
+        assert reply == "[profile dev HOLLOW: 0 tool calls]"
+        assert "getaddrinfo" not in reply
+        session = SessionDB(state_path, read_only=True).get_session("sess-hollow")
+        assert session["end_reason"] == "a2a_hollow"
+        lines = [json.loads(l) for l in audit_path.read_text().splitlines()]
+        hollow = [l for l in lines if l["direction"] == "hollow"]
+        assert hollow and hollow[0]["task_id"] == "task-h"
+        assert "HOLLOW: profile produced no tool-backed evidence" in hollow[0]["summary"]
+
+    def test_hollow_guard_counts_only_this_turn_on_resume(self, monkeypatch, tmp_path):
+        """A resumed session whose EARLIER turn used tools must not vouch for a
+        new turn that made zero tool calls."""
+        from hermes_state import SessionDB
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(tmp_path / "profile" / "state.db")
+            store.append_message("sess-resume", "assistant", content="turn two, no tools")
+            store.close()
+            return 0, "", ""
+
+        adapter, state_path = self._adapter(monkeypatch, tmp_path, fake_run_command)
+        store = SessionDB(state_path)
+        store.create_session("sess-resume", "a2a", model="test-model")
+        store.append_message("sess-resume", "assistant", content="", tool_calls=_FAKE_TOOL_CALLS)
+        store.append_message("sess-resume", "assistant", content="turn one reply")
+        store.close()
+        adapter._profile_sessions[("dev", "dev", "ctx-resume")] = "sess-resume"
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-resume", "again"
+        )
+        assert state == protocol.STATE_FAILED
+        assert reply == "[profile dev HOLLOW: 0 tool calls]"
+
+    def test_require_tools_false_allows_tool_free_reply(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(tmp_path / "profile" / "state.db")
+            store.create_session("sess-chat", "a2a", model="test-model")
+            store.append_message("sess-chat", "assistant", content="just chatting")
+            store.close()
+            return 0, "", ""
+
+        adapter, _ = self._adapter(
+            monkeypatch, tmp_path, fake_run_command, extra_top={"require_tools": False}
+        )
+        assert adapter._require_tools is False
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-chat", "hi"
+        )
+        assert (reply, state) == ("just chatting", protocol.STATE_COMPLETED)
+
+    def test_require_tools_accepts_string_false(self, monkeypatch, tmp_path):
+        adapter, _ = self._adapter(
+            monkeypatch, tmp_path, lambda *a: (0, "", ""), extra_top={"require_tools": "false"}
+        )
+        assert adapter._require_tools is False
+        adapter2, _ = self._adapter(monkeypatch, tmp_path, lambda *a: (0, "", ""))
+        assert adapter2._require_tools is True
+
+    def test_tool_backed_reply_still_completes(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(tmp_path / "profile" / "state.db")
+            store.create_session("sess-real", "a2a", model="test-model")
+            store.append_message("sess-real", "assistant", content="", tool_calls=_FAKE_TOOL_CALLS)
+            store.append_message("sess-real", "tool", content="file contents", tool_call_id="call-1", tool_name="read_file")
+            store.append_message("sess-real", "assistant", content="verified: 3 tests pass")
+            store.close()
+            return 0, "", ""
+
+        adapter, state_path = self._adapter(monkeypatch, tmp_path, fake_run_command)
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-real", "verify"
+        )
+        assert (reply, state) == ("verified: 3 tests pass", protocol.STATE_COMPLETED)
+        assert adapter._forward_tool_call_count("dev", "sess-real") >= 1
+
+    def test_nonzero_exit_never_returns_stdout(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(tmp_path / "profile" / "state.db")
+            store.create_session("sess-rc", "a2a", model="test-model")
+            store.append_message("sess-rc", "assistant", content="partial answer")
+            store.close()
+            return 2, "session_id: 2026-08-15-abc\npartial answer\n", "Traceback...\n\nRuntimeError: " + ("x" * 500) + "\n\n"
+
+        adapter, state_path = self._adapter(monkeypatch, tmp_path, fake_run_command)
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-rc", "hello"
+        )
+        assert state == protocol.STATE_FAILED
+        assert reply.startswith("[profile dev failed rc=2: RuntimeError: xxx")
+        assert reply.endswith("]")
+        assert len(reply) <= len("[profile dev failed rc=2: ]") + 200
+        assert "session_id" not in reply and "partial answer" not in reply
+        session = SessionDB(state_path, read_only=True).get_session("sess-rc")
+        assert session["end_reason"] == "a2a_failed"
+
+    def test_nonzero_exit_without_stderr(self, monkeypatch, tmp_path):
+        adapter, _ = self._adapter(
+            monkeypatch, tmp_path, lambda cmd, timeout, env: (1, "session_id: only-stdout", "")
+        )
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-rc2", "hello"
+        )
+        assert (reply, state) == ("[profile dev failed rc=1]", protocol.STATE_FAILED)
+
+    def test_orphan_timeout_honors_route_timeout(self, monkeypatch, tmp_path):
+        from plugins.platforms.a2a import adapter as adapter_mod
+
+        adapter, _ = self._adapter(
+            monkeypatch, tmp_path, lambda *a: (0, "", ""), extra_agent={"timeout": 900}
+        )
+        assert adapter._orphan_timeout_for("dev") == 960
+        # Short route timeouts keep the 300 s floor; unknown/default agent too.
+        adapter._agents["dev"]["timeout"] = 5
+        assert adapter._orphan_timeout_for("dev") == adapter_mod._ORPHAN_TIMEOUT
+        assert adapter._orphan_timeout_for("") == adapter_mod._ORPHAN_TIMEOUT
+        assert adapter._orphan_timeout_for("nope") == adapter_mod._ORPHAN_TIMEOUT
+
+    def test_watchdog_does_not_fail_long_route_task_at_floor(self, monkeypatch, tmp_path):
+        import time as _time
+
+        adapter, _ = self._adapter(
+            monkeypatch, tmp_path, lambda *a: (0, "", ""), extra_agent={"timeout": 900}
+        )
+        adapter.tasks.create("t-long", "ctx", "peer", "dev", "dev")
+        adapter.tasks.create("t-default", "ctx", "peer", "", "")
+        for rec in adapter.tasks._tasks.values():
+            rec["created_at"] = _time.time() - 400  # past the 300 s floor
+        timeout_for = lambda rec: adapter._orphan_timeout_for(rec.get("agent_slug", ""))
+        failed = adapter.tasks.fail_orphans(300, timeout_for=timeout_for)
+        assert failed == ["t-default"]
+        assert adapter.tasks._tasks["t-long"]["state"] == protocol.STATE_WORKING or \
+            adapter.tasks._tasks["t-long"]["state"] == protocol.STATE_SUBMITTED
+        adapter.tasks._tasks["t-long"]["created_at"] = _time.time() - 1000
+        assert adapter.tasks.fail_orphans(300, timeout_for=timeout_for) == ["t-long"]
