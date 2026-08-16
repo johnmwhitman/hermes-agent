@@ -5574,10 +5574,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except (TypeError, ValueError):
                 pass
         
-        # Fallback provider chain — tried in order when primary fails after retries.
-        # Merge new ``fallback_providers`` entries with any legacy
-        # ``fallback_model`` entries so old configs still participate.
-        self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        # Fallback provider chain — tried in order when the configured primary
+        # fails after retries. An explicit CLI model/provider is a route pin:
+        # silently serving a configured fallback under that explicit selection
+        # misreports which model handled the request.
+        self._fallback_model = (
+            [] if model is not None or provider is not None
+            else get_fallback_chain(CLI_CONFIG)
+        )
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
@@ -10464,6 +10468,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Best-effort: an unreachable config default must never block
                 # /new. The session keeps the current working model.
                 logger.debug("/new model reset to config default failed", exc_info=True)
+        HermesCLI._set_model_switch_fallback_policy(self, disabled=False)
         _sync_process_session_id(self.session_id)
 
         if self.agent:
@@ -11572,10 +11577,97 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "active_agent_route_signature": copy.deepcopy(
+                getattr(self, "_active_agent_route_signature", None)
+            ),
+            "cli_fallback_model": copy.deepcopy(
+                getattr(self, "_fallback_model", [])
+            ),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
+            "agent_model": getattr(agent, "model", "") if agent is not None else "",
+            "agent_provider": (
+                getattr(agent, "provider", "") if agent is not None else ""
+            ),
+            "agent_api_key": (
+                getattr(agent, "api_key", "") if agent is not None else ""
+            ),
+            "agent_base_url": (
+                getattr(agent, "base_url", "") if agent is not None else ""
+            ),
+            "agent_api_mode": (
+                getattr(agent, "api_mode", "") if agent is not None else ""
+            ),
+            "agent_capabilities": copy.deepcopy(
+                getattr(agent, "runtime_capabilities", None)
+            ) if agent is not None else None,
+            "agent_fallback_chain": copy.deepcopy(
+                getattr(agent, "_fallback_chain", [])
+            ) if agent is not None else [],
+            "agent_fallback_model": copy.deepcopy(
+                getattr(agent, "_fallback_model", None)
+            ) if agent is not None else None,
+            "agent_fallback_index": (
+                getattr(agent, "_fallback_index", 0)
+                if agent is not None
+                else 0
+            ),
+            "agent_fallback_activated": (
+                bool(getattr(agent, "_fallback_activated", False))
+                if agent is not None
+                else False
+            ),
+            "agent_rate_limited_until": (
+                getattr(agent, "_rate_limited_until", 0)
+                if agent is not None
+                else 0
+            ),
+            "agent_rate_limit_backoff_count": (
+                getattr(agent, "_rate_limit_backoff_count", 0)
+                if agent is not None
+                else 0
+            ),
         }
+
+    def _arm_pending_one_turn_session_runtime(self, agent=None, snapshot=None) -> None:
+        """Keep lazy session creation on the durable pre-``--once`` route."""
+        target = agent if agent is not None else getattr(self, "agent", None)
+        if target is None:
+            return
+        if snapshot is None:
+            snapshot = getattr(self, "_pending_one_turn_model_restore", None)
+        target._session_create_runtime_override = (
+            copy.deepcopy(snapshot) if isinstance(snapshot, dict) else None
+        )
+
+    def _set_model_switch_fallback_policy(self, *, disabled: bool) -> None:
+        """Clear a route pin or rehydrate the configured fallback chain."""
+        if disabled:
+            chain = []
+        else:
+            try:
+                from hermes_cli.config import load_config
+
+                fallback_config = load_config()
+            except Exception:
+                fallback_config = CLI_CONFIG
+            chain = get_fallback_chain(fallback_config)
+        chain = [
+            copy.deepcopy(entry)
+            for entry in (chain or [])
+            if isinstance(entry, dict) and entry.get("provider") and entry.get("model")
+        ]
+        self._fallback_model = chain
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return
+        agent._fallback_chain = copy.deepcopy(chain)
+        agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+        agent._rate_limited_until = 0
+        agent._rate_limit_backoff_count = 0
 
     def _restore_model_runtime_snapshot(self, snapshot: dict | None) -> None:
         """Restore a model runtime captured before a one-turn override."""
@@ -11593,34 +11685,62 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ):
             if key in snapshot:
                 setattr(self, key, snapshot.get(key))
+        self._fallback_model = copy.deepcopy(snapshot.get("cli_fallback_model", []))
 
         agent = getattr(self, "agent", None)
         if agent is None:
             return
 
-        primary = snapshot.get("agent_primary_runtime")
-        if primary and hasattr(agent, "_restore_primary_runtime"):
-            try:
-                agent._primary_runtime = copy.deepcopy(primary)
-                agent._fallback_activated = True
-                agent._rate_limited_until = 0
-                if agent._restore_primary_runtime():
-                    return
-            except Exception:
-                logger.debug("CLI one-turn model restore via primary runtime failed", exc_info=True)
-
         if hasattr(agent, "switch_model"):
-            try:
-                agent.switch_model(
-                    new_model=snapshot.get("model", ""),
-                    new_provider=snapshot.get("provider", ""),
-                    api_key=snapshot.get("api_key", ""),
-                    base_url=snapshot.get("base_url", ""),
-                    api_mode=snapshot.get("api_mode", ""),
-                    capabilities=snapshot.get("capabilities"),
-                )
-            except Exception as exc:
-                logger.warning("CLI one-turn model restore failed: %s", exc)
+            agent.switch_model(
+                new_model=snapshot.get("agent_model") or snapshot.get("model", ""),
+                new_provider=snapshot.get("agent_provider")
+                or snapshot.get("provider", ""),
+                api_key=snapshot.get("agent_api_key") or snapshot.get("api_key", ""),
+                base_url=snapshot.get("agent_base_url")
+                or snapshot.get("base_url", ""),
+                api_mode=snapshot.get("agent_api_mode")
+                or snapshot.get("api_mode", ""),
+                capabilities=snapshot.get("agent_capabilities"),
+            )
+        self._active_agent_route_signature = copy.deepcopy(
+            snapshot.get("active_agent_route_signature")
+        )
+        agent._primary_runtime = copy.deepcopy(snapshot.get("agent_primary_runtime"))
+        agent._fallback_chain = copy.deepcopy(
+            snapshot.get("agent_fallback_chain", [])
+        )
+        agent._fallback_model = copy.deepcopy(
+            snapshot.get("agent_fallback_model")
+        )
+        agent._fallback_index = int(
+            snapshot.get("agent_fallback_index", 0) or 0
+        )
+        agent._fallback_activated = bool(
+            snapshot.get("agent_fallback_activated", False)
+        )
+        agent._rate_limited_until = (
+            snapshot.get("agent_rate_limited_until", 0) or 0
+        )
+        agent._rate_limit_backoff_count = int(
+            snapshot.get("agent_rate_limit_backoff_count", 0) or 0
+        )
+
+    def _retry_blocked_one_turn_model_restore(self) -> bool:
+        """Retry a failed one-turn restore before allowing another prompt."""
+        snapshot = getattr(self, "_blocked_one_turn_model_restore", None)
+        if not isinstance(snapshot, dict):
+            return True
+        try:
+            self._restore_model_runtime_snapshot(snapshot)
+        except Exception as exc:
+            _cprint(
+                f"  ⚠ Previous one-turn model restore is still blocked ({exc}); "
+                "prompt not sent."
+            )
+            return False
+        self._blocked_one_turn_model_restore = None
+        return True
 
     @staticmethod
     def _filter_model_picker_entries(entries: list, query: str) -> list:
@@ -11776,6 +11896,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"staying on {old_model}."
                 )
                 return
+
+        # A picker/session selection is a route pin; a global selection adopts
+        # the configured fallback policy and must rehydrate any pruned entries.
+        HermesCLI._set_model_switch_fallback_policy(
+            self, disabled=not persist_global
+        )
 
         from hermes_cli.model_switch import format_model_for_display
         _display_old = format_model_for_display(old_model)
@@ -12116,7 +12242,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Update requested_provider so _ensure_runtime_credentials() doesn't
         # overwrite the switch on the next turn (it re-resolves from this).
         old_model = self.model
-        _one_turn_restore_snapshot = self._snapshot_model_runtime() if one_turn else None
+        _existing_one_turn_restore = getattr(
+            self, "_pending_one_turn_model_restore", None
+        )
+        _one_turn_restore_snapshot = (
+            copy.deepcopy(_existing_one_turn_restore)
+            if one_turn and isinstance(_existing_one_turn_restore, dict)
+            else (self._snapshot_model_runtime() if one_turn else None)
+        )
         # Snapshot CLI-level fields before mutation so a failed in-place swap
         # rolls the whole CLI back to the old working model (#50163).
         _cli_snapshot = {
@@ -12154,6 +12287,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=result.base_url,
                     api_mode=result.api_mode,
                     capabilities=getattr(result, "runtime_capabilities", None),
+                    persist_billing_route=not one_turn,
                 )
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a
@@ -12165,6 +12299,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"staying on {old_model}."
                 )
                 return
+
+        # Session and one-turn selections fail closed. Global selections reload
+        # configured fallbacks even if the prior pin/switch pruned the live chain.
+        HermesCLI._set_model_switch_fallback_policy(
+            self, disabled=not persist_global
+        )
 
         # Store a note to prepend to the next user message so the model
         # knows a switch occurred (avoids injecting system messages mid-history
@@ -16829,6 +16969,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
 
+        if not self._retry_blocked_one_turn_model_restore():
+            return None
+
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
             return None
@@ -16840,6 +16983,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Initialize agent if needed
         if self.agent is None:
             _cprint(f"{_DIM}Initializing agent...{_RST}")
+        else:
+            self._arm_pending_one_turn_session_runtime(self.agent)
         if not self._init_agent(
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
@@ -17152,6 +17297,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self, "_pending_one_turn_model_restore", None
                 )
                 self._pending_one_turn_model_restore = None
+                _one_turn_agent = self.agent
+                if _one_turn_model_restore and _one_turn_agent is not None:
+                    self._arm_pending_one_turn_session_runtime(
+                        _one_turn_agent, _one_turn_model_restore
+                    )
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
@@ -17182,7 +17332,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     }
                 finally:
                     if _one_turn_model_restore:
-                        self._restore_model_runtime_snapshot(_one_turn_model_restore)
+                        try:
+                            self._restore_model_runtime_snapshot(_one_turn_model_restore)
+                            self._blocked_one_turn_model_restore = None
+                        except Exception as exc:
+                            self._blocked_one_turn_model_restore = copy.deepcopy(
+                                _one_turn_model_restore
+                            )
+                            _cprint(
+                                f"  ⚠ One-turn model restore failed ({exc}); "
+                                "future prompts are blocked until restoration succeeds."
+                            )
+                    if _one_turn_agent is not None:
+                        _one_turn_agent._session_create_runtime_override = None
                     # Surface any credit notices queued during the turn (cold-start
                     # seed / per-turn capture) now that the response is done — printing
                     # at this boundary paints cleanly above the prompt instead of being

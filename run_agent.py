@@ -678,10 +678,23 @@ class AIAgent:
                     _init_model_config["yolo_mode"] = True
             except Exception:
                 pass
+            _create_model = getattr(self, "model", "")
+            _create_runtime = getattr(
+                self, "_session_create_runtime_override", None
+            )
+            if isinstance(_create_runtime, dict):
+                _create_model = _create_runtime.get("model") or _create_model
+                _init_model_config = dict(_init_model_config or {})
+                for _key in ("model", "provider", "base_url", "api_mode"):
+                    _value = _create_runtime.get(_key)
+                    if _value:
+                        _init_model_config[_key] = _value
+                    else:
+                        _init_model_config.pop(_key, None)
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=source,
-                model=self.model,
+                model=_create_model,
                 model_config=_init_model_config,
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
@@ -914,6 +927,7 @@ class AIAgent:
         base_url='',
         api_mode='',
         capabilities=None,
+        persist_billing_route=True,
     ):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
@@ -925,6 +939,7 @@ class AIAgent:
             base_url,
             api_mode,
             capabilities,
+            persist_billing_route,
         )
 
     def _safe_print(self, *args, **kwargs):

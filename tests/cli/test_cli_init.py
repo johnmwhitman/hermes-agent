@@ -119,6 +119,19 @@ class TestFallbackChainInit:
             {"provider": "nous", "model": "Hermes-4"},
         ]
 
+    def test_explicit_model_provider_pin_disables_configured_fallbacks(self):
+        cli = _make_cli(
+            model="claude-fable-5",
+            provider="anthropic",
+            config_overrides={
+                "fallback_providers": [
+                    {"provider": "routeplane", "model": "subs/grok"},
+                ],
+            },
+        )
+
+        assert cli._fallback_model == []
+
 
 class TestBusyInputMode:
     def test_default_busy_input_mode_is_interrupt(self):

@@ -47,6 +47,36 @@ def test_portable_skill_namespace_is_ascii_safe():
     assert is_valid_namespace(namespace)
 
 
+def test_bundled_platform_with_client_tools_loads_eagerly(monkeypatch):
+    manifest = PluginManifest(
+        name="peer-platform",
+        source="bundled",
+        kind="platform",
+        key="platforms/peer",
+        provides_tools=["peer_call"],
+    )
+    manager = PluginManager()
+    eager = []
+    deferred = []
+    monkeypatch.setattr(
+        manager, "_collect_directory_manifests", lambda: [manifest]
+    )
+    monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+    monkeypatch.setattr(manager, "_load_plugin", lambda candidate: eager.append(candidate))
+    monkeypatch.setattr(
+        manager,
+        "_register_deferred_platform",
+        lambda candidate: deferred.append(candidate),
+    )
+    monkeypatch.setattr("hermes_cli.plugins._get_disabled_plugins", lambda: set())
+    monkeypatch.setattr("hermes_cli.plugins._get_enabled_plugins", lambda: set())
+
+    manager._discover_and_load_inner()
+
+    assert eager == [manifest]
+    assert deferred == []
+
+
 def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
                      manifest_extra: dict | None = None,
                      auto_enable: bool = True,

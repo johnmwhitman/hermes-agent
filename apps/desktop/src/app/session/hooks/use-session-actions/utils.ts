@@ -21,6 +21,7 @@ import {
   setCurrentCwdTransient,
   setCurrentFastMode,
   setCurrentModel,
+  setCurrentModelSource,
   setCurrentPersonality,
   setCurrentProvider,
   setCurrentReasoningEffort,
@@ -1664,6 +1665,10 @@ export function applyRuntimeInfo(
   if (foreground) {
     publishRuntimeToComposer(sessionState)
 
+    if (typeof info.fallback_disabled === 'boolean') {
+      setCurrentModelSource(info.fallback_disabled ? 'manual' : 'default')
+    }
+
     if (info.usage) {
       setCurrentUsage(current => ({ ...current, ...info.usage }))
     }
@@ -1677,6 +1682,7 @@ export function applyStoredSessionPreviewRuntimeInfo(
   storedSessionId: null | string
 ) {
   setCurrentModel(stored?.model || '')
+  setCurrentModelSource('')
   setCurrentProvider('')
   setCurrentReasoningEffort('')
   setCurrentServiceTier('')

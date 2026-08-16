@@ -2,7 +2,7 @@
 
 import json
 
-from hermes_cli.oneshot import _write_usage_file
+from hermes_cli.oneshot import _fallback_chain_for_selection, _write_usage_file
 
 
 def _result(**overrides):
@@ -53,5 +53,25 @@ class TestWriteUsageFile:
         assert report["failure"] == "boom"
         # Missing result fields serialize as null, not KeyError.
         assert report["estimated_cost_usd"] is None
+
+
+class TestExplicitRoutePin:
+    _CONFIG = {
+        "fallback_providers": [
+            {"provider": "routeplane", "model": "subs/grok"},
+        ],
+    }
+
+    def test_explicit_model_provider_disables_fallbacks(self):
+        assert _fallback_chain_for_selection(
+            self._CONFIG,
+            model="claude-fable-5",
+            provider="anthropic",
+        ) == []
+
+    def test_configured_default_keeps_fallbacks(self):
+        assert _fallback_chain_for_selection(self._CONFIG) == [
+            {"provider": "routeplane", "model": "subs/grok"},
+        ]
 
 

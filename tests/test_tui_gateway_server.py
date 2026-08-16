@@ -4061,6 +4061,33 @@ def test_stored_session_runtime_overrides_skips_bare_billing_provider(monkeypatc
     assert ov["model_override"]["provider"] == "custom:myendpoint"
 
 
+def test_stored_session_runtime_overrides_restores_route_pin_policy():
+    pinned = server._stored_session_runtime_overrides(
+        {
+            "model": "claude-fable-5",
+            "model_config": {
+                "provider": "anthropic",
+                "fallback_disabled": True,
+            },
+        }
+    )
+    assert pinned["model_override"]["fallback_disabled"] is True
+
+    unpinned = server._stored_session_runtime_overrides(
+        {
+            "model": "subs/minimax",
+            "model_config": {
+                "provider": "routeplane",
+                "fallback_disabled": False,
+            },
+        }
+    )
+    assert unpinned["model_override"]["fallback_disabled"] is False
+
+    legacy = server._stored_session_runtime_overrides({"model": "legacy/model"})
+    assert "fallback_disabled" not in legacy["model_override"]
+
+
 def test_stored_session_runtime_overrides_restores_explicit_normal_tier():
     overrides = server._stored_session_runtime_overrides(
         {
@@ -4441,6 +4468,108 @@ def test_apply_model_switch_persist_override_false_never_persists(monkeypatch):
     assert session["model_override"]["model"] == "new/model"
 
 
+def test_apply_model_switch_session_pin_disables_configured_fallbacks(monkeypatch):
+    import types as _types
+
+    result = _types.SimpleNamespace(
+        success=True,
+        new_model="claude-fable-5",
+        target_provider="anthropic",
+        base_url="https://api.anthropic.com",
+        api_key="token",
+        api_mode="anthropic_messages",
+        warning_message="",
+        model_info=None,
+        error_message="",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model", lambda **kw: result
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_persist_behavior", lambda *a, **k: False
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_load_fallback_model",
+        lambda: [{"provider": "routeplane", "model": "subs/grok"}],
+    )
+    persisted_overrides = []
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        server,
+        "_persist_live_session_runtime",
+        lambda sess: persisted_overrides.append(
+            dict(sess.get("model_override") or {})
+        ),
+    )
+    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
+
+    class _Agent:
+        model = "subs/minimax"
+        provider = "routeplane"
+        base_url = "http://127.0.0.1:4356/v1"
+        api_key = "routeplane-key"
+        api_mode = "chat_completions"
+        _fallback_chain = [
+            {"provider": "routeplane", "model": "subs/grok"},
+        ]
+        _fallback_model = _fallback_chain[0]
+        _fallback_index = 0
+        credential_pool = None
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.base_url = kwargs["base_url"]
+            self.api_key = kwargs["api_key"]
+            self.api_mode = kwargs["api_mode"]
+
+    agent = _Agent()
+    session = {
+        "agent": agent,
+        "history": [],
+        "session_key": "session-key",
+        "profile_home": None,
+    }
+
+    out = server._apply_model_switch(
+        "sid", session, "claude-fable-5 --provider anthropic"
+    )
+
+    assert out["value"] == "claude-fable-5"
+    assert agent._fallback_chain == []
+    assert agent._fallback_model is None
+    assert session["model_override"]["fallback_disabled"] is True
+    assert persisted_overrides[-1]["fallback_disabled"] is True
+
+    # Internal config-sync rebuilds are not user route pins and must retain the
+    # configured chain even though they also pass persist_override=False.
+    config_agent = _Agent()
+    config_agent._fallback_chain = []
+    config_session = {
+        "agent": config_agent,
+        "history": [],
+        "session_key": "config-session-key",
+        "profile_home": None,
+    }
+    server._apply_model_switch(
+        "config-sid",
+        config_session,
+        "claude-fable-5 --provider anthropic",
+        pin_session_override=False,
+        persist_override=False,
+    )
+    assert config_agent._fallback_chain == [
+        {"provider": "routeplane", "model": "subs/grok"},
+    ]
+    assert "model_override" not in config_session
+
+
 def test_startup_runtime_uses_tui_provider_env(monkeypatch):
     monkeypatch.setenv("HERMES_MODEL", "nous/hermes-test")
     monkeypatch.setenv("HERMES_TUI_PROVIDER", "nous")
@@ -4548,6 +4677,57 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
     assert agent.model == "gpt-5.5"
     assert captured["fallback_model"] == fallback_chain
     assert captured["platform"] == "tui"
+
+
+def test_make_agent_explicit_model_override_disables_configured_fallbacks(monkeypatch):
+    captured = {}
+    fallback_chain = [
+        {"provider": "routeplane", "model": "subs/grok"},
+    ]
+
+    def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(model=kwargs.get("model"))
+
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "model": {"default": "subs/minimax", "provider": "routeplane"},
+            "fallback_providers": fallback_chain,
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "token",
+            "api_mode": "anthropic_messages",
+            "credential_pool": None,
+        },
+    )
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    agent = server._make_agent(
+        "sid",
+        "session-key",
+        model_override={
+            "model": "claude-fable-5",
+            "provider": "anthropic",
+            "fallback_disabled": True,
+        },
+    )
+
+    assert agent.model == "claude-fable-5"
+    assert captured["fallback_model"] == []
 
 
 def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
@@ -7705,7 +7885,11 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
     server._ensure_session_db_row(
         {
             "session_key": "k1",
-            "model_override": {"model": "openai/gpt-5.5", "provider": "openrouter"},
+            "model_override": {
+                "model": "openai/gpt-5.5",
+                "provider": "openrouter",
+                "fallback_disabled": True,
+            },
             "create_reasoning_override": {"effort": "high"},
             "create_service_tier_override": "priority",
         }
@@ -7716,6 +7900,7 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
     assert row["model"] == "openai/gpt-5.5"
     assert row["model_config"]["model"] == "openai/gpt-5.5"
     assert row["model_config"]["provider"] == "openrouter"
+    assert row["model_config"]["fallback_disabled"] is True
     assert row["model_config"]["reasoning_config"] == {"effort": "high"}
     assert row["model_config"]["service_tier"] == "priority"
 
@@ -9976,8 +10161,14 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
         base_url = "https://openrouter.ai/api/v1"
         api_key = "sk-old"
         api_mode = "chat_completions"
+        _fallback_chain = [
+            {"provider": "routeplane", "model": "subs/grok"},
+        ]
+        _fallback_model = _fallback_chain[0]
+        _fallback_index = 0
 
         def switch_model(self, **kwargs):
+            self.last_switch = kwargs
             self.model = kwargs["new_model"]
             self.provider = kwargs["new_provider"]
             self.api_key = kwargs["api_key"]
@@ -10003,7 +10194,23 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
         "hermes_cli.model_switch.switch_model",
         lambda **kwargs: seen.update(kwargs) or result,
     )
+    durable_writes = []
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_persist_live_session_runtime",
+        lambda *_args: durable_writes.append("runtime"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_persist_live_session_system_prompt",
+        lambda *_args: durable_writes.append("prompt"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_append_model_switch_marker",
+        lambda *_args, **_kwargs: durable_writes.append("marker"),
+    )
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
     try:
@@ -10018,11 +10225,34 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
                 },
             }
         )
+        server.handle_request(
+            {
+                "id": "2",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "claude-sonnet-4.6 --provider anthropic --once",
+                },
+            }
+        )
 
         assert resp["result"]["scope"] == "once"
         assert seen["is_global"] is False
         assert agent.model == "claude-sonnet-4.6"
+        assert agent.last_switch["persist_billing_route"] is False
+        assert agent._fallback_chain == []
+        assert durable_writes == []
         assert session["one_turn_model_restore"]["model"] == "old/model"
+        assert session["one_turn_model_restore"]["fallback_chain"] == [
+            {"provider": "routeplane", "model": "subs/grok"},
+        ]
+        server._restore_agent_model_runtime(
+            agent, session["one_turn_model_restore"]
+        )
+        assert agent._fallback_chain == [
+            {"provider": "routeplane", "model": "subs/grok"},
+        ]
         assert os.environ["HERMES_INFERENCE_PROVIDER"] == "openrouter"
         assert os.environ["HERMES_MODEL"] == "old/model"
     finally:
@@ -10131,6 +10361,110 @@ def test_restore_agent_model_runtime_falls_back_to_switch_model():
     assert agent.model == "old/model"
     assert agent.provider == "openrouter"
     assert agent.base_url == "https://openrouter.ai/api/v1"
+
+
+def test_one_turn_restore_preserves_active_fallback_state():
+    class Agent:
+        model = "subs/grok"
+        provider = "routeplane"
+        api_key = "fallback-key"
+        base_url = "http://127.0.0.1:4356/v1"
+        api_mode = "chat_completions"
+        _primary_runtime = {"model": "old/model", "provider": "openrouter"}
+        _fallback_chain = [{"provider": "routeplane", "model": "subs/grok"}]
+        _fallback_model = _fallback_chain[0]
+        _fallback_index = 0
+        _fallback_activated = True
+        _rate_limited_until = 123
+        _rate_limit_backoff_count = 2
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+
+    agent = Agent()
+    snapshot = server._snapshot_agent_model_runtime(agent)
+    agent.model = "claude-fable-5"
+    agent.provider = "anthropic"
+    agent._primary_runtime = {"model": "claude-fable-5", "provider": "anthropic"}
+    agent._fallback_activated = False
+    agent._rate_limited_until = 0
+    agent._rate_limit_backoff_count = 0
+
+    server._restore_agent_model_runtime(agent, snapshot)
+
+    assert agent.model == "subs/grok"
+    assert agent.provider == "routeplane"
+    assert agent._primary_runtime == {"model": "old/model", "provider": "openrouter"}
+    assert agent._fallback_activated is True
+    assert agent._rate_limited_until == 123
+    assert agent._rate_limit_backoff_count == 2
+
+
+def test_one_turn_restore_failure_does_not_claim_runtime_restored():
+    class Agent:
+        _primary_runtime = {"model": "claude-fable-5", "provider": "anthropic"}
+        _fallback_chain = []
+        _fallback_model = None
+        _fallback_index = 0
+        _fallback_activated = False
+        _rate_limited_until = 0
+        _rate_limit_backoff_count = 0
+
+        def switch_model(self, **_kwargs):
+            raise RuntimeError("restore failed")
+
+    agent = Agent()
+    snapshot = {
+        "model": "subs/grok",
+        "provider": "routeplane",
+        "primary_runtime": {"model": "old/model", "provider": "openrouter"},
+        "fallback_activated": True,
+        "rate_limited_until": 123,
+        "rate_limit_backoff_count": 2,
+    }
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        server._restore_agent_model_runtime(agent, snapshot)
+
+    assert agent._primary_runtime == {
+        "model": "claude-fable-5",
+        "provider": "anthropic",
+    }
+    assert agent._fallback_activated is False
+
+
+def test_prepare_turn_retains_blocked_restore_when_retry_fails(monkeypatch):
+    snapshot = {"model": "subs/grok", "provider": "routeplane"}
+    session = _session(agent=object())
+    session["blocked_one_turn_model_restore"] = snapshot
+    monkeypatch.setattr(
+        server,
+        "_restore_agent_model_runtime",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("still blocked")),
+    )
+
+    with pytest.raises(RuntimeError, match="still blocked"):
+        server._prepare_turn_model_runtime("sid", session)
+
+    assert session["blocked_one_turn_model_restore"] is snapshot
+
+
+def test_compute_host_frame_claims_pending_model_switch_once():
+    session = _session(agent=None)
+    pending = {
+        "raw": "claude-fable-5 --provider anthropic --once",
+        "display_model": "claude-fable-5",
+        "display_provider": "anthropic",
+    }
+    session["pending_model_switch"] = pending
+
+    first = server._compute_host_turn_frame("rid-1", "sid", session, "first")
+    second = server._compute_host_turn_frame("rid-2", "sid", session, "second")
+
+    assert first["pending_model_switch"] == pending
+    assert second["pending_model_switch"] is None
+    assert "pending_model_switch" not in session
 
 
 def test_config_set_personality_rejects_unknown_name(monkeypatch):
@@ -13834,6 +14168,37 @@ def test_apply_pending_model_switch_runs_queued_pick(monkeypatch):
     # Idempotent: a second turn start with nothing queued is a no-op.
     server._apply_pending_model_switch("sid", session)
     assert calls == ["anthropic/claude-sonnet-4.6"]
+
+
+def test_prepare_turn_model_runtime_claims_restore_from_queued_once(monkeypatch):
+    """A queued --once switch belongs to the immediately following turn."""
+    restore_snapshot = {"model": "old/model", "fallback_chain": []}
+    sync_calls = []
+
+    def _fake_apply(_sid, session, _raw, **_kwargs):
+        session["one_turn_model_restore"] = restore_snapshot
+        return {"value": "new/model", "warning": "", "confirm_required": False}
+
+    monkeypatch.setattr(server, "_apply_model_switch", _fake_apply)
+    monkeypatch.setattr(
+        server,
+        "_sync_agent_model_with_config",
+        lambda *_args: sync_calls.append(True),
+    )
+
+    session = _session(running=False)
+    session["agent"] = object()
+    session["pending_model_switch"] = {
+        "raw": "new/model --provider anthropic --once",
+        "confirm_expensive_model": False,
+    }
+
+    claimed = server._prepare_turn_model_runtime("sid", session)
+
+    assert claimed == restore_snapshot
+    assert "one_turn_model_restore" not in session
+    assert "pending_model_switch" not in session
+    assert sync_calls == []
 
 
 def test_config_set_model_allowed_when_idle(monkeypatch):
@@ -18624,19 +18989,36 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
                 "cols": 80,
                 "model": "claude-sonnet-4.6",
                 "provider": "anthropic",
+                "fallback_disabled": True,
                 "reasoning_effort": "high",
                 "fast": True,
             },
         )
         sid = resp["result"]["session_id"]
         sess = server._sessions[sid]
-        assert sess["model_override"] == {"model": "claude-sonnet-4.6", "provider": "anthropic"}
+        assert sess["model_override"] == {
+            "model": "claude-sonnet-4.6",
+            "provider": "anthropic",
+            "fallback_disabled": True,
+        }
         assert sess["create_reasoning_override"] is not None
         assert sess["create_service_tier_override"] == "priority"
         # The immediate response reflects the override (not the global default) so
         # the client never clobbers its sticky pick before the build lands.
         assert resp["result"]["info"]["model"] == "claude-sonnet-4.6"
         assert resp["result"]["info"]["provider"] == "anthropic"
+
+        default_seed = server._methods["session.create"](
+            "r-default",
+            {
+                "cols": 80,
+                "model": "subs/minimax",
+                "provider": "routeplane",
+                "fallback_disabled": False,
+            },
+        )
+        default_sess = server._sessions[default_seed["result"]["session_id"]]
+        assert default_sess["model_override"]["fallback_disabled"] is False
 
         # Explicit false is not the same as omission: it must suppress a Fast
         # profile default for this session's first request.
@@ -19376,6 +19758,7 @@ class TestResolveRuntimeWithFallback:
                 "provider": "openai-codex",
                 "base_url": "https://chatgpt.com/backend-api/codex",
                 "api_key": "stale-codex-token",
+                "fallback_disabled": False,
             },
         )
 
@@ -19383,6 +19766,53 @@ class TestResolveRuntimeWithFallback:
         assert captured["provider"] == "deepseek"
         assert captured["base_url"] == "https://fallback.invalid/v1"
         assert captured["api_key"] == "fb-tok"
+
+    def test_make_agent_explicit_pin_fails_closed_on_auth_error(self, monkeypatch):
+        """An explicit Desktop route pin must not use setup-time auth fallback."""
+        import pytest
+
+        from hermes_cli.auth import AuthError
+
+        calls = []
+
+        def fake_resolve(**kwargs):
+            calls.append(kwargs.get("requested"))
+            raise AuthError("No Anthropic subscription capacity")
+
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+        monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
+        monkeypatch.setattr(
+            server,
+            "_load_cfg",
+            lambda: {
+                "model": {"default": "subs/minimax", "provider": "routeplane"},
+                "fallback_providers": [
+                    {"provider": "routeplane", "model": "subs/grok"},
+                ],
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve,
+        )
+        monkeypatch.setattr(
+            "run_agent.AIAgent",
+            lambda **_kwargs: pytest.fail("agent must not build after auth failure"),
+        )
+
+        with pytest.raises(AuthError, match="No Anthropic subscription capacity"):
+            server._make_agent(
+                "sid",
+                "session-key",
+                model_override={
+                    "model": "claude-fable-5",
+                    "provider": "anthropic",
+                    "fallback_disabled": True,
+                },
+            )
+
+        assert calls == ["anthropic"]
 
 
 def test_get_usage_does_not_substitute_cumulative_total_for_context_used():

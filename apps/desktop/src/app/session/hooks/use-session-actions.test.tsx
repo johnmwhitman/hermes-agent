@@ -60,6 +60,7 @@ import {
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentModel,
+  setCurrentModelSource,
   setCurrentProvider,
   setCurrentReasoningEffort,
   setMessages,
@@ -566,6 +567,7 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentCwd.set('')
     $currentFastMode.set(false)
     $currentModel.set('')
+    setCurrentModelSource('')
     $currentProvider.set('')
     $currentReasoningEffort.set('')
     setNewChatWorkspaceTarget(undefined)
@@ -657,6 +659,7 @@ describe('createBackendSessionForSend profile routing', () => {
     vi.mocked(ensureGatewayProfile).mockReturnValueOnce(profileReady.promise)
 
     setCurrentModel('anthropic/claude-sonnet-4.6')
+    setCurrentModelSource('manual')
     setCurrentProvider('anthropic')
     setCurrentReasoningEffort('high')
     setCurrentFastMode(false)
@@ -686,6 +689,7 @@ describe('createBackendSessionForSend profile routing', () => {
     // A background refresh or a second click can mutate the sticky atoms while
     // the profile is waking. This send must still use what was visible at Enter.
     setCurrentModel('openai/gpt-5.5')
+    setCurrentModelSource('default')
     setCurrentProvider('openai-codex')
     setCurrentReasoningEffort('low')
     setCurrentFastMode(true)
@@ -697,9 +701,24 @@ describe('createBackendSessionForSend profile routing', () => {
 
     expect(createParams).toMatchObject({
       fast: false,
+      fallback_disabled: true,
       model: 'anthropic/claude-sonnet-4.6',
       provider: 'anthropic',
       reasoning_effort: 'high'
+    })
+  })
+
+  it('keeps configured fallback for a model seeded from the profile default', async () => {
+    const params = await createWith(() => {
+      setCurrentModel('subs/minimax')
+      setCurrentModelSource('default')
+      setCurrentProvider('routeplane')
+    })
+
+    expect(params).toMatchObject({
+      fallback_disabled: false,
+      model: 'subs/minimax',
+      provider: 'routeplane'
     })
   })
 

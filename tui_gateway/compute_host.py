@@ -588,6 +588,8 @@ class ComputeHost:
                 session["profile_home"] = str(frame.get("profile_home"))
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
+            if isinstance(frame.get("pending_model_switch"), dict):
+                session["pending_model_switch"] = dict(frame["pending_model_switch"])
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
@@ -690,6 +692,8 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        if isinstance(frame.get("pending_model_switch"), dict):
+            session["pending_model_switch"] = dict(frame["pending_model_switch"])
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:

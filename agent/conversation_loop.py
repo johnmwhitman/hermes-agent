@@ -111,6 +111,35 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _record_api_call_without_usage(agent) -> bool:
+    """Account for a successful response whose provider omitted usage data."""
+    agent.session_api_calls += 1
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if not session_db or not session_id:
+        return False
+    try:
+        if not getattr(agent, "_session_db_created", False):
+            agent._ensure_db_session()
+        session_db.queue_token_counts(
+            session_id,
+            model=getattr(agent, "model", None),
+            billing_provider=getattr(agent, "provider", None),
+            billing_base_url=getattr(agent, "base_url", None),
+            cost_status="unknown",
+            cost_source="none",
+            api_call_count=1,
+        )
+        return True
+    except Exception as exc:
+        logger.debug(
+            "API-call accounting without usage failed (session=%s): %s",
+            session_id,
+            exc,
+        )
+        return False
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -4536,6 +4565,8 @@ def run_conversation(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
+                else:
+                    _record_api_call_without_usage(agent)
                 
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call

@@ -589,6 +589,11 @@ class CLIAgentSetupMixin:
             # forever — so memory shutdown never ran on /exit (#49287).
             import cli as _cli
             _cli._active_agent_ref = self.agent
+            _arm_once_runtime = getattr(
+                self, "_arm_pending_one_turn_session_runtime", None
+            )
+            if callable(_arm_once_runtime):
+                _arm_once_runtime(self.agent)
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint

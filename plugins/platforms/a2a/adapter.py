@@ -88,7 +88,7 @@ def _default_agent_name() -> str:
 def _clean_slug(value: str) -> str:
     """Return a URL-safe-ish single-segment slug for a served agent."""
     slug = str(value or "").strip().strip("/")
-    return "" if slug in ("", "default", "root") else slug.split("/")[0]
+    return "" if slug in ("", "root") else slug.split("/")[0]
 
 
 def _join_url(base: str, prefix: str) -> str:
@@ -367,7 +367,10 @@ class A2AAdapter(BasePlatformAdapter):
 
         # Forwarded profile sessions: map (profile, agent_slug, context_id) -> session_id.
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
-        self._profile_session_locks: Dict[tuple[str, str, str], threading.Lock] = {}
+        # First-contact discovery queries the profile's shared state.db for the
+        # newest source=a2a row. Serialize all forwards to one profile so two
+        # contexts cannot claim each other's newly created session.
+        self._profile_session_locks: Dict[str, threading.Lock] = {}
         self._profile_session_locks_guard = threading.Lock()
 
         # Pending reply futures, keyed by task_id. Each future resolves to a
@@ -535,7 +538,10 @@ class A2AAdapter(BasePlatformAdapter):
             toolsets = val.get("advertised_toolsets") or val.get("toolsets") or val.get("capabilities") or []
             if isinstance(toolsets, str):
                 toolsets = [t.strip() for t in toolsets.split(",") if t.strip()]
-            local = bool(val.get("local")) or profile in ("", "default", self._active_profile)
+            if isinstance(val.get("local"), bool):
+                local = val["local"]
+            else:
+                local = profile in ("", self._active_profile)
             tenant = str(val.get("tenant") or slug).strip()
             if tenant:
                 if tenant in tenants:
@@ -555,6 +561,8 @@ class A2AAdapter(BasePlatformAdapter):
                 "description": str(val.get("description") or f"Hermes profile '{profile or slug}' exposed over A2A."),
                 "advertised_toolsets": list(toolsets or []),
                 "timeout": int(val.get("timeout") or _reply_timeout()),
+                "model": str(val.get("model") or "").strip(),
+                "provider": str(val.get("provider") or "").strip(),
             }
         return agents
 
@@ -685,12 +693,12 @@ class A2AAdapter(BasePlatformAdapter):
         agent = agent or self._agents[""]
         return str(agent.get("slug") or ""), str(agent.get("tenant") or "")
 
-    def _forward_lock(self, key: tuple[str, str, str]) -> threading.Lock:
+    def _forward_lock(self, profile: str) -> threading.Lock:
         with self._profile_session_locks_guard:
-            lock = self._profile_session_locks.get(key)
+            lock = self._profile_session_locks.get(profile)
             if lock is None:
                 lock = threading.Lock()
-                self._profile_session_locks[key] = lock
+                self._profile_session_locks[profile] = lock
             return lock
 
     # ── Inbound task handling ─────────────────────────────────────────────
@@ -836,6 +844,47 @@ class A2AAdapter(BasePlatformAdapter):
             logger.debug("A2A: could not find latest forwarded session", exc_info=True)
             return ""
 
+    def _latest_message_id(self, profile: str, session_id: str) -> Optional[int]:
+        """Return the current durable transcript boundary for a profile session."""
+        db = self._profile_state_db(profile)
+        if not db or not os.path.exists(db) or not session_id:
+            return None
+        try:
+            con = sqlite3.connect(db, timeout=5)
+            row = con.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            con.close()
+            return int(row[0]) if row else 0
+        except Exception:
+            logger.debug("A2A: could not read forwarded transcript boundary", exc_info=True)
+            return None
+
+    def _latest_assistant_content(
+        self, profile: str, session_id: str, after_id: int = 0
+    ) -> str:
+        """Return visible assistant content persisted after a transcript boundary."""
+        db = self._profile_state_db(profile)
+        if not db or not os.path.exists(db) or not session_id:
+            return ""
+        try:
+            con = sqlite3.connect(db, timeout=5)
+            row = con.execute(
+                "SELECT content FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' "
+                "AND TRIM(COALESCE(content, '')) != '' "
+                "AND COALESCE(active, 1) = 1 "
+                "AND id > ? "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id, after_id),
+            ).fetchone()
+            con.close()
+            return str(row[0]).strip() if row and row[0] is not None else ""
+        except Exception:
+            logger.debug("A2A: could not read forwarded reply", exc_info=True)
+            return ""
+
     def _title_forward_session(self, profile: str, session_id: str, title: str) -> None:
         db = self._profile_state_db(profile)
         if not db or not os.path.exists(db) or not session_id:
@@ -847,6 +896,89 @@ class A2AAdapter(BasePlatformAdapter):
             con.close()
         except Exception:
             logger.debug("A2A: could not title forwarded session", exc_info=True)
+
+    def _end_forward_session(self, profile: str, session_id: str, reason: str) -> bool:
+        db = self._profile_state_db(profile)
+        if not db or not os.path.exists(db) or not session_id:
+            return False
+        con = None
+        try:
+            con = sqlite3.connect(db, timeout=5)
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                "WHERE id = ? AND (ended_at IS NULL OR end_reason = 'agent_close')",
+                (time.time(), reason, session_id),
+            )
+            row = con.execute(
+                "SELECT end_reason FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            con.commit()
+            return bool(row and row[0] == reason)
+        except Exception:
+            logger.debug("A2A: could not finalize forwarded session", exc_info=True)
+            return False
+        finally:
+            if con is not None:
+                con.close()
+
+    @staticmethod
+    def _terminate_profile_process_tree(proc: subprocess.Popen) -> None:
+        """Terminate and reap a timed-out Hermes child and all descendants."""
+        try:
+            import psutil
+
+            parent = psutil.Process(proc.pid)
+            targets = parent.children(recursive=True) + [parent]
+            for target in targets:
+                try:
+                    target.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = psutil.wait_procs(targets, timeout=2)
+            for target in alive:
+                try:
+                    target.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            if alive:
+                psutil.wait_procs(alive, timeout=2)
+        except Exception:
+            logger.debug("A2A: process-tree termination failed", exc_info=True)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    def _run_profile_command(self, cmd: list[str], timeout: int, env: dict) -> tuple[int, str, str]:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            self._terminate_profile_process_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except Exception:
+                stdout = exc.output or ""
+                stderr = exc.stderr or ""
+            raise subprocess.TimeoutExpired(
+                cmd, timeout, output=stdout, stderr=stderr
+            ) from None
+        except Exception:
+            self._terminate_profile_process_tree(proc)
+            raise
+        return proc.returncode, stdout or "", stderr or ""
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str) -> tuple[str, str]:
         """Forward a routed A2A task to another local Hermes profile.
@@ -863,10 +995,27 @@ class A2AAdapter(BasePlatformAdapter):
         key = (profile or "default", slug, safe_ctx)
         timeout = int(agent.get("timeout") or _reply_timeout())
 
-        lock = self._forward_lock(key)
+        lock = self._forward_lock(profile or "default")
         with lock:
             session_id = self._profile_sessions.get(key) or self._lookup_forward_session(profile, session_title)
-            cmd = ["hermes", "chat", "-q", framed_text, "-Q", "--source", "a2a"]
+            message_watermark = (
+                self._latest_message_id(profile, session_id) if session_id else 0
+            )
+            if message_watermark is None:
+                return (
+                    "[profile transcript boundary unavailable]",
+                    protocol.STATE_FAILED,
+                )
+            cmd = [
+                "hermes", "--profile", profile or "default",
+                "chat", "-q", framed_text, "-Q", "--source", "a2a",
+            ]
+            model = str(agent.get("model") or "").strip()
+            provider = str(agent.get("provider") or "").strip()
+            if model:
+                cmd.extend(["-m", model])
+            if provider:
+                cmd.extend(["--provider", provider])
             if session_id:
                 cmd.extend(["--resume", session_id])
 
@@ -877,23 +1026,46 @@ class A2AAdapter(BasePlatformAdapter):
             env["HERMES_A2A_PEER"] = peer
             start = time.time()
             try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=timeout,
-                    env=env, check=False, stdin=subprocess.DEVNULL,
-                )
+                returncode, stdout, stderr = self._run_profile_command(cmd, timeout, env)
             except subprocess.TimeoutExpired:
+                if not session_id:
+                    session_id = self._latest_a2a_session(profile, start)
+                if session_id:
+                    self._profile_sessions[key] = session_id
+                    self._title_forward_session(profile, session_id, session_title)
+                    self._end_forward_session(profile, session_id, "a2a_timeout")
                 return "[profile did not reply in time]", protocol.STATE_FAILED
             except Exception as e:
+                if not session_id:
+                    session_id = self._latest_a2a_session(profile, start)
+                if session_id:
+                    self._profile_sessions[key] = session_id
+                    self._title_forward_session(profile, session_id, session_title)
+                    self._end_forward_session(profile, session_id, "a2a_failed")
                 return security.redact_outbound(f"Profile dispatch failed: {e}"), protocol.STATE_FAILED
-            if proc.returncode != 0:
-                msg = (proc.stderr or proc.stdout or f"profile exited {proc.returncode}").strip()
+            if returncode != 0:
+                if not session_id:
+                    session_id = self._latest_a2a_session(profile, start)
+                if session_id:
+                    self._profile_sessions[key] = session_id
+                    self._title_forward_session(profile, session_id, session_title)
+                    self._end_forward_session(profile, session_id, "a2a_failed")
+                msg = (stderr or stdout or f"profile exited {returncode}").strip()
                 return security.redact_outbound(msg[-2000:]), protocol.STATE_FAILED
             if not session_id:
                 session_id = self._latest_a2a_session(profile, start)
                 if session_id:
                     self._profile_sessions[key] = session_id
                     self._title_forward_session(profile, session_id, session_title)
-            return security.redact_outbound((proc.stdout or "").strip()), protocol.STATE_COMPLETED
+            reply = self._latest_assistant_content(
+                profile, session_id, after_id=message_watermark
+            )
+            if not reply:
+                self._end_forward_session(profile, session_id, "a2a_reply_missing")
+                return "[profile produced no persisted reply]", protocol.STATE_FAILED
+            if not self._end_forward_session(profile, session_id, "a2a_complete"):
+                return "[profile reply session could not be finalized]", protocol.STATE_FAILED
+            return security.redact_outbound(reply), protocol.STATE_COMPLETED
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
         """Record the outcome of a dispatched task. Returns (state, reply) after

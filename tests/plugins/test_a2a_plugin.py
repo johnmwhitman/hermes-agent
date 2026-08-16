@@ -201,7 +201,9 @@ class TestAudit:
         security.audit("inbound", "peer-y", "task-1", "hello world")
         audit_file = tmp_path / "a2a_audit.jsonl"
         assert audit_file.exists()
-        rec = json.loads(audit_file.read_text().strip().splitlines()[-1])
+        rec = json.loads(
+            audit_file.read_text(encoding="utf-8").strip().splitlines()[-1]
+        )
         assert rec["direction"] == "inbound"
         assert rec["peer"] == "peer-y"
         assert rec["task_id"] == "task-1"
@@ -1309,6 +1311,47 @@ def test_agent_card_can_advertise_tenant():
 
 
 class TestMultiAgentRouting:
+    def test_named_default_profile_is_forwarded_when_gateway_profile_differs(
+        self, monkeypatch
+    ):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._active_profile_name",
+            lambda: "conductor",
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "default": {
+                    "profile": "default",
+                    "name": "Default",
+                }
+            }
+        }))
+
+        assert adapter._agents["default"]["local"] is False
+
+    def test_explicit_local_false_forwards_gateway_profile(self, monkeypatch):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._active_profile_name",
+            lambda: "conductor",
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "conductor": {
+                    "profile": "conductor",
+                    "name": "Conductor",
+                    "local": False,
+                }
+            }
+        }))
+
+        assert adapter._agents["conductor"]["local"] is False
+
     def test_path_routed_agent_card_uses_prefix_and_canonical_path(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
@@ -1579,7 +1622,14 @@ class TestV1SpecRegressionFixes:
         db = profile_home / "state.db"
         import sqlite3
         con = sqlite3.connect(db)
-        con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, title TEXT)")
+        con.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, "
+            "title TEXT, ended_at REAL, end_reason TEXT)"
+        )
+        con.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+            "content TEXT, active INTEGER DEFAULT 1)"
+        )
         con.commit(); con.close()
 
         fakebin = tmp_path / "bin"
@@ -1595,9 +1645,10 @@ home = os.environ['HERMES_HOME']
 con = sqlite3.connect(os.path.join(home, 'state.db'))
 if '--resume' not in sys.argv:
     con.execute('INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)', ('sess-1', 'a2a', time.time(), None))
-    con.commit()
+con.execute('INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)', ('sess-1', 'assistant', 'fake reply'))
+con.commit()
 print('fake reply')
-""")
+""", encoding="utf-8")
         hermes.chmod(0o755)
         monkeypatch.setenv("PATH", str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
         monkeypatch.setenv("FAKE_HERMES_CALLS", str(calls))
@@ -1611,10 +1662,617 @@ print('fake reply')
         assert (reply, state) == ("fake reply", protocol.STATE_COMPLETED)
         reply2, state2 = adapter._forward_to_profile(agent, "peer", "ctx/unsafe value", "again")
         assert (reply2, state2) == ("fake reply", protocol.STATE_COMPLETED)
-        argv_lines = [json.loads(line) for line in calls.read_text().splitlines()]
+        argv_lines = [
+            json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()
+        ]
         assert "--resume" not in argv_lines[0]
         assert argv_lines[1][argv_lines[1].index("--resume") + 1] == "sess-1"
         con = sqlite3.connect(db)
         title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
         con.close()
         assert title == "a2a-dev-ctx-unsafe-value"
+
+    def test_forward_to_profile_applies_route_model_and_provider(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+        calls = []
+
+        def fake_run_command(cmd, timeout, env):
+            calls.append(cmd)
+            store = SessionDB(state_path)
+            store.create_session("sess-route-pin", "a2a", model="subs/codex")
+            store.append_message(
+                "sess-route-pin", "assistant", content="route pin reply"
+            )
+            store.close()
+            return 0, "route pin reply", ""
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "dev": {
+                    "profile": "dev",
+                    "tenant": "dev",
+                    "model": "subs/codex",
+                    "provider": "routeplane",
+                    "timeout": 5,
+                }
+            }
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-route-pin", "hello"
+        )
+
+        assert (reply, state) == ("route pin reply", protocol.STATE_COMPLETED)
+        assert calls
+        assert calls[0][1:3] == ["--profile", "dev"]
+        assert calls[0][calls[0].index("-m") + 1] == "subs/codex"
+        assert calls[0][calls[0].index("--provider") + 1] == "routeplane"
+
+    def test_forward_to_profile_serializes_first_contacts_per_profile(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+        guard = threading.Lock()
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        counter = 0
+        active = 0
+        peak_active = 0
+
+        def fake_run_command(cmd, timeout, env):
+            nonlocal counter, active, peak_active
+            with guard:
+                index = counter
+                counter += 1
+                active += 1
+                peak_active = max(peak_active, active)
+            session_id = f"sess-{index}"
+            store = SessionDB(state_path)
+            store.create_session(session_id, "a2a", model="test-model")
+            store.append_message(
+                session_id, "assistant", content=f"reply-{index}"
+            )
+            store.close()
+            if index == 0:
+                first_entered.set()
+                second_entered.wait(timeout=0.2)
+            else:
+                second_entered.set()
+            with guard:
+                active -= 1
+            return 0, "internal stdout", ""
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+        results = {}
+
+        def forward(context_id):
+            results[context_id] = adapter._forward_to_profile(
+                adapter._agents["dev"], "peer", context_id, "hello"
+            )
+
+        first = threading.Thread(target=forward, args=("ctx-first",))
+        second = threading.Thread(target=forward, args=("ctx-second",))
+        first.start()
+        assert first_entered.wait(timeout=1)
+        second.start()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        assert first.is_alive() is False
+        assert second.is_alive() is False
+        assert peak_active == 1
+        assert results == {
+            "ctx-first": ("reply-0", protocol.STATE_COMPLETED),
+            "ctx-second": ("reply-1", protocol.STATE_COMPLETED),
+        }
+
+    def test_forward_to_profile_uses_persisted_assistant_content_not_stdout(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(state_path)
+            store.create_session("sess-clean", "a2a", model="test-model")
+            store.append_message(
+                "sess-clean", "assistant", content="", reasoning="private reasoning"
+            )
+            store.append_message(
+                "sess-clean", "assistant", content="persisted clean reply"
+            )
+            store.close()
+            return (
+                0,
+                "private reasoning\npersisted clean reply\nsession_id: sess-clean\n",
+                "",
+            )
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-clean", "hello"
+        )
+
+        assert state == protocol.STATE_COMPLETED
+        assert reply == "persisted clean reply"
+        assert "private reasoning" not in reply
+        assert "session_id:" not in reply
+
+    def test_forward_to_profile_fails_closed_when_persisted_reply_is_missing(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(state_path)
+            store.create_session("sess-missing", "a2a", model="test-model")
+            store.append_message(
+                "sess-missing", "assistant", content="", reasoning="private reasoning"
+            )
+            store.close()
+            return 0, "private reasoning\nsession_id: sess-missing\n", ""
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-missing", "hello"
+        )
+
+        assert state == protocol.STATE_FAILED
+        assert reply == "[profile produced no persisted reply]"
+        assert "private reasoning" not in reply
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-missing")
+        store.close()
+        assert session is not None
+        assert session["ended_at"] is not None
+        assert session["end_reason"] == "a2a_reply_missing"
+
+    def test_forward_to_profile_does_not_replay_stale_reply_on_resume(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        store = SessionDB(state_path)
+        store.create_session("sess-resume-missing", "a2a", model="test-model")
+        store.append_message(
+            "sess-resume-missing", "assistant", content="previous turn reply"
+        )
+        store.close()
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(lambda cmd, timeout, env: (0, "session_id: ignored", "")),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+        adapter._profile_sessions[("dev", "dev", "ctx-resume-missing")] = (
+            "sess-resume-missing"
+        )
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-resume-missing", "hello again"
+        )
+
+        assert state == protocol.STATE_FAILED
+        assert reply == "[profile produced no persisted reply]"
+        assert "previous turn reply" not in reply
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-resume-missing")
+        store.close()
+        assert session is not None
+        assert session["end_reason"] == "a2a_reply_missing"
+
+    def test_forward_to_profile_fails_closed_when_resume_boundary_is_unavailable(
+        self, monkeypatch
+    ):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        command_calls = []
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+        adapter._profile_sessions[("dev", "dev", "ctx-boundary")] = "sess-boundary"
+        monkeypatch.setattr(adapter, "_latest_message_id", lambda profile, sid: None)
+        monkeypatch.setattr(
+            adapter,
+            "_run_profile_command",
+            lambda cmd, timeout, env: command_calls.append(cmd) or (0, "", ""),
+        )
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-boundary", "hello"
+        )
+
+        assert state == protocol.STATE_FAILED
+        assert reply == "[profile transcript boundary unavailable]"
+        assert command_calls == []
+
+    def test_forward_to_profile_finalizes_nonzero_exit_session(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(state_path)
+            store.create_session("sess-error", "a2a", model="test-model")
+            store.close()
+            return 7, "internal stdout", "provider failed"
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-error", "hello"
+        )
+
+        assert state == protocol.STATE_FAILED
+        assert reply == "provider failed"
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-error")
+        store.close()
+        assert session is not None
+        assert session["ended_at"] is not None
+        assert session["end_reason"] == "a2a_failed"
+
+    def test_forward_to_profile_finalizes_session_after_dispatch_exception(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(state_path)
+            store.create_session("sess-dispatch-exception", "a2a", model="test-model")
+            store.close()
+            raise RuntimeError("communicate failed")
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-dispatch-exception", "hello"
+        )
+
+        assert state == protocol.STATE_FAILED
+        assert "communicate failed" in reply
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-dispatch-exception")
+        store.close()
+        assert session is not None
+        assert session["end_reason"] == "a2a_failed"
+
+    def test_run_profile_command_reaps_tree_after_unexpected_communicate_error(
+        self, monkeypatch
+    ):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        class BrokenProcess:
+            pid = 4242
+
+            def communicate(self, timeout=None):
+                raise OSError("pipe failed")
+
+        proc = BrokenProcess()
+        reaped = []
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.subprocess.Popen",
+            lambda *args, **kwargs: proc,
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(
+            adapter, "_terminate_profile_process_tree", lambda candidate: reaped.append(candidate)
+        )
+
+        with pytest.raises(OSError, match="pipe failed"):
+            adapter._run_profile_command(["hermes"], 5, {})
+
+        assert reaped == [proc]
+
+    def test_forward_to_profile_finalizes_successful_session(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(state_path)
+            store.create_session("sess-final", "a2a", model="test-model")
+            store.append_message(
+                "sess-final", "assistant", content="final reply"
+            )
+            store.close()
+            return 0, "final reply", ""
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-final", "hello"
+        )
+
+        assert (reply, state) == ("final reply", protocol.STATE_COMPLETED)
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-final")
+        store.close()
+        assert session is not None
+        assert session["ended_at"] is not None
+        assert session["end_reason"] == "a2a_complete"
+
+    def test_forward_to_profile_promotes_agent_close_to_a2a_complete(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(state_path)
+            store.create_session("sess-agent-close", "a2a", model="test-model")
+            store.append_message(
+                "sess-agent-close", "assistant", content="final reply"
+            )
+            store.end_session("sess-agent-close", "agent_close")
+            store.close()
+            return 0, "final reply", ""
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-agent-close", "hello"
+        )
+
+        assert (reply, state) == ("final reply", protocol.STATE_COMPLETED)
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-agent-close")
+        store.close()
+        assert session is not None
+        assert session["end_reason"] == "a2a_complete"
+
+    def test_forward_to_profile_fails_closed_on_incompatible_terminal_reason(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(state_path)
+            store.create_session("sess-compressed", "a2a", model="test-model")
+            store.append_message(
+                "sess-compressed", "assistant", content="stale reply"
+            )
+            store.end_session("sess-compressed", "compression")
+            store.close()
+            return 0, "stale reply", ""
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-compressed", "hello"
+        )
+
+        assert state == protocol.STATE_FAILED
+        assert reply == "[profile reply session could not be finalized]"
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-compressed")
+        store.close()
+        assert session is not None
+        assert session["end_reason"] == "compression"
+
+    @pytest.mark.live_system_guard_bypass
+    def test_forward_to_profile_timeout_reaps_tree_and_finalizes_session(self, monkeypatch, tmp_path):
+        import psutil
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+        child_pid_path = tmp_path / "child.pid"
+        fakebin = tmp_path / "bin"
+        fakebin.mkdir()
+        hermes = fakebin / "hermes"
+        hermes.write_text("""#!/usr/bin/env python3
+import os, sqlite3, subprocess, sys, time
+home = os.environ['HERMES_HOME']
+con = sqlite3.connect(os.path.join(home, 'state.db'))
+con.execute(
+    'INSERT INTO sessions (id, source, started_at, model) VALUES (?, ?, ?, ?)',
+    ('sess-timeout', 'a2a', time.time(), 'test-model'),
+)
+con.commit()
+con.close()
+child = subprocess.Popen(
+    [sys.executable, '-c', 'import time; time.sleep(60)'],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+with open(os.environ['FAKE_CHILD_PID'], 'w') as f:
+    f.write(str(child.pid))
+time.sleep(60)
+""", encoding="utf-8")
+        hermes.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
+        monkeypatch.setenv("FAKE_CHILD_PID", str(child_pid_path))
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 1}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-timeout", "hello"
+        )
+
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        child_survived = psutil.pid_exists(child_pid)
+        if child_survived:
+            try:
+                psutil.Process(child_pid).kill()
+                psutil.Process(child_pid).wait(timeout=5)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                pass
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-timeout")
+        store.close()
+
+        assert state == protocol.STATE_FAILED
+        assert reply == "[profile did not reply in time]"
+        assert child_survived is False
+        assert session is not None
+        assert session["ended_at"] is not None
+        assert session["end_reason"] == "a2a_timeout"

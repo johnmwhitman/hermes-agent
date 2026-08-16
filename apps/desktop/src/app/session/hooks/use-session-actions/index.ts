@@ -71,6 +71,7 @@ import {
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
+  getCurrentModelSource,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
@@ -256,7 +257,8 @@ async function desktopSessionCreateParams(
     effort: $currentReasoningEffort.get().trim(),
     fast: $currentFastMode.get(),
     model: $currentModel.get().trim(),
-    provider: $currentProvider.get().trim()
+    provider: $currentProvider.get().trim(),
+    source: getCurrentModelSource()
   }
 
   const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
@@ -273,7 +275,11 @@ async function desktopSessionCreateParams(
     ...(cwd && { cwd }),
     ...(profile ? { profile: capturedRoute?.targetProfile || profile } : {}),
     ...(selection.model
-      ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
+      ? {
+          fallback_disabled: selection.source === 'manual',
+          model: selection.model,
+          ...(selection.provider ? { provider: selection.provider } : {})
+        }
       : {}),
     ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
     fast: selection.fast

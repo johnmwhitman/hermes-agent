@@ -8,8 +8,10 @@ import { $activeGatewayProfile } from '@/store/profile'
 import {
   $currentBranch,
   $currentCwd,
+  getCurrentModelSource,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentModelSource,
   setSelectedStoredSessionId,
   workspaceCwdBelongsToSelectedSession
 } from '@/store/session'
@@ -67,6 +69,26 @@ describe('applyRuntimeInfo approval mode', () => {
 
     expect(approvalModeForProfile('work')).toBe('smart')
     expect(approvalModeForProfile('default')).toBe('smart')
+  })
+})
+
+describe('applyRuntimeInfo model provenance', () => {
+  afterEach(() => {
+    setCurrentModelSource('')
+  })
+
+  it('publishes fail-closed provenance from a resumed session', () => {
+    applyRuntimeInfo({ fallback_disabled: true, model: 'claude-fable-5', provider: 'anthropic' })
+    expect(getCurrentModelSource()).toBe('manual')
+
+    applyRuntimeInfo({ fallback_disabled: false, model: 'subs/minimax', provider: 'routeplane' })
+    expect(getCurrentModelSource()).toBe('default')
+  })
+
+  it('clears sticky provenance while a stored-session preview is unresolved', () => {
+    setCurrentModelSource('manual')
+    applyStoredSessionPreviewRuntimeInfo({ model: 'claude-fable-5' }, 'stored-session')
+    expect(getCurrentModelSource()).toBe('')
   })
 })
 

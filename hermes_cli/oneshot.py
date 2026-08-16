@@ -32,6 +32,19 @@ from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
 
 
+def _fallback_chain_for_selection(
+    cfg: dict,
+    *,
+    model: object = None,
+    provider: object = None,
+    env_model: str = "",
+) -> list[dict]:
+    """Return no fallbacks when one-shot inference is explicitly pinned."""
+    if (model or provider or env_model):
+        return []
+    return get_fallback_chain(cfg)
+
+
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
     if not toolsets:
         return None
@@ -487,7 +500,12 @@ def _run_agent(
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
         # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        _fb = _fallback_chain_for_selection(
+            cfg,
+            model=model,
+            provider=provider,
+            env_model=env_model,
+        )
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),

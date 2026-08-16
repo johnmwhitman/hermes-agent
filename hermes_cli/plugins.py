@@ -4443,18 +4443,15 @@ class PluginManager:
                 continue
 
             # Bundled platform plugins (gateway adapters: telegram, discord,
-            # feishu, teams, ...) are registered LAZILY. Their modules import
-            # heavy, platform-specific SDKs at module level (lark_oapi,
-            # microsoft_teams, discord.py, slack_bolt, ...), so eagerly loading
-            # all ~20 of them added several seconds to every `hermes`
-            # invocation — including plain `hermes chat`, which never touches a
-            # gateway platform. Instead we register a cheap deferred loader in
-            # the platform_registry keyed on the platform name; the real module
-            # is imported only when the gateway / cron / setup / send_message
-            # path actually asks for that platform. Every platform Hermes ships
-            # remains available out of the box — it just loads on first use.
+            # feishu, teams, ...) are registered LAZILY unless they also expose
+            # client tools for ordinary chat. Tool-providing platforms must load
+            # eagerly or those tools never reach the runtime registry and cannot
+            # be enabled through `hermes tools`.
             if manifest.source == "bundled" and manifest.kind == "platform":
-                self._register_deferred_platform(manifest)
+                if manifest.provides_tools:
+                    self._load_plugin(manifest)
+                else:
+                    self._register_deferred_platform(manifest)
                 continue
 
             # Everything else (standalone, user-installed backends,

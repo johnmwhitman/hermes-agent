@@ -77,6 +77,48 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
     assert pool.select() is None
 
 
+def test_reset_statuses_persists_explicit_cooldown_clear(tmp_path, monkeypatch):
+    """An explicit reset must not resurrect a newer unexpired disk cooldown."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "reset-me",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "test-token",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reason": "rate_limit",
+                        "last_error_message": "Too many requests",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    assert pool.reset_statuses() == 1
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entry = payload["credential_pool"]["openrouter"][0]
+    assert entry["last_status"] is None
+    assert entry["last_status_at"] is None
+    assert entry["last_error_code"] is None
+    assert entry["last_error_reason"] is None
+    assert entry["last_error_message"] is None
+
+
 
 
 def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeypatch):

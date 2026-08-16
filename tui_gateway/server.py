@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional, cast
 
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -2632,6 +2632,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
+        pending_model_switch = session.pop("pending_model_switch", None)
     return {
         "type": "turn.start",
         "sid": sid,
@@ -2646,6 +2647,7 @@ def _compute_host_turn_frame(
         "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),
+        "pending_model_switch": pending_model_switch,
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
@@ -3974,6 +3976,8 @@ def _ensure_session_db_row(session: dict) -> bool:
     ):
         if val := override.get(src_key):
             model_config[cfg_key] = str(val)
+    if "fallback_disabled" in override:
+        model_config["fallback_disabled"] = bool(override["fallback_disabled"])
     # The composer override may carry the RESOLVED provider "custom" for a named
     # ``providers:`` / ``custom_providers:`` entry. Persisting bare "custom" here
     # (the very first DB write for a fresh desktop session, before the agent is
@@ -5544,6 +5548,10 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             "base_url": base_url or None,
             "api_mode": api_mode or None,
         }
+        if "fallback_disabled" in model_config:
+            overrides["model_override"]["fallback_disabled"] = bool(
+                model_config["fallback_disabled"]
+            )
     if provider:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
@@ -5661,6 +5669,13 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             if isinstance(parsed, dict):
                 existing_config = parsed
         model_config = _runtime_model_config(agent, existing_config)
+        model_override = session.get("model_override")
+        if isinstance(model_override, dict) and "fallback_disabled" in model_override:
+            model_config["fallback_disabled"] = bool(
+                model_override["fallback_disabled"]
+            )
+        else:
+            model_config.pop("fallback_disabled", None)
         create_service_tier_override = session.get("create_service_tier_override")
         if create_service_tier_override is not None:
             # _runtime_model_config sees agent.service_tier=None for explicit
@@ -6241,23 +6256,35 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
+        "fallback_chain": copy.deepcopy(getattr(agent, "_fallback_chain", [])),
+        "fallback_model": copy.deepcopy(getattr(agent, "_fallback_model", None)),
+        "fallback_index": getattr(agent, "_fallback_index", 0),
+        "fallback_activated": bool(getattr(agent, "_fallback_activated", False)),
+        "rate_limited_until": getattr(agent, "_rate_limited_until", 0),
+        "rate_limit_backoff_count": getattr(agent, "_rate_limit_backoff_count", 0),
     }
+
+
+def _set_agent_fallback_policy(agent, *, disabled: bool) -> None:
+    """Clear an explicit route pin or rehydrate the configured fallback chain."""
+    configured = [] if disabled else (_load_fallback_model() or [])
+    chain = [
+        copy.deepcopy(entry)
+        for entry in configured
+        if isinstance(entry, dict) and entry.get("provider") and entry.get("model")
+    ]
+    agent._fallback_chain = chain
+    agent._fallback_model = chain[0] if chain else None
+    agent._fallback_index = 0
+    agent._fallback_activated = False
+    agent._rate_limited_until = 0
+    agent._rate_limit_backoff_count = 0
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
         return
-    primary = snapshot.get("primary_runtime")
-    if primary and hasattr(agent, "_restore_primary_runtime"):
-        try:
-            agent._primary_runtime = copy.deepcopy(primary)
-            agent._fallback_activated = True
-            agent._rate_limited_until = 0
-            if agent._restore_primary_runtime():
-                return
-        except Exception:
-            logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
     if hasattr(agent, "switch_model"):
         agent.switch_model(
             new_model=snapshot.get("model", ""),
@@ -6267,6 +6294,15 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_mode=snapshot.get("api_mode", ""),
             capabilities=snapshot.get("capabilities"),
         )
+    agent._primary_runtime = copy.deepcopy(snapshot.get("primary_runtime"))
+    agent._fallback_chain = copy.deepcopy(snapshot.get("fallback_chain", []))
+    agent._fallback_model = copy.deepcopy(snapshot.get("fallback_model"))
+    agent._fallback_index = int(snapshot.get("fallback_index", 0) or 0)
+    agent._fallback_activated = bool(snapshot.get("fallback_activated", False))
+    agent._rate_limited_until = snapshot.get("rate_limited_until", 0) or 0
+    agent._rate_limit_backoff_count = int(
+        snapshot.get("rate_limit_backoff_count", 0) or 0
+    )
 
 
 @contextlib.contextmanager
@@ -6422,7 +6458,12 @@ def _apply_model_switch(
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
-    restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
+    _existing_one_turn_restore = session.get("one_turn_model_restore")
+    restore_snapshot = (
+        copy.deepcopy(_existing_one_turn_restore)
+        if one_turn and isinstance(_existing_one_turn_restore, dict)
+        else (_snapshot_agent_model_runtime(agent) if one_turn else None)
+    )
 
     if agent:
         try:
@@ -6470,6 +6511,12 @@ def _apply_model_switch(
                 "confirm_message": confirm_msg,
             }
 
+    # A per-session model-picker selection is an explicit route pin. Keep
+    # configured fallbacks for the profile default and global switches, but
+    # never let a failed pinned model silently become another provider/model
+    # while the UI still presents the user's explicit choice.
+    fail_closed_pin = bool(pin_session_override and not persist_global)
+
     if agent:
         try:
             agent.switch_model(
@@ -6479,6 +6526,7 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
                 capabilities=getattr(result, "runtime_capabilities", None),
+                persist_billing_route=not one_turn,
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -6493,17 +6541,29 @@ def _apply_model_switch(
                 f"Model switch to {result.new_model} failed ({exc}); "
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
+        _set_agent_fallback_policy(agent, disabled=fail_closed_pin)
+        if pin_session_override and isinstance(session, dict) and not one_turn:
+            # Commit the override before persisting live runtime so an immediate
+            # restart/resume cannot lose the fail-closed route-pin marker.
+            session["model_override"] = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+                "api_key": result.api_key,
+                "api_mode": result.api_mode,
+                "fallback_disabled": fail_closed_pin,
+            }
         _restart_slash_worker(sid, session)
-        _persist_live_session_runtime(session)
-        _persist_live_session_system_prompt(session)
-        _append_model_switch_marker(
-            session, model=result.new_model, provider=result.target_provider
-        )
-        _emit("session.info", sid, _session_info(agent, session))
         if one_turn:
             session["one_turn_model_restore"] = restore_snapshot
         else:
             session.pop("one_turn_model_restore", None)
+            _persist_live_session_runtime(session)
+            _persist_live_session_system_prompt(session)
+            _append_model_switch_marker(
+                session, model=result.new_model, provider=result.target_provider
+            )
+        _emit("session.info", sid, _session_info(agent, session))
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session (e.g. /new via _reset_session_agent, or resume) re-derives the
@@ -6525,6 +6585,7 @@ def _apply_model_switch(
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
+            "fallback_disabled": fail_closed_pin,
         }
     if persist_global:
         _persist_model_switch(result)
@@ -7033,6 +7094,23 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
             sid,
             {"message": f"Could not switch model: {e}"},
         )
+
+
+def _prepare_turn_model_runtime(sid: str, session: dict) -> dict | None:
+    """Apply queued switches and return any one-turn restore for this turn."""
+    blocked_restore = session.get("blocked_one_turn_model_restore")
+    if isinstance(blocked_restore, dict):
+        _restore_agent_model_runtime(session.get("agent"), blocked_restore)
+        session.pop("blocked_one_turn_model_restore", None)
+        _restart_slash_worker(sid, session)
+    restore = session.pop("one_turn_model_restore", None)
+    if restore:
+        return restore
+    _apply_pending_model_switch(sid, session)
+    restore = session.pop("one_turn_model_restore", None)
+    if not restore:
+        _sync_agent_model_with_config(sid, session)
+    return restore
 
 
 class CompressionLockHeld(Exception):
@@ -7571,6 +7649,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
     }
+    model_override = (session or {}).get("model_override")
+    if isinstance(model_override, dict) and "fallback_disabled" in model_override:
+        info["fallback_disabled"] = bool(model_override["fallback_disabled"])
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -8883,6 +8964,8 @@ class _RuntimeFallbackResolution(NamedTuple):
 
 def _resolve_runtime_with_fallback(
     resolve_kwargs: dict | None = None,
+    *,
+    allow_fallback: bool = True,
 ) -> _RuntimeFallbackResolution:
     """Resolve the primary runtime or one complete provider/model fallback.
 
@@ -8902,6 +8985,8 @@ def _resolve_runtime_with_fallback(
             False,
         )
     except AuthError as primary_exc:
+        if not allow_fallback:
+            raise
         fb_chain = _load_fallback_model() or []
         for entry in fb_chain:
             if not isinstance(entry, dict):
@@ -9013,6 +9098,10 @@ def _make_agent(
     # Prefer a per-session model override (set by a prior in-session /model
     # switch) over global config/env resolution. Resume-time stored sessions may
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
+    fallback_disabled = bool(
+        isinstance(model_override, dict)
+        and model_override.get("fallback_disabled") is True
+    )
     if isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
         requested_provider = model_override.get("provider") or provider_override or None
@@ -9045,7 +9134,10 @@ def _make_agent(
                 resolve_kwargs["explicit_base_url"] = override_base_url
         resolve_kwargs["requested"] = requested_provider
         resolve_kwargs["target_model"] = model or None
-        resolution = _resolve_runtime_with_fallback(resolve_kwargs)
+        resolution = _resolve_runtime_with_fallback(
+            resolve_kwargs,
+            allow_fallback=not fallback_disabled,
+        )
         runtime = resolution.runtime
         if resolution.used_fallback:
             if not resolution.selected_model:
@@ -9121,7 +9213,11 @@ def _make_agent(
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
-        fallback_model=_load_fallback_model(),
+        # Only an explicit session route pin disables fallback. Resume/global
+        # rebuilds also carry model_override but set fallback_disabled=False.
+        fallback_model=cast(
+            Any, [] if fallback_disabled else _load_fallback_model()
+        ),
         **_agent_cbs(sid),
     )
     if context_cwd_is_launch_artifact is None:
@@ -12808,7 +12904,7 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
-        one_turn_restore = session.pop("one_turn_model_restore", None)
+        one_turn_restore = None
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
@@ -13589,10 +13685,22 @@ def _run_prompt_submit(
             if one_turn_restore:
                 try:
                     _restore_agent_model_runtime(agent, one_turn_restore)
+                    session.pop("blocked_one_turn_model_restore", None)
                     _restart_slash_worker(sid, session)
-                    _persist_live_session_runtime(session)
-                    _persist_live_session_system_prompt(session)
-                except Exception:
+                except Exception as exc:
+                    session["blocked_one_turn_model_restore"] = copy.deepcopy(
+                        one_turn_restore
+                    )
+                    _emit(
+                        "error",
+                        sid,
+                        {
+                            "message": (
+                                f"One-turn model restore failed ({exc}); future prompts "
+                                "are blocked until restoration succeeds."
+                            )
+                        },
+                    )
                     logger.debug("TUI one-turn model restore failed", exc_info=True)
             try:
                 if approval_token is not None:

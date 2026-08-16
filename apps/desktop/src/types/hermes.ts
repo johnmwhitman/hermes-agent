@@ -700,6 +700,7 @@ export interface SessionRuntimeInfo {
   credential_warning?: string
   cwd?: string
   desktop_contract?: number
+  fallback_disabled?: boolean
   fast?: boolean
   install_warning?: string
   model?: string

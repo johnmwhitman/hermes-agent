@@ -3146,15 +3146,19 @@ def _model_flow_anthropic(config, current_model=""):
     from hermes_cli.models import _PROVIDER_MODELS
 
     # Check ALL credential sources
-    from hermes_cli.auth import get_anthropic_key
+    from hermes_cli.auth import PROVIDER_REGISTRY
 
-    existing_key = get_anthropic_key()
+    existing_key, credential_source = _existing_api_key_for_model_flow(
+        "anthropic", PROVIDER_REGISTRY["anthropic"]
+    )
+    pool_backed = credential_source.startswith("credential_pool:")
+    from agent.anthropic_adapter import _is_oauth_token
+
     cc_available = False
     try:
         from agent.anthropic_adapter import (
             read_claude_code_credentials,
             is_claude_code_token_valid,
-            _is_oauth_token,
         )
 
         cc_creds = read_claude_code_credentials()
@@ -3167,7 +3171,12 @@ def _model_flow_anthropic(config, current_model=""):
     # (no valid cc_creds to fall back on), treat it as missing so the re-auth
     # path is offered instead of silently accepting a broken token.
     existing_is_stale_oauth = False
-    if existing_key and _is_oauth_token(existing_key) and not cc_available:
+    if (
+        existing_key
+        and _is_oauth_token(existing_key)
+        and not cc_available
+        and not pool_backed
+    ):
         existing_is_stale_oauth = True
 
     has_creds = (bool(existing_key) and not existing_is_stale_oauth) or cc_available

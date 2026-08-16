@@ -48,8 +48,17 @@ def _(rid, params: dict) -> dict:
     # for a new chat can't mutate the profile default. provider is optional
     # (resolved at build).
     create_model = str(params.get("model") or "").strip()
+    fallback_disabled = (
+        bool(params.get("fallback_disabled"))
+        if "fallback_disabled" in params
+        else True
+    )
     session_model_override = (
-        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
+        {
+            "model": create_model,
+            "provider": str(params.get("provider") or "").strip() or None,
+            "fallback_disabled": fallback_disabled,
+        }
         if create_model
         else None
     )

@@ -2905,7 +2905,6 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
         overrides["extra_body"] = dict(new_extra_body)
     agent.request_overrides = overrides
 
-
 def switch_model(
     agent,
     new_model,
@@ -2914,6 +2913,7 @@ def switch_model(
     base_url='',
     api_mode='',
     capabilities=None,
+    persist_billing_route=True,
 ):
     """Switch the model/provider in-place for a live agent.
 
@@ -3419,7 +3419,7 @@ def switch_model(
     # See #48248 for the full bug description.
     _session_db = getattr(agent, "_session_db", None)
     _session_id = getattr(agent, "session_id", None)
-    if _session_db is not None and _session_id:
+    if persist_billing_route and _session_db is not None and _session_id:
         try:
             _session_db.update_session_billing_route(
                 _session_id,
