@@ -5256,7 +5256,22 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        # #43589 follow-up (2026-08-17): serialize the refresh on the GLOBAL
+        # root store's lock, not the caller's profile lock. xAI rotates the
+        # refresh token on every use and revokes the grant family on replay;
+        # ten profile gateways each hold a *different* profile lock, so two
+        # of them could race the same root-resolved refresh token and kill
+        # the grant within minutes of `hermes auth add xai-oauth` (the
+        # write-through in _save_xai_oauth_tokens fixed persistence but not
+        # this cross-profile race). Locking the root path gives all profiles
+        # one mutex; the under-lock re-read below then sees the rotated chain
+        # written through by whichever process refreshed first and skips its
+        # own refresh. In classic mode _global_auth_file_path() is None and
+        # target_path=None degrades to the active-store lock (old behavior).
+        with _auth_store_lock(
+            timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0),
+            target_path=_global_auth_file_path(),
+        ):
             data = _read_xai_oauth_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
@@ -5288,8 +5303,16 @@ def resolve_xai_oauth_runtime_credentials(
                         # Clear dead tokens from auth.json so subsequent sessions fail fast
                         # without a network retry. Mirrors credential_pool.py quarantine.
                         try:
+                            # 2026-08-17: quarantine into the SOURCE store the
+                            # grant was resolved from. The old code stored the
+                            # emptied state into the PROFILE store, creating a
+                            # shadowing providers.xai-oauth stub that hides the
+                            # root grant from this lane forever (#74339 shape).
                             _q_store = _load_auth_store()
-                            _q_state = _load_provider_state(_q_store, "xai-oauth") or {}
+                            _q_state, _q_source = _load_provider_state_with_source(
+                                _q_store, "xai-oauth"
+                            )
+                            _q_state = _q_state or {}
                             _q_tokens = dict(_q_state.get("tokens") or {})
                             _q_tokens.pop("access_token", None)
                             _q_tokens.pop("refresh_token", None)
@@ -5302,8 +5325,14 @@ def resolve_xai_oauth_runtime_credentials(
                                 "relogin_required": True,
                                 "at": datetime.now(timezone.utc).isoformat(),
                             }
-                            _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
-                            _save_auth_store(_q_store)
+                            _q_active = _auth_file_path()
+                            if _q_source is not None and not _same_path(_q_source, _q_active):
+                                _persist_provider_state_to_store(
+                                    "xai-oauth", _q_state, _q_source, set_active=False
+                                )
+                            else:
+                                _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
+                                _save_auth_store(_q_store)
                         except Exception as _save_exc:
                             logger.debug(
                                 "xAI OAuth: failed to persist quarantined state: %s", _save_exc,
