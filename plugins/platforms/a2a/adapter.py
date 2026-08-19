@@ -573,6 +573,23 @@ class A2AAdapter(BasePlatformAdapter):
                 local = val["local"]
             else:
                 local = profile in ("", self._active_profile)
+            model = str(val.get("model") or "").strip()
+            provider = str(val.get("provider") or "").strip()
+            # Any explicit pin overrides the profile default — surface it.
+            # subs/* shims are text-only; pinning one resurrects the 08-15
+            # hollow-reply class (fabricated OS errors, zero tool rows).
+            if model:
+                logger.warning(
+                    "A2A: served agent %r pins model %r — forwarded tasks override the profile default",
+                    slug, model,
+                )
+                model_l = model.lower()
+                if model_l.startswith("subs/") or "/subs/" in model_l:
+                    logger.warning(
+                        "A2A: refusing served agent %r — model %r is a text-only subs/* shim",
+                        slug, model,
+                    )
+                    continue
             tenant = str(val.get("tenant") or slug).strip()
             if tenant:
                 if tenant in tenants:
@@ -592,8 +609,8 @@ class A2AAdapter(BasePlatformAdapter):
                 "description": str(val.get("description") or f"Hermes profile '{profile or slug}' exposed over A2A."),
                 "advertised_toolsets": list(toolsets or []),
                 "timeout": int(val.get("timeout") or _reply_timeout()),
-                "model": str(val.get("model") or "").strip(),
-                "provider": str(val.get("provider") or "").strip(),
+                "model": model,
+                "provider": provider,
             }
         return agents
 
@@ -979,7 +996,7 @@ class A2AAdapter(BasePlatformAdapter):
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
-                "WHERE id = ? AND (ended_at IS NULL OR end_reason = 'agent_close')",
+                "WHERE id = ? AND (ended_at IS NULL OR end_reason IN ('agent_close', 'cli_close'))",
                 (time.time(), reason, session_id),
             )
             row = con.execute(

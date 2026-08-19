@@ -1619,6 +1619,74 @@ class TestV1SpecRegressionFixes:
         assert "one" in adapter._agents
         assert "two" not in adapter._agents
 
+    def test_served_agent_model_pin_warns_and_keeps_tool_capable(self, caplog):
+        import logging
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        with caplog.at_level(logging.WARNING, logger="plugins.platforms.a2a.adapter"):
+            adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+                "agents": {
+                    "overwatch": {
+                        "profile": "overwatch",
+                        "tenant": "overwatch",
+                        "model": "grok-4.6",
+                        "provider": "xai-oauth",
+                    }
+                }
+            }))
+        assert "overwatch" in adapter._agents
+        assert adapter._agents["overwatch"]["model"] == "grok-4.6"
+        assert any(
+            "overwatch" in rec.getMessage()
+            and "grok-4.6" in rec.getMessage()
+            and "pins model" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_served_agent_refuses_subs_shim_model(self, caplog):
+        import logging
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        with caplog.at_level(logging.WARNING, logger="plugins.platforms.a2a.adapter"):
+            adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+                "agents": {
+                    "spritefactory": {
+                        "profile": "spritefactory",
+                        "tenant": "spritefactory",
+                        "model": "subs/codex",
+                    },
+                    "ok": {"profile": "ok", "tenant": "ok"},
+                }
+            }))
+        assert "spritefactory" not in adapter._agents
+        assert "ok" in adapter._agents
+        msgs = [rec.getMessage() for rec in caplog.records]
+        assert any("spritefactory" in m and "subs/codex" in m and "refusing" in m for m in msgs)
+        assert any("spritefactory" in m and "pins model" in m for m in msgs)
+
+    def test_served_agent_refuses_qualified_and_cased_subs_shim(self):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "overwatch": {
+                    "profile": "overwatch",
+                    "tenant": "overwatch",
+                    "model": "routeplane/subs/minimax",
+                },
+                "spritefactory": {
+                    "profile": "spritefactory",
+                    "tenant": "spritefactory",
+                    "model": "SUBS/Grok",
+                },
+            }
+        }))
+        assert "overwatch" not in adapter._agents
+        assert "spritefactory" not in adapter._agents
+
     def test_forward_to_profile_first_contact_creates_then_resumes_fake_hermes(self, monkeypatch, tmp_path):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
@@ -1718,8 +1786,8 @@ print('fake reply')
                 "dev": {
                     "profile": "dev",
                     "tenant": "dev",
-                    "model": "subs/codex",
-                    "provider": "routeplane",
+                    "model": "grok-4.6",
+                    "provider": "xai-oauth",
                     "timeout": 5,
                 }
             }
@@ -1732,8 +1800,8 @@ print('fake reply')
         assert (reply, state) == ("route pin reply", protocol.STATE_COMPLETED)
         assert calls
         assert calls[0][1:3] == ["--profile", "dev"]
-        assert calls[0][calls[0].index("-m") + 1] == "subs/codex"
-        assert calls[0][calls[0].index("--provider") + 1] == "routeplane"
+        assert calls[0][calls[0].index("-m") + 1] == "grok-4.6"
+        assert calls[0][calls[0].index("--provider") + 1] == "xai-oauth"
 
     def test_forward_to_profile_serializes_first_contacts_per_profile(
         self, monkeypatch, tmp_path
@@ -2181,6 +2249,54 @@ print('fake reply')
         assert (reply, state) == ("final reply", protocol.STATE_COMPLETED)
         store = SessionDB(state_path, read_only=True)
         session = store.get_session("sess-agent-close")
+        store.close()
+        assert session is not None
+        assert session["end_reason"] == "a2a_complete"
+
+    def test_forward_to_profile_promotes_cli_close_to_a2a_complete(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        state_path = profile_home / "state.db"
+        SessionDB(state_path).close()
+
+        def fake_run_command(cmd, timeout, env):
+            store = SessionDB(state_path)
+            store.create_session("sess-cli-close", "a2a", model="test-model")
+            store.append_message(
+                "sess-cli-close", "assistant", content="", tool_calls=_FAKE_TOOL_CALLS
+            )
+            store.append_message(
+                "sess-cli-close", "assistant", content="final reply"
+            )
+            store.end_session("sess-cli-close", "cli_close")
+            store.close()
+            return 0, "final reply", ""
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home",
+            lambda profile: str(profile_home),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._run_profile_command",
+            staticmethod(fake_run_command),
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+        }))
+
+        reply, state = adapter._forward_to_profile(
+            adapter._agents["dev"], "peer", "ctx-cli-close", "hello"
+        )
+
+        assert (reply, state) == ("final reply", protocol.STATE_COMPLETED)
+        store = SessionDB(state_path, read_only=True)
+        session = store.get_session("sess-cli-close")
         store.close()
         assert session is not None
         assert session["end_reason"] == "a2a_complete"
