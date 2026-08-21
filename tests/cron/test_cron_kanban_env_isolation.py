@@ -216,13 +216,18 @@ class TestRunJobKanbanIsolation:
         import sys
 
         import cron.scheduler as sched
-        from agent.delegation_context import is_dispatcher_owned_worker_context
+        from agent.delegation_context import (
+            delegated_child_subprocess_env,
+            is_delegated_child_context,
+            is_dispatcher_owned_worker_context,
+        )
 
         class FakeAgent:
             def __init__(self, **kwargs):
                 observed["dispatcher_owned_during_init"] = (
                     is_dispatcher_owned_worker_context()
                 )
+                observed["delegated_child_during_init"] = is_delegated_child_context()
                 observed["kanban_env_during_init"] = {
                     k: v for k, v in os.environ.items()
                     if k.startswith("HERMES_KANBAN_")
@@ -232,6 +237,8 @@ class TestRunJobKanbanIsolation:
                 observed["dispatcher_owned_during_run"] = (
                     is_dispatcher_owned_worker_context()
                 )
+                observed["delegated_child_during_run"] = is_delegated_child_context()
+                observed["subprocess_env_during_run"] = delegated_child_subprocess_env()
                 return {"final_response": "done", "messages": []}
 
             def get_activity_summary(self):
@@ -375,8 +382,90 @@ class TestRunJobKanbanIsolation:
 
 
 # ---------------------------------------------------------------------------
+# Stale delegate_task child marker (contextvars leak into a cron execution)
+# ---------------------------------------------------------------------------
+
+class TestDelegatedChildClearedContext:
+    def test_token_form_clears_and_restores(self):
+        import agent.delegation_context as dc
+
+        outer = dc._DELEGATED_CHILD_CONTEXT.set(True)
+        try:
+            assert dc.is_delegated_child_context() is True
+            token = dc.enter_delegated_child_cleared_context()
+            assert token.old_value is True
+            assert dc.is_delegated_child_context() is False
+            dc.exit_delegated_child_cleared_context(token)
+            assert dc.is_delegated_child_context() is True
+        finally:
+            dc._DELEGATED_CHILD_CONTEXT.reset(outer)
+
+    def test_token_form_on_clean_context(self):
+        import agent.delegation_context as dc
+
+        token = dc.enter_delegated_child_cleared_context()
+        assert dc.is_delegated_child_context() is False
+        dc.exit_delegated_child_cleared_context(token)
+        assert dc.is_delegated_child_context() is False
+
+
+class TestRunJobClearsLeakedDelegatedChildContext:
+    """A delegate_task child execution can leave _DELEGATED_CHILD_CONTEXT=True
+    in a long-lived asyncio context that later fires a cron job (observed
+    2026-08-21: the conductor planner cron could not `hermes kanban create`
+    after a gateway restart — every subprocess carried
+    HERMES_DELEGATED_CHILD_CONTEXT=1 and hit the kanban_db mutation guard).
+    run_job must clear the stale marker for the job's scope."""
+
+    def test_agent_runs_without_child_marker(self, monkeypatch, caplog):
+        import agent.delegation_context as dc
+        import cron.scheduler as sched
+
+        observed: dict = {}
+        TestRunJobKanbanIsolation._install_stubs(monkeypatch, observed)
+
+        outer = dc._DELEGATED_CHILD_CONTEXT.set(True)
+        try:
+            with caplog.at_level("WARNING", logger="cron.scheduler"):
+                success, *_ = sched.run_job(
+                    TestRunJobKanbanIsolation._job("delegated-leak")
+                )
+            assert success is True
+            assert observed["delegated_child_during_init"] is False
+            assert observed["delegated_child_during_run"] is False
+            # The scrubber must NOT fire for this job's subprocesses: env=None
+            # passthrough, no HERMES_DELEGATED_CHILD_CONTEXT materialized.
+            assert observed["subprocess_env_during_run"] is None
+            # The leak is logged as the diagnostic datum.
+            assert any(
+                "leaked _DELEGATED_CHILD_CONTEXT" in r.message for r in caplog.records
+            )
+            # Prior context state is restored after the job.
+            assert dc.is_delegated_child_context() is True
+        finally:
+            dc._DELEGATED_CHILD_CONTEXT.reset(outer)
+
+    def test_no_warning_on_clean_context(self, monkeypatch, caplog):
+        import cron.scheduler as sched
+
+        observed: dict = {}
+        TestRunJobKanbanIsolation._install_stubs(monkeypatch, observed)
+
+        with caplog.at_level("WARNING", logger="cron.scheduler"):
+            success, *_ = sched.run_job(
+                TestRunJobKanbanIsolation._job("delegated-clean")
+            )
+        assert success is True
+        assert observed["delegated_child_during_run"] is False
+        assert not any(
+            "leaked _DELEGATED_CHILD_CONTEXT" in r.message for r in caplog.records
+        )
+
+
+# ---------------------------------------------------------------------------
 # Drift guard
 # ---------------------------------------------------------------------------
+
 
 def test_every_dispatcher_kanban_var_is_identity_gated():
     """Invariant: every HERMES_KANBAN_* var the dispatcher injects is covered by

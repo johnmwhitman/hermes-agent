@@ -121,6 +121,31 @@ def exit_non_dispatcher_owned_context(token: Token[bool]) -> None:
     _NON_DISPATCHER_OWNED_CONTEXT.reset(token)
 
 
+def enter_delegated_child_cleared_context() -> Token[bool]:
+    """Explicitly clear the delegate_task child marker for this scope.
+
+    ``contextvars`` state is copied into every new asyncio task / thread hop,
+    so a ``delegate_task`` child execution that creates (or whose context is
+    reused by) a long-lived task can leave ``_DELEGATED_CHILD_CONTEXT`` set to
+    True in that context forever.  A later ``cron.scheduler.run_job`` fired on
+    that context then inherits the stale marker and every subprocess it spawns
+    gets ``HERMES_DELEGATED_CHILD_CONTEXT=1`` — failing the Kanban DB mutation
+    guard (``kanban_db._assert_not_delegated_child_mutation``) even though a
+    cron job is definitionally never a delegate_task child.
+
+    A cron job therefore clears the flag for its scope.  If the flag reads
+    True at entry here it is stale by definition — a real delegate_task child
+    never calls ``run_job``.  Inspect ``Token.old_value`` to log the leak.
+    Pair with :func:`exit_delegated_child_cleared_context`.
+    """
+    return _DELEGATED_CHILD_CONTEXT.set(False)
+
+
+def exit_delegated_child_cleared_context(token: Token[bool]) -> None:
+    """Restore the flag saved by :func:`enter_delegated_child_cleared_context`."""
+    _DELEGATED_CHILD_CONTEXT.reset(token)
+
+
 def is_delegated_child_process_context() -> bool:
     """Return True in this process or a subprocess spawned by a child."""
     import os

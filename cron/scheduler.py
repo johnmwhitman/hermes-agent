@@ -57,7 +57,9 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
+    enter_delegated_child_cleared_context,
     enter_non_dispatcher_owned_context,
+    exit_delegated_child_cleared_context,
     exit_non_dispatcher_owned_context,
 )
 
@@ -5866,6 +5868,7 @@ def run_job(
     _cron_session_token = None
     _non_dispatcher_token = None
     _session_db = None
+    _delegated_child_token = None
     try:
 
         # Scope cron approval policy to this job. Keep the token so the finally
@@ -5893,6 +5896,29 @@ def run_job(
         # concurrent cron jobs on the parallel pool.  contextvars.copy_context()
         # at the run_conversation hop carries this into the agent thread.
         _non_dispatcher_token = enter_non_dispatcher_owned_context()
+
+        # A cron job is never a delegate_task child, so _DELEGATED_CHILD_CONTEXT
+        # must be False for this job's scope.  contextvars state is copied into
+        # every new asyncio task / thread hop: a delegate_task child execution
+        # that created (or whose context was reused by) the long-lived task now
+        # running this job would leak the marker in as True, and every
+        # subprocess this job spawns would then carry
+        # HERMES_DELEGATED_CHILD_CONTEXT=1 — failing the Kanban DB mutation
+        # guard (kanban_db._assert_not_delegated_child_mutation) for an
+        # unrelated cron agent (observed 2026-08-21: the conductor planner cron
+        # could not `hermes kanban create` for 3 consecutive fires after a
+        # gateway restart).  Clear it explicitly; if it was True at entry the
+        # value is stale by definition (a real delegate_task child never calls
+        # run_job), so log the leak as the diagnostic datum.
+        _delegated_child_token = enter_delegated_child_cleared_context()
+        if _delegated_child_token.old_value is True:
+            logger.warning(
+                "Job '%s': cleared a leaked _DELEGATED_CHILD_CONTEXT=True "
+                "(stale delegate_task child marker inherited by this execution "
+                "context); subprocesses would have been scrubbed as delegated "
+                "children",
+                job_id,
+            )
         if _job_workdir:
             logger.info("Job '%s': using task-scoped workdir %s", job_id, _job_workdir)
 
@@ -6802,6 +6828,8 @@ def run_job(
             _cron_session_var.reset(_cron_session_token)
         if _non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
+        if _delegated_child_token is not None:
+            exit_delegated_child_cleared_context(_delegated_child_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
