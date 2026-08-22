@@ -344,6 +344,7 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.skills_refused,
         )):
             outcome = "idle"
         invoke_hook(
@@ -8080,6 +8081,21 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    skills_refused: list[tuple[str, str, str]] = field(default_factory=list)
+    """Task ids that the skills preflight refused to spawn, as
+    ``(task_id, unresolved_skill_csv, reason)`` tuples.
+
+    Surfaced by ``_dispatch_once_locked`` after
+    ``fleet_supervisor.skills_preflight.validate_task_skills`` returns
+    ``False`` for a claimed task. The dispatcher records the refusal,
+    appends a ``skills_preflight_refused`` event, and returns the task to
+    ``ready`` WITHOUT invoking the spawn function — historically the
+    spawn would crash inside the worker at startup (pid not alive within
+    300s) and the task would burn its failure budget on a deterministic
+    misconfiguration. Pre-empts that crash loop: the operator sees the
+    skill name + remediation hint in ``hermes kanban show`` and can
+    either install the skill or rewrite the task body before another
+    tick respawns."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -10260,6 +10276,34 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # Skills preflight: if the task pins any ``skills`` the assignee
+        # can't resolve, refuse to spawn — historically the worker would
+        # import the requested skill at startup, fail to find it, exit
+        # non-zero, and the dispatcher would record ``crashed`` + bump
+        # ``consecutive_failures`` until the failure_limit circuit
+        # breaker tripped. By validating up-front we (a) surface the
+        # exact unresolved skill name + remediation hint to the operator
+        # via the ``skills_preflight_refused`` event, and (b) keep the
+        # failure budget intact for genuine runtime errors. The
+        # ``fleet_supervisor.skills_preflight`` module is the same one
+        # exercised by ``fleet-supervisor/tests/test_skills_preflight.py``.
+        _skills_refused = _skills_preflight_check(claimed)
+        if _skills_refused is not None:
+            unresolved_csv, reason = _skills_refused
+            result.skills_refused.append(
+                (claimed.id, unresolved_csv, reason)
+            )
+            with write_txn(conn):
+                _append_event(
+                    conn, claimed.id, "skills_preflight_refused",
+                    {
+                        "assignee": claimed.assignee or "",
+                        "requested_skills": list(claimed.skills or []),
+                        "unresolved_skills": unresolved_csv,
+                        "reason": reason,
+                    },
+                )
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -10715,6 +10759,88 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
+def _skills_preflight_check(
+    task: Task,
+) -> Optional[tuple[str, str]]:
+    """Validate ``task.skills`` against the assignee's installed skills.
+
+    Returns ``None`` when every requested skill resolves (or when the task
+    pins no skills at all). Returns a ``(unresolved_csv, reason)`` tuple
+    when at least one skill cannot be resolved — the dispatcher then
+    refuses to spawn, records a ``skills_preflight_refused`` event, and
+    leaves the task on the board for the operator to either install the
+    skill (`hermes -p <assignee> skills install <name>`) or rewrite the
+    task body to drop the skill reference.
+
+    The check is best-effort: failures of the lazy import (the
+    ``fleet-supervisor`` module isn't reachable, the path is wrong,
+    etc.) are logged at DEBUG and treated as ``None`` so a missing
+    preflight never breaks a spawn. The module is the same one
+    exercised by ``fleet-supervisor/tests/test_skills_preflight.py``.
+    """
+    requested = list(task.skills or [])
+    if not requested:
+        return None
+    if not task.assignee:
+        # No assignee ⇒ ``_default_spawn`` will refuse too. Don't
+        # double-handle: leave the existing skipped_unassigned path.
+        return None
+    # Load skills_preflight by absolute file path. The module is a
+    # flat sibling under ``agents/fleet-supervisor/`` (no
+    # ``__init__.py``); we resolve its location via the well-known
+    # canonical repo root and ``importlib``, with the directory
+    # temporarily on ``sys.path`` so its own relative imports work
+    # (skills_preflight has none today, but the invariant protects
+    # future drift).
+    try:
+        import importlib.util as _ilu
+        import sys as _sys
+        _AGENTS_ROOT = "/Users/johnwhitman/AI/agents"
+        _FS_DIR = _AGENTS_ROOT + "/fleet-supervisor"
+        _SP_PATH = _FS_DIR + "/skills_preflight.py"
+        if _FS_DIR not in _sys.path:
+            _sys.path.insert(0, _FS_DIR)
+        _spec = _ilu.spec_from_file_location(
+            "_kanban_skills_preflight", _SP_PATH
+        )
+        if _spec is None or _spec.loader is None:
+            _log.debug(
+                "kanban: skills preflight spec unavailable; falling through to spawn"
+            )
+            return None
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        validate_task_skills = _mod.validate_task_skills
+        SkillStatus = _mod.SkillStatus
+    except Exception as exc:
+        _log.debug(
+            "kanban: skills preflight unavailable, falling through to spawn (%s)",
+            exc,
+        )
+        return None
+    try:
+        ok, resolutions = validate_task_skills(requested, profile=task.assignee)
+    except Exception as exc:
+        _log.debug(
+            "kanban: skills preflight raised (%s); treating as ok to avoid blocking spawn",
+            exc,
+        )
+        return None
+    if ok:
+        return None
+    unresolved = [
+        r.name for r in resolutions if r.status != SkillStatus.OK
+    ]
+    reasons = sorted({r.status for r in resolutions if r.status != SkillStatus.OK})
+    first_remediation = next(
+        (r.remediation for r in resolutions if r.remediation), ""
+    )
+    reason_blob = ",".join(reasons)
+    if first_remediation:
+        reason_blob = f"{reason_blob}: {first_remediation}"
+    return ",".join(unresolved), reason_blob
 
 
 def _default_spawn(

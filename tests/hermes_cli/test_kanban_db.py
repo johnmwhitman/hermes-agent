@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -1301,6 +1302,208 @@ def test_dispatch_max_in_progress_blocks_review_when_at_limit(
     assert not spawns
     assert review_task is not None
     assert review_task.status == "review"
+
+# Skills preflight refusal — dispatch refuses to spawn a task whose
+# requested skills don't resolve in the assignee's skills/ tree, and
+# still spawns normally when skills resolve. The point is to keep
+# "wrong skills" from burning the failure budget on a doomed worker
+# startup.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_skips_spawn_when_skills_preflight_refuses(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A task pinning ``skills=['design-review']`` for a profile that
+    has no ``design-review`` skill installed (here, ``alice`` in an
+    isolated temp HERMES_HOME) must NOT be spawned — the dispatcher
+    records a ``skills_preflight_refused`` event with the unresolved
+    skill name and remediation hint, leaves the task on the board, and
+    does NOT increment ``consecutive_failures``. This is the regression
+    test for the Vela crash loop observed in
+    ``hermes-kanban/diagnostics`` 2026-08-22 16:25–16:45: a missing
+    ``design-review`` skill caused the worker to exit non-zero during
+    skill load, and the dispatcher bumped failures until the circuit
+    breaker tripped at failure_limit=2. With preflight, the loop is
+    pre-empted at the dispatcher.
+    """
+    spawn_calls = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawn_calls.append((task.id, task.skills))
+        return 42
+
+    # Load skills_preflight by absolute file path (the same way the
+    # dispatcher's ``_skills_preflight_check`` does at runtime). The
+    # module is a flat sibling under ``agents/fleet-supervisor/`` with
+    # no ``__init__.py``, so a normal ``import`` cannot find it.
+    import importlib.util as _iu
+    import sys as _sys
+    _FS_DIR = "/Users/johnwhitman/AI/agents/fleet-supervisor"
+    if _FS_DIR not in _sys.path:
+        _sys.path.insert(0, _FS_DIR)
+    _spec = _iu.spec_from_file_location(
+        "_fs_skills_preflight_refuse", _FS_DIR + "/skills_preflight.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    sp = _iu.module_from_spec(_spec)
+    _sys.modules["_fs_skills_preflight_refuse"] = sp
+    _spec.loader.exec_module(sp)
+    from pathlib import Path as _P
+    profile_root = kanban_home / "profiles" / "alice"
+    real_validate = sp.validate_task_skills
+
+    def _rooted_validate(skills, profile, **kw):
+        old_root = sp._PROFILES_ROOT
+        object.__setattr__(sp, "_PROFILES_ROOT", _P(str(profile_root)).parent)
+        try:
+            return real_validate(skills, profile, **kw)
+        finally:
+            object.__setattr__(sp, "_PROFILES_ROOT", old_root)
+
+    monkeypatch.setattr(sp, "validate_task_skills", _rooted_validate)
+    # The dispatcher loads its own copy of the module; we need to
+    # patch THE DISPATCHER'S module. Easier: monkey-patch
+    # ``kb._skills_preflight_check`` itself with a wrapper that calls
+    # our rooted validate.
+    real_preflight_check = kb._skills_preflight_check
+
+    def rooted_preflight_check(task):
+        requested = list(task.skills or [])
+        if not requested or not task.assignee:
+            return None
+        ok, resolutions = _rooted_validate(requested, task.assignee)
+        if ok:
+            return None
+        unresolved = [r.name for r in resolutions if r.status != sp.SkillStatus.OK]
+        reasons = sorted({r.status for r in resolutions if r.status != sp.SkillStatus.OK})
+        first_remediation = next(
+            (r.remediation for r in resolutions if r.remediation), ""
+        )
+        reason_blob = ",".join(reasons)
+        if first_remediation:
+            reason_blob = f"{reason_blob}: {first_remediation}"
+        return ",".join(unresolved), reason_blob
+
+    monkeypatch.setattr(kb, "_skills_preflight_check", rooted_preflight_check)
+
+    with kb.connect() as conn:
+        task = kb.create_task(conn, title="vela sweep", assignee="alice")
+        # Pin ``design-review`` explicitly — none installed → refusal.
+        conn.execute(
+            "UPDATE tasks SET skills = ? WHERE id = ?",
+            (json.dumps(["design-review"]), task),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=5)
+        events = list(conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? ORDER BY id",
+            (task,),
+        ).fetchall())
+
+    # The dispatcher refused → no spawn happened.
+    assert not spawn_calls, (
+        f"spawn_fn was called despite skills_preflight refusal: {spawn_calls}"
+    )
+    assert res.skills_refused, (
+        f"expected skills_refused to be non-empty; got {res.skills_refused}"
+    )
+    refused_id, unresolved_csv, reason_blob = res.skills_refused[0]
+    assert refused_id == task
+    assert "design-review" in unresolved_csv
+    assert reason_blob, "reason_blob must carry a remediation hint"
+    # An event with kind ``skills_preflight_refused`` must be on the
+    # task's event trail so ``hermes kanban show`` can show the
+    # remediation hint.
+    refusal_events = [e for e in events if e[0] == "skills_preflight_refused"]
+    assert refusal_events, (
+        f"expected at least one skills_preflight_refused event; got kinds={[e[0] for e in events]}"
+    )
+
+
+def test_dispatch_still_spawns_when_skills_preflight_passes(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Negative control: when skills resolve, the dispatcher must
+    invoke spawn_fn normally — the preflight must NEVER block a
+    well-formed task. Verified by installing a stub skill in an
+    isolated profile dir and pinning that exact name on the task.
+    """
+    spawn_calls = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawn_calls.append(task.id)
+        return 4242
+
+    # Create a stub skill that resolves under alice's profile root.
+    import importlib.util as _iu
+    import sys as _sys
+    _FS_DIR = "/Users/johnwhitman/AI/agents/fleet-supervisor"
+    if _FS_DIR not in _sys.path:
+        _sys.path.insert(0, _FS_DIR)
+    _spec = _iu.spec_from_file_location(
+        "_fs_skills_preflight_pass", _FS_DIR + "/skills_preflight.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    sp = _iu.module_from_spec(_spec)
+    _sys.modules["_fs_skills_preflight_pass"] = sp
+    _spec.loader.exec_module(sp)
+    from pathlib import Path as _P
+    profile_root = kanban_home / "profiles" / "alice"
+    (profile_root / "skills" / "my-installed-skill").mkdir(parents=True)
+    (profile_root / "skills" / "my-installed-skill" / "SKILL.md").write_text(
+        "---\nname: my-installed-skill\n---\nstub\n",
+        encoding="utf-8",
+    )
+
+    real_validate = sp.validate_task_skills
+
+    def _rooted_validate(skills, profile, **kw):
+        old_root = sp._PROFILES_ROOT
+        object.__setattr__(sp, "_PROFILES_ROOT", _P(str(profile_root)).parent)
+        try:
+            return real_validate(skills, profile, **kw)
+        finally:
+            object.__setattr__(sp, "_PROFILES_ROOT", old_root)
+
+    monkeypatch.setattr(sp, "validate_task_skills", _rooted_validate)
+
+    real_preflight_check = kb._skills_preflight_check
+
+    def rooted_preflight_check(task):
+        requested = list(task.skills or [])
+        if not requested or not task.assignee:
+            return None
+        ok, resolutions = _rooted_validate(requested, task.assignee)
+        if ok:
+            return None
+        unresolved = [r.name for r in resolutions if r.status != sp.SkillStatus.OK]
+        reasons = sorted({r.status for r in resolutions if r.status != sp.SkillStatus.OK})
+        first_remediation = next(
+            (r.remediation for r in resolutions if r.remediation), ""
+        )
+        reason_blob = ",".join(reasons)
+        if first_remediation:
+            reason_blob = f"{reason_blob}: {first_remediation}"
+        return ",".join(unresolved), reason_blob
+
+    monkeypatch.setattr(kb, "_skills_preflight_check", rooted_preflight_check)
+
+    with kb.connect() as conn:
+        task = kb.create_task(conn, title="good card", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET skills = ? WHERE id = ?",
+            (json.dumps(["my-installed-skill"]), task),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=5)
+
+    assert spawn_calls == [task], (
+        f"spawn_fn should be called once for resolvable skills; got {spawn_calls}"
+    )
+    assert not res.skills_refused, (
+        f"skills_refused should be empty when skills resolve; got {res.skills_refused}"
+    )
+
 
 # Review column dispatch
 # ---------------------------------------------------------------------------
