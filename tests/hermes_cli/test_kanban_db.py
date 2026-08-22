@@ -1419,6 +1419,19 @@ def test_dispatch_skips_spawn_when_skills_preflight_refuses(
     assert refusal_events, (
         f"expected at least one skills_preflight_refused event; got kinds={[e[0] for e in events]}"
     )
+    # The refused task must be flipped back to ``ready`` so the operator
+    # can fix the missing skill / rewrite the body and the next tick
+    # picks it up without waiting for the claim TTL to expire.
+    refused_task = kb.get_task(conn, task)
+    assert refused_task is not None
+    assert refused_task.status == "ready", (
+        f"refused task must revert to ready so it can be re-claimed; got {refused_task.status}"
+    )
+    assert refused_task.claim_lock is None
+    assert refused_task.claim_expires is None
+    # consecutive_failures is NOT bumped — a deterministic misconfig is
+    # operator-actionable, not a runtime error.
+    assert refused_task.consecutive_failures == 0
 
 
 def test_dispatch_still_spawns_when_skills_preflight_passes(

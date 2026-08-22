@@ -10293,6 +10293,15 @@ def _dispatch_once_locked(
             result.skills_refused.append(
                 (claimed.id, unresolved_csv, reason)
             )
+            # Release the claim and revert status to ``ready`` so the task
+            # is re-claimable once the operator either installs the
+            # skill or rewrites the task body. ``claim_lock`` /
+            # ``claim_expires`` are cleared here so a subsequent
+            # dispatcher tick can re-claim without waiting on TTL.
+            # ``consecutive_failures`` is NOT bumped — a deterministic
+            # misconfiguration is operator-actionable, not a runtime
+            # error, so the failure budget stays intact for genuine
+            # runtime issues.
             with write_txn(conn):
                 _append_event(
                     conn, claimed.id, "skills_preflight_refused",
@@ -10302,6 +10311,17 @@ def _dispatch_once_locked(
                         "unresolved_skills": unresolved_csv,
                         "reason": reason,
                     },
+                )
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'ready',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL
+                     WHERE id = ?
+                    """,
+                    (claimed.id,),
                 )
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
@@ -10802,15 +10822,22 @@ def _skills_preflight_check(
         _SP_PATH = _FS_DIR + "/skills_preflight.py"
         if _FS_DIR not in _sys.path:
             _sys.path.insert(0, _FS_DIR)
-        _spec = _ilu.spec_from_file_location(
-            "_kanban_skills_preflight", _SP_PATH
-        )
+        # Register the module name in sys.modules BEFORE exec_module so
+        # the `@dataclass(frozen=True)` decorator machinery inside
+        # skills_preflight can resolve cls.__module__.__dict__ — without
+        # the registration Python raises
+        # ``'NoneType' object has no attribute '__dict__'`` and the
+        # preflight silently falls through to spawn (the exact bug that
+        # let the Vela crash loop keep recurring on the live dispatch).
+        _mod_name = "_kanban_skills_preflight"
+        _spec = _ilu.spec_from_file_location(_mod_name, _SP_PATH)
         if _spec is None or _spec.loader is None:
             _log.debug(
                 "kanban: skills preflight spec unavailable; falling through to spawn"
             )
             return None
         _mod = _ilu.module_from_spec(_spec)
+        _sys.modules[_mod_name] = _mod
         _spec.loader.exec_module(_mod)
         validate_task_skills = _mod.validate_task_skills
         SkillStatus = _mod.SkillStatus
