@@ -11,6 +11,8 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
 import logging
 import os
 import re
@@ -1346,6 +1348,27 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
+        # Keep dispatch independent from the gateway's default asyncio
+        # executor. Long-running cron or platform work can exhaust that shared
+        # pool and leave every dispatcher ``to_thread`` call queued forever.
+        dispatcher_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="kanban-dispatch",
+        )
+
+        async def _run_dispatch_io(func, *args):
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                dispatcher_executor,
+                functools.partial(func, *args),
+            )
+
+        def _close_dispatch_executor() -> None:
+            # Do not hold gateway shutdown hostage to a wedged filesystem or
+            # SQLite call. The singleton lock prevents a replacement gateway
+            # from overlapping this process's dispatcher.
+            dispatcher_executor.shutdown(wait=False, cancel_futures=True)
+
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         except (ValueError, TypeError):
@@ -1773,7 +1796,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
-                pids = await _to_thread_process_service(_kb.reap_worker_zombies)
+                pids = await _run_dispatch_io(_kb.reap_worker_zombies)
                 if pids:
                     logger.info(
                         "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
@@ -1796,8 +1819,8 @@ class GatewayKanbanWatchersMixin:
                     # takes effect on the next tick, not on gateway restart (#49638).
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
-                        await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(_tick_once)
+                        await _run_dispatch_io(_auto_decompose_tick, _ad_per_tick)
+                    results = await _run_dispatch_io(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
@@ -1816,7 +1839,7 @@ class GatewayKanbanWatchersMixin:
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
                     # Health telemetry (aggregate across boards)
-                    ready_pending = await _to_thread_process_service(_ready_nonempty)
+                    ready_pending = await _run_dispatch_io(_ready_nonempty)
                     if ready_pending and not any_spawned:
                         bad_ticks += 1
                     else:
@@ -1834,6 +1857,7 @@ class GatewayKanbanWatchersMixin:
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                _close_dispatch_executor()
                 self._release_kanban_dispatcher_lock()
                 raise
             except Exception:
@@ -1846,4 +1870,5 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
+        _close_dispatch_executor()
         self._release_kanban_dispatcher_lock()

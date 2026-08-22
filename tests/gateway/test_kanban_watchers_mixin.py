@@ -26,3 +26,12 @@ def test_mixin_defines_kanban_methods():
         assert hasattr(GatewayKanbanWatchersMixin, m), f"mixin missing {m}"
 
 
+def test_dispatcher_uses_private_executor_for_blocking_work():
+    """Dispatcher progress must not depend on the gateway default pool."""
+    source = inspect.getsource(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
+    assert "ThreadPoolExecutor" in source
+    assert "run_in_executor" in source
+    assert "await asyncio.to_thread(_kb.reap_worker_zombies)" not in source
+    assert "await asyncio.to_thread(_tick_once)" not in source
+    assert "await asyncio.to_thread(_ready_nonempty)" not in source
+
