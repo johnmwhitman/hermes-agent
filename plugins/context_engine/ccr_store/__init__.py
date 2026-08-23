@@ -236,3 +236,123 @@ def ccr_retrieve(short_hash: str, profile_dir: Optional[Path] = None) -> Dict[st
         "access_count": rec["access_count"],
         "engine_version": rec["engine_version"],
     }
+
+
+# -- Plugin registration --------------------------------------------------
+#
+# This module registers the `ccr_retrieve` agent tool via the standard
+# plugin seam. It also registers the CCR store init/bootstrap, so any
+# profile with `context.engine: ast_code_compressor|toon_compressor` gets
+# a working CCR toolset without further config.
+#
+# Tool spec follows the OpenAI function-call JSON schema format (same as
+# `plugins/platforms/a2a/tools.py`).
+
+CCR_RETRIEVE_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "ccr_retrieve",
+        "description": (
+            "Retrieve the original (uncompressed) content that was replaced "
+            "by a context-engine skeleton. Use this whenever a conversation "
+            "block contains a line like "
+            "`# original_sha256=HHHHHHHHHHHHHHHH` or "
+            "`# use ccr_retrieve('HHHHHHHHHHHHHHHH') to fetch full code` "
+            "and you need the actual code or JSON. Returns the original "
+            "string (decoded utf-8) plus metadata: content_type, byte_size, "
+            "created_at, access_count, engine_version."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "short_hash": {
+                    "type": "string",
+                    "description": (
+                        "The 16-character sha256 prefix that the context engine "
+                        "emitted after compression (visible in skeleton markers "
+                        "like `# original_sha256=abcd1234abcd1234`)."
+                    ),
+                },
+                "profile_dir": {
+                    "type": "string",
+                    "description": (
+                        "Optional override: path to the Hermes profile home "
+                        "directory whose CCR store should be queried. Defaults "
+                        "to the active profile (via HERMES_HOME env var, then "
+                        "the conductor profile). Almost always you should leave "
+                        "this empty and pass only short_hash."
+                    ),
+                },
+            },
+            "required": ["short_hash"],
+        },
+    },
+}
+
+
+def _resolve_profile_dir(profile_dir: str = "") -> Path:
+    """Return the profile_dir argument if set, else derive from env.
+
+    Resolution order:
+      1. Explicit profile_dir argument (non-empty).
+      2. HERMES_HOME env var.
+      3. ~/.hermes/profiles/conductor (legacy fallback).
+    """
+    if profile_dir:
+        return Path(profile_dir)
+    import os as _os
+    env_home = _os.environ.get("HERMES_HOME", "").strip()
+    if env_home:
+        return Path(env_home)
+    return Path.home() / ".hermes" / "profiles" / "conductor"
+
+
+def _ccr_retrieve_tool_handler(short_hash: str, profile_dir: str = "") -> Dict[str, Any]:
+    """Plugin tool handler — wraps the module-level ccr_retrieve for the agent.
+
+    `profile_dir` is optional and accepted via the JSON-schema. When empty,
+    falls back to HERMES_HOME / conductor profile.
+    """
+    pd = _resolve_profile_dir(profile_dir)
+    result = ccr_retrieve(short_hash, profile_dir=pd)
+    if "error" in result:
+        return result
+    # Truncate very large content to keep the agent loop responsive.
+    content = result["content"]
+    if len(content) > 20000:
+        result["content"] = content[:20000] + (
+            f"\n\n... [TRUNCATED at 20000 chars; full size={result['byte_size']}]"
+        )
+        result["truncated"] = True
+    return result
+
+
+def register(ctx) -> None:
+    """Plugin entry point — register the ccr_retrieve tool.
+
+    Called automatically by the Hermes plugin loader when this plugin
+    directory is discovered under plugins/context_engine/ccr_store/.
+    Idempotent: re-registration with `override=True` ensures we win
+    against any stale handler from a previous session.
+    """
+    logger.info("ccr_store plugin: registering ccr_retrieve tool")
+    ctx.register_tool(
+        name="ccr_retrieve",
+        toolset="ccr",
+        schema=CCR_RETRIEVE_SCHEMA["function"],
+        handler=_ccr_retrieve_tool_handler,
+        description=CCR_RETRIEVE_SCHEMA["function"]["description"],
+        emoji="\U0001f4e6",  # package icon (we ship bytes)
+        override=True,
+    )
+
+
+__all__ = [
+    "CcrStore",
+    "DEFAULT_TTL_SECONDS",
+    "DEFAULT_MAX_RECORDS",
+    "get_store",
+    "ccr_retrieve",
+    "register",
+    "CCR_RETRIEVE_SCHEMA",
+]
