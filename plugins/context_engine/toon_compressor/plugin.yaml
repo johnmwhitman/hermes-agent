@@ -1,0 +1,5 @@
+name: toon_compressor
+description: TOON-style JSON array compression — replaces large uniform-shape JSON arrays (common MCP response shape) with TSV-shaped summaries. ~50% reduction measured on synthetic MCP-shape payloads. Stdlib-only (no install). Best paired with `ast_code_compressor` for mixed code + JSON conversations.
+version: 1.0.0
+author: capability-enablement-lane
+license: MIT

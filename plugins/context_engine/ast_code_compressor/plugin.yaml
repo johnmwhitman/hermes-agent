@@ -1,0 +1,5 @@
+name: ast_code_compressor
+description: AST-aware Python code compression — replaces large Python code blocks in conversation history with import + class/function signature skeletons. 96% reduction on real Hermes source. Stdlib-only (no install). Complements the lossy `compressor` engine; together they form a lossless+lossy hybrid.
+version: 1.0.0
+author: capability-enablement-lane
+license: MIT

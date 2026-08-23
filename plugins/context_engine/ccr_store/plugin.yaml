@@ -1,0 +1,5 @@
+name: ccr_store
+description: Compress-Cache-Retrieve (CCR) reversibility store for compressing context engines. Companion to `ast_code_compressor` and `toon_compressor` — when those engines replace a block with a hash-prefixed skeleton, the original is stored here under its sha256 hash. The agent can call `ccr_retrieve(short_hash)` to fetch the original on demand. Content-addressed, time-bounded (TTL), LRU-bounded.
+version: 1.0.0
+author: capability-enablement-lane
+license: MIT
