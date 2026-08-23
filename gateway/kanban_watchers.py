@@ -1837,9 +1837,12 @@ class GatewayKanbanWatchersMixin:
                         await _run_dispatch_io(_auto_decompose_tick, _ad_per_tick)
                     results = await _run_dispatch_io(_tick_once)
                     any_spawned = False
+                    cap_blocked_all = True  # becomes False if any board had
+                                            # non-cap reasons for skipping
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
+                            cap_blocked_all = False
                             # Quiet by default — only log when something actually
                             # happened, so an idle gateway stays silent.
                             logger.info(
@@ -1853,9 +1856,35 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
-                    # Health telemetry (aggregate across boards)
+                        elif res is not None:
+                            # Did this board skip ALL ready tasks purely due
+                            # to per-profile-cap? If so, that's correct
+                            # throttling (a sibling task is already running),
+                            # not a stuck dispatcher. Don't count toward
+                            # ``bad_ticks``; reset to False so any board
+                            # that actually had a spawnable-and-unskipped
+                            # ready task keeps the warning firing.
+                            skipped_capped = list(
+                                getattr(res, "skipped_per_profile_capped", [])
+                            )
+                            skipped_others = (
+                                len(getattr(res, "skipped_unassigned", []) or [])
+                                + len(getattr(res, "skipped_nonspawnable", []) or [])
+                                + len(getattr(res, "reclaimed", []) or [])
+                                + len(getattr(res, "crashed", []) or [])
+                                + len(getattr(res, "timed_out", []) or [])
+                            )
+                            if not skipped_capped or skipped_others > 0:
+                                cap_blocked_all = False
+                    # Health telemetry (aggregate across boards).
+                    # Treat "ready tasks exist BUT every board skipped purely
+                    # due to per-profile cap" as correctly idle — the cap is
+                    # the design, not a stuck dispatcher. Without this gate
+                    # the warning fires every tick whenever a sibling worker
+                    # is mid-flight, which is most of the time on a busy
+                    # portfolio.
                     ready_pending = await _run_dispatch_io(_ready_nonempty)
-                    if ready_pending and not any_spawned:
+                    if ready_pending and not any_spawned and not cap_blocked_all:
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
