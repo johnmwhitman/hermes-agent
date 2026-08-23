@@ -753,11 +753,24 @@ class InsightsEngine:
         for model, data in model_data.items():
             entry = {"model": model, **data}
             entry["sessions"] = len(data["sessions"])
-            # Models that surfaced only via tool-call attribution (no token
-            # rows) won't have these set by _accumulate — default them so the
-            # output shape is uniform for downstream/JSON consumers.
+            # Cache-read amplification surface (B3 finding 2026-08-23): for
+            # long sessions on prompt-cache-enabled models, cache_read_tokens
+            # can dominate the total, making "Tokens" column misleading.
+            # Expose cache_read_pct (0-100, rounded) so consumers can see the
+            # shape without re-querying.
             entry.setdefault("has_pricing", False)
             entry.setdefault("cost_status", "unknown")
+            # Cache-read amplification surface (B3 finding 2026-08-23): for
+            # long sessions on prompt-cache-enabled models, cache_read_tokens
+            # can dominate the total, making "Tokens" column misleading.
+            # Expose cache_read_pct (0-100, rounded) so consumers can see the
+            # shape without re-querying.
+            if entry["total_tokens"] > 0:
+                entry["cache_read_pct"] = round(
+                    100.0 * entry["cache_read_tokens"] / entry["total_tokens"], 1
+                )
+            else:
+                entry["cache_read_pct"] = 0.0
             result.append(entry)
         # Sort by tokens first, fall back to session count when tokens are 0
         result.sort(key=lambda x: (x["total_tokens"], x["sessions"]), reverse=True)
@@ -1042,7 +1055,11 @@ class InsightsEngine:
             lines.append(f"  {'Model':<30} {'Sessions':>8} {'Tokens':>12}")
             for m in report["models"]:
                 model_name = m["model"][:28]
-                lines.append(f"  {model_name:<30} {m['sessions']:>8} {m['total_tokens']:>12,}")
+                cache_pct = m.get("cache_read_pct", 0.0)
+                cache_marker = f" (cache {cache_pct:.0f}%)" if cache_pct >= 50.0 else ""
+                lines.append(
+                    f"  {model_name:<30} {m['sessions']:>8} {m['total_tokens']:>12,}{cache_marker}"
+                )
             lines.append("")
 
         # Platform breakdown
