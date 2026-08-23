@@ -261,6 +261,15 @@ class AstCodeCompressor(ContextEngine):
             return skeleton_marker
 
         new_text = _FENCED_PY_RE.sub(replace_block, text)
+
+        # Second pass: catch unfenced Python. A bare Python source pasted
+        # into a chat (no ```python fence) is the most common missed case.
+        # We split on double-newlines, attempt to parse each chunk as Python,
+        # and compress only when the chunk (a) is large enough, (b) parses
+        # cleanly, and (c) hasn't already been replaced by the fenced pass.
+        # We track already-compressed byte ranges to avoid double-compressing.
+        new_text = _apply_unfenced_pass(new_text, replace_block, stats)
+
         return new_text, stats
 
     def set_ccr_store(self, store) -> None:
@@ -438,3 +447,108 @@ def _safe_unparse(node) -> str:
         return ast.unparse(node)
     except Exception:
         return "..."
+
+
+# Unfenced Python detector — finds blocks of plain Python source that are
+# not inside markdown fences. The common case is someone pasting raw
+# `def f(x): ...` content into a chat. We split on double newlines, try
+# to parse each chunk, and compress when (a) chunk >= _MIN_BLOCK_CHARS,
+# (b) ast.parse succeeds, (c) saved bytes >= 100. We skip ranges that
+# overlap an already-compressed skeleton marker (the fenced pass leaves
+# `# AST skeleton (saved ...) ...` markers, which are easy to detect by
+# their leading `# AST skeleton` substring).
+_UNFENCED_PY_HEADER = "# AST skeleton "
+
+
+def _apply_unfenced_pass(text: str, replace_block, stats: Dict[str, int]) -> str:
+    """Second pass on already-fenced-compressed text to catch unfenced Python.
+
+    The `replace_block` callable is the same one used by the fenced pass; we
+    build a synthetic Match object that exposes ``group("body")`` and
+    ``group("full")`` matching the fenced regex's named-group contract.
+    """
+    if _UNFENCED_PY_HEADER not in text:
+        # No skeleton markers present → fenced pass did nothing. Still
+        # try the unfenced pass on the original text.
+        pass
+
+    # Find candidate regions: contiguous text that's NOT a fence opener
+    # (```python, ```py, ```) and NOT a skeleton marker.
+    out: list[str] = []
+    cursor = 0
+    n = len(text)
+    while cursor < n:
+        # Skip forward past any skeleton marker (5+ lines starting with # AST skeleton)
+        if text[cursor:cursor + len(_UNFENCED_PY_HEADER)] == _UNFENCED_PY_HEADER:
+            nl = text.find("\n\n", cursor)
+            if nl == -1:
+                out.append(text[cursor:])
+                break
+            out.append(text[cursor:nl])
+            cursor = nl
+            continue
+        # Find the next fence or skeleton marker
+        next_fence = text.find("\n```", cursor)
+        next_skel = text.find(_UNFENCED_PY_HEADER, cursor)
+        candidates = [c for c in (next_fence, next_skel) if c != -1]
+        if not candidates:
+            seg_end = n
+        else:
+            seg_end = min(candidates)
+        # Ensure forward progress even on empty segments (e.g. when cursor
+        # sits exactly on a fence newline or skeleton marker start).
+        if seg_end <= cursor:
+            seg_end = cursor + 1
+        segment = text[cursor:seg_end]
+        # Try the unfenced compression on this segment.
+        out.append(_compress_unfenced_segment(segment, replace_block, stats))
+        cursor = seg_end
+
+    return "".join(out)
+
+
+def _compress_unfenced_segment(segment: str, replace_block, stats: Dict[str, int]) -> str:
+    """Find unfenced Python chunks inside `segment` and compress them.
+
+    Splits on double-newlines (paragraph boundaries). Each chunk that
+    (a) is >= _MIN_BLOCK_CHARS long, (b) parses as Python via ast.parse,
+    (c) saves at least 100 bytes after skeletonization, gets replaced
+    via the same `replace_block` path the fenced pass uses.
+    """
+    if len(segment) < _MIN_BLOCK_CHARS:
+        return segment
+
+    # Split on double newlines; preserve the separators so we can reassemble.
+    parts = re.split(r"(\n\n+)", segment)
+    out: list[str] = []
+    for part in parts:
+        # Skip separators (whitespace) and tiny parts.
+        if not part or part.startswith("\n") or len(part) < _MIN_BLOCK_CHARS:
+            out.append(part)
+            continue
+        # Try to parse as Python.
+        try:
+            ast.parse(part)
+        except SyntaxError:
+            out.append(part)
+            continue
+        # Valid Python! Compress via the shared replace_block.
+        # Build a synthetic Match that the fenced replace_block can consume.
+        class _M:
+            def __init__(self, body):
+                self._body = body
+            def group(self, name):
+                if name == "body":
+                    return self._body
+                if name == "full":
+                    return self._body
+                return self._body
+        stats["blocks_found"] += 1
+        # Reuse the fenced replace_block to keep behavior consistent.
+        new = replace_block(_M(part))
+        # replace_block returns the skeleton marker on success, or `part`
+        # unchanged on skip (too small, no savings, parse fail). Only the
+        # marker path increments blocks_compressed/bytes_saved inside the
+        # closure.
+        out.append(new)
+    return "".join(out)
