@@ -91,6 +91,31 @@ class AstCodeCompressor(ContextEngine):
         `compress()` call when triggered."""
         return False
 
+    def select_context(
+        self,
+        request_messages,
+        *,
+        conversation_messages=None,
+        incoming_message=None,
+        budget_tokens=0,
+    ):
+        """Per-turn hook (independent of ``should_compress()``).
+
+        Fires on EVERY request to compress large Python code blocks inline.
+        This is the integration point that gives the AST engine real-world
+        reach: without this hook, the host never calls our ``compress()`` and
+        the engine is dormant (host's token-budget thresholds only fire for
+        the lossy summarizer). Compressing per-turn on the request list is
+        safe because the result is request-only — persisted transcript stays
+        intact, and the agent gets a leaner prompt.
+        """
+        if not request_messages:
+            return request_messages
+        compressed, stats = self._compress_messages(request_messages)
+        if stats["blocks_compressed"] > 0:
+            self._compression_count = getattr(self, "_compression_count", 0) + 1
+        return compressed
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
@@ -143,6 +168,24 @@ class AstCodeCompressor(ContextEngine):
                 self._last_compression_savings_pct,
             )
         return out
+
+    def _compress_messages(self, messages):
+        """Shared per-message compression path used by both ``compress()``
+        and the per-turn ``select_context()`` hook."""
+        if not messages:
+            return messages, {"blocks_found": 0, "blocks_compressed": 0, "bytes_saved": 0}
+        protected_head = 1 + getattr(self, "protect_first_n", 3)
+        out: List[Dict[str, Any]] = []
+        stats = {"blocks_found": 0, "blocks_compressed": 0, "bytes_saved": 0}
+        for idx, msg in enumerate(messages):
+            if idx < protected_head:
+                out.append(msg)
+                continue
+            new_msg, msg_stats = self._process_message(msg)
+            out.append(new_msg)
+            for k, v in msg_stats.items():
+                stats[k] += v
+        return out, stats
 
     # -- Internal helpers --------------------------------------------------
 

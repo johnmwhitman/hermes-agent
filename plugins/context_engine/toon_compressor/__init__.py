@@ -72,6 +72,29 @@ class ToonCompressor(ContextEngine):
         # Event-driven; host uses its own threshold.
         return False
 
+    def select_context(
+        self,
+        request_messages,
+        *,
+        conversation_messages=None,
+        incoming_message=None,
+        budget_tokens=0,
+    ):
+        """Per-turn hook (independent of ``should_compress()``).
+
+        Same integration story as ``ast_code_compressor.select_context``:
+        the host never calls our ``compress()`` because should_compress() is
+        always False; without this hook the engine is dormant. Compressing
+        per-turn on the request list gives us real-world reach with zero
+        risk to the persisted transcript (request-only mutation).
+        """
+        if not request_messages:
+            return request_messages
+        compressed, stats = self._compress_messages(request_messages)
+        if stats["compressed"] > 0:
+            self._compression_count = getattr(self, "_compression_count", 0) + 1
+        return compressed
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
@@ -82,20 +105,7 @@ class ToonCompressor(ContextEngine):
     ) -> List[Dict[str, Any]]:
         if not messages:
             return messages
-        protected_head = 1 + getattr(self, "protect_first_n", 3)
-
-        out: List[Dict[str, Any]] = []
-        stats = {"candidates_found": 0, "compressed": 0, "bytes_saved": 0}
-
-        for idx, msg in enumerate(messages):
-            if idx < protected_head:
-                out.append(msg)
-                continue
-            new_msg, msg_stats = self._process_message(msg)
-            out.append(new_msg)
-            for k, v in msg_stats.items():
-                stats[k] += v
-
+        out, stats = self._compress_messages(messages)
         if stats["compressed"] > 0:
             self.compression_count += 1
             self._last_compression_savings_pct = (
@@ -108,6 +118,24 @@ class ToonCompressor(ContextEngine):
                 self._last_compression_savings_pct,
             )
         return out
+
+    def _compress_messages(self, messages):
+        """Shared per-message compression path used by both ``compress()``
+        and the per-turn ``select_context()`` hook."""
+        if not messages:
+            return messages, {"candidates_found": 0, "compressed": 0, "bytes_saved": 0}
+        protected_head = 1 + getattr(self, "protect_first_n", 3)
+        out: List[Dict[str, Any]] = []
+        stats = {"candidates_found": 0, "compressed": 0, "bytes_saved": 0}
+        for idx, msg in enumerate(messages):
+            if idx < protected_head:
+                out.append(msg)
+                continue
+            new_msg, msg_stats = self._process_message(msg)
+            out.append(new_msg)
+            for k, v in msg_stats.items():
+                stats[k] += v
+        return out, stats
 
     # -- Internal helpers --------------------------------------------------
 
