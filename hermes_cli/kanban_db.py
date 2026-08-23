@@ -10848,7 +10848,35 @@ def _skills_preflight_check(
         )
         return None
     try:
-        ok, resolutions = validate_task_skills(requested, profile=task.assignee)
+        # Build the extra-skills-dirs list the runtime would walk on a
+        # real worker spawn. Without this the resolver only sees the
+        # assignee profile's skills/ subdir and misses (a) skills
+        # installed at the global ``~/.claude/skills`` or
+        # ``~/.agents/skills`` cross-agent shared roots, and (b) any
+        # skills surfaced via ``agent.skill_utils.get_all_skills_dirs()``
+        # (the active profile's skills/ for whichever profile the
+        # dispatcher is currently running under). The runtime helper
+        # resolves to a superset we mirror here lazily so a missing
+        # import still falls through cleanly.
+        _extras: list[Path] = []
+        try:
+            from agent.skill_utils import get_all_skills_dirs as _gasd
+            for _d in _gasd():
+                _p = Path(_d).expanduser().resolve()
+                if _p not in _extras:
+                    _extras.append(_p)
+        except Exception:
+            # Fall back to the canonical cross-agent shared roots when
+            # the runtime helper can't be imported (the dispatch path
+            # runs in hermes_cli which may import this before
+            # agent.skill_utils lands on sys.path).
+            for _d in ("~/.claude/skills", "~/.agents/skills"):
+                _p = Path(_d).expanduser().resolve()
+                if _p.exists() and _p not in _extras:
+                    _extras.append(_p)
+        ok, resolutions = validate_task_skills(
+            requested, profile=task.assignee, extra_skills_dirs=_extras,
+        )
     except Exception as exc:
         _log.debug(
             "kanban: skills preflight raised (%s); treating as ok to avoid blocking spawn",
@@ -10857,12 +10885,39 @@ def _skills_preflight_check(
         return None
     if ok:
         return None
-    unresolved = [
-        r.name for r in resolutions if r.status != SkillStatus.OK
+    # ``AMBIGUOUS`` (skill found in multiple roots) is NOT a refusal —
+    # the runtime's ``_find_skill`` walks the same roots and picks the
+    # first match, so the worker would load the skill successfully.
+    # Only hard misses (not_found / missing_profile / missing_skills_dir
+    # / invalid_name) should block the spawn. The remaining ambiguity
+    # is logged at DEBUG so an operator who wants to pin a single root
+    # still has visibility, but the dispatcher does not pre-empt.
+    blocking_statuses = {
+        SkillStatus.NOT_FOUND,
+        SkillStatus.MISSING_PROFILE,
+        SkillStatus.MISSING_SKILLS_DIR,
+        SkillStatus.INVALID_NAME,
+    }
+    blocking_resolutions = [
+        r for r in resolutions if r.status in blocking_statuses
     ]
-    reasons = sorted({r.status for r in resolutions if r.status != SkillStatus.OK})
+    ambiguous_resolutions = [
+        r for r in resolutions if r.status == SkillStatus.AMBIGUOUS
+    ]
+    if not blocking_resolutions and ambiguous_resolutions:
+        _log.debug(
+            "kanban: skills preflight found %d skill(s) as AMBIGUOUS but resolvable; "
+            "runtime will pick the first; not refusing. Skill names: %s",
+            len(ambiguous_resolutions),
+            [r.name for r in ambiguous_resolutions],
+        )
+        return None
+    unresolved = [
+        r.name for r in blocking_resolutions
+    ]
+    reasons = sorted({r.status for r in blocking_resolutions})
     first_remediation = next(
-        (r.remediation for r in resolutions if r.remediation), ""
+        (r.remediation for r in blocking_resolutions if r.remediation), ""
     )
     reason_blob = ",".join(reasons)
     if first_remediation:

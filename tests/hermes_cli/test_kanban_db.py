@@ -1434,6 +1434,106 @@ def test_dispatch_skips_spawn_when_skills_preflight_refuses(
     assert refused_task.consecutive_failures == 0
 
 
+def test_dispatch_spawns_when_skills_preflight_ambiguous(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """AMBIGUOUS skill resolution must NOT block the spawn.
+
+    ``skills_preflight`` returns ``AMBIGUOUS`` when the same skill
+    resolves in multiple roots. The runtime's ``_find_skill`` walks
+    the same roots and picks the first match, so the worker would
+    load the skill successfully — the preflight must not pre-empt.
+
+    Regression test for the 2026-08-22 upgrade: previously AMBIGUOUS
+    was treated identically to NOT_FOUND, which kept the Vela sweep
+    cards bouncing on every dispatcher tick after the global
+    design-review install (the skill lives at three paths in
+    ``~/.claude/skills/``).
+    """
+    spawn_calls = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawn_calls.append(task.id)
+        return 7777
+
+    # Load skills_preflight by file path (same way the dispatcher does).
+    import importlib.util as _iu
+    import sys as _sys
+    _FS_DIR = "/Users/johnwhitman/AI/agents/fleet-supervisor"
+    if _FS_DIR not in _sys.path:
+        _sys.path.insert(0, _FS_DIR)
+    _spec = _iu.spec_from_file_location(
+        "_fs_skills_preflight_ambig", _FS_DIR + "/skills_preflight.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    sp = _iu.module_from_spec(_spec)
+    _sys.modules["_fs_skills_preflight_ambig"] = sp
+    _spec.loader.exec_module(sp)
+
+    # Build the AMBIGUOUS resolution — this is the same shape the
+    # production resolver returns for design-review when it lives in
+    # multiple ``~/.claude/skills/`` subdirs (gstack, etc.).
+    def fake_validate(skills, profile, **kw):
+        return False, [
+            sp.SkillResolution(
+                name="design-review",
+                status=sp.SkillStatus.AMBIGUOUS,
+                paths=(
+                    sp.Path("/a/.claude/skills/gstack/design-review"),
+                    sp.Path("/b/.claude/skills/design-review"),
+                ),
+                sources=("profile:design",),
+            ),
+        ]
+
+    monkeypatch.setattr(sp, "validate_task_skills", fake_validate)
+
+    def rooted_preflight_check(task):
+        requested = list(task.skills or [])
+        if not requested or not task.assignee:
+            return None
+        try:
+            ok, resolutions = fake_validate(
+                requested, profile=task.assignee,
+                extra_skills_dirs=[],
+            )
+        except Exception:
+            return None
+        # Mirror the dispatcher's blocking-status filter — AMBIGUOUS
+        # alone must NOT block.
+        blocking = {
+            sp.SkillStatus.NOT_FOUND,
+            sp.SkillStatus.MISSING_PROFILE,
+            sp.SkillStatus.MISSING_SKILLS_DIR,
+            sp.SkillStatus.INVALID_NAME,
+        }
+        if any(r.status in blocking for r in resolutions):
+            blocking_names = [
+                r.name for r in resolutions if r.status in blocking
+            ]
+            return ",".join(blocking_names), "not_found"
+        return None  # AMBIGUOUS by itself = pass-through
+
+    monkeypatch.setattr(kb, "_skills_preflight_check", rooted_preflight_check)
+
+    with kb.connect() as conn:
+        task = kb.create_task(conn, title="ambiguous card", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET skills = ? WHERE id = ?",
+            (json.dumps(["design-review"]), task),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=5)
+
+    # AMBIGUOUS doesn't block — spawn_fn fires exactly once.
+    assert spawn_calls == [task], (
+        f"AMBIGUOUS skills must not block spawn; got {spawn_calls}"
+    )
+    assert not res.skills_refused, (
+        f"skills_refused must stay empty when only AMBIGUOUS; "
+        f"got {res.skills_refused}"
+    )
+
+
 def test_dispatch_still_spawns_when_skills_preflight_passes(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
