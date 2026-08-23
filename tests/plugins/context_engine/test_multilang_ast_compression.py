@@ -29,7 +29,9 @@ JS_CODE = (
 )
 TS_CODE = (
     "interface Foo { name: string; value: number; }\n"
-    "export function greet(name: string): string { return 'hi ' + name; }\n"
+    "export function greet(name: string): string {\n"
+    "    return 'hi ' + name;\n"
+    "}\n"
 )
 GO_CODE = (
     "package main\n"

@@ -118,7 +118,7 @@ def _try_init_tree_sitter():
         import tree_sitter as _ts
         import tree_sitter_languages as _ts_lang
 
-        def _make_skeleton(language: str, ext_to_kind: dict, kind_extractors: dict):
+        def _make_skeleton(language: str, handler_map: dict):
             """Return a function that takes (code: str) -> str skeleton.
 
             The skeleton preserves top-level declarations (imports,
@@ -133,30 +133,98 @@ def _try_init_tree_sitter():
                 except Exception:
                     return code  # bail
                 out: list[str] = []
-                # Walk top-level statements
-                for child in tree.root_node.children:
-                    # ext_to_kind maps node-type -> display name; defaults
-                    # to the node-type itself when not in the map.
-                    kind = ext_to_kind.get(child.type, child.type)
-                    handler = kind_extractors.get(kind) if kind in kind_extractors else None
-                    if handler is not None:
-                        line = handler(child, code)
+
+                def _walk(node, code, depth, out):
+                    # ext_to_kind and kind_extractors are both dicts mapping
+                    # node-type -> True (a set-like membership dict).
+                    # Membership in kind_extractors means "extract a signature
+                    # line"; membership in RECURSE_TYPES means "descend into
+                    # this container and walk its children".
+                    # Nodes we descend into. Containers that hold nested
+                    # declarations we want to extract.
+                    RECURSE_TYPES = {
+                        "class_body",           # methods inside classes
+                        "class_declaration",    # wrapper, descends into class_body
+                        "impl_item",            # Rust impl block wrapper
+                        "object",               # dict literals (rare in TS)
+                        "export_statement",     # exports wrapper (descend)
+                        "lexical_declaration",  # const/let blocks
+                        "module",               # Rust mod
+                        "source_file",          # Go file wrapper
+                        "declaration_list",     # Go import block
+                    }
+                    # Children of class_declaration / impl_item that are
+                    # just keywords / type identifiers / punctuation (NOT
+                    # useful declarations on their own).
+                    NOISE_CHILDREN = {
+                        "class", "interface", "fn", "function", "type",
+                        "impl", "struct", "enum", "mod", "pub",
+                        "async", "export", "default", "abstract",
+                        "static", "const", "let", "var",
+                        # Type / name identifiers (handled by parent).
+                        "type_identifier", "property_identifier",
+                        "identifier",
+                        # Generic type args.
+                        "type_arguments", "generic_type",
+                        # Formal params / type annotations.
+                        "formal_parameters", "required_parameter",
+                        "type_annotation", "predefined_type",
+                        # Note: class_body is NOT here — it has its own
+                        # recursion entry above to descend into its children.
+                        # Punctuation.
+                        "{", "}", "(", ")", "[", "]", ";", ",", ":",
+                    }
+                    # If the node is a recognized declaration, emit its
+                    # signature. If it's only a container (no signature), AND
+                    # it's in RECURSE_TYPES, descend into its children.
+                    # First: emit handler signature if known.
+                    emitted = False
+                    if node.type in handler_map:
+                        line = handler_map[node.type](node, code)
                         if line:
-                            out.append(line)
+                            out.append(("  " * depth) + line)
+                            emitted = True
+                    # Then: descend into RECURSE containers. Skip children
+                    # that are just keywords / identifiers (NOISE_CHILDREN).
+                    if node.type in RECURSE_TYPES and depth < 3:
+                        for grandchild in node.children:
+                            if grandchild.type in NOISE_CHILDREN:
+                                continue
+                            _walk(grandchild, code, depth + 1, out)
+                        return
+                    if emitted:
+                        return
+                    # Pure-punctuation nodes (braces, parens) — skip.
+                    if node.type in {"{", "}", "(", ")", "[", "]", ";", ","}:
+                        return
+                    # Unknown kind: emit a 1-line stub.
+                    body = code[node.start_byte:node.end_byte]
+                    first = body.split("\n", 1)[0]
+                    for sfx in (" {", "{", " ("):
+                        if first.rstrip().endswith(sfx):
+                            first = first.rstrip()[:-len(sfx)].rstrip()
+                            break
+                    if not first.strip():
+                        return
+                    out.append(("  " * depth) + first[:240])
+                    if node.type in RECURSE_TYPES and depth < 3:
+                        for grandchild in node.children:
+                            _walk(grandchild, code, depth + 1, out)
+                        return
                     else:
-                        # Unknown kind: emit a 1-line summary stub. Trim the
-                        # opening brace so the output is a clean signature.
-                        body = code[child.start_byte:child.end_byte]
+                        # Unknown kind: emit a 1-line stub.
+                        body = code[node.start_byte:node.end_byte]
                         first = body.split("\n", 1)[0]
                         for sfx in (" {", "{", " ("):
                             if first.rstrip().endswith(sfx):
                                 first = first.rstrip()[:-len(sfx)].rstrip()
                                 break
                         if not first.strip():
-                            # Empty / whitespace-only line (Go's top-level
-                            # newline quirks). Skip rather than emit noise.
-                            continue
-                        out.append(first[:240])
+                            return
+                        out.append(("  " * depth) + first[:240])
+
+                for child in tree.root_node.children:
+                    _walk(child, code, 0, out)
                 if not out:
                     return code
                 return "\n".join(out)
@@ -192,40 +260,62 @@ def _try_init_tree_sitter():
                     break
             return head if len(head) < 240 else head[:240] + " ..."
 
-        # Per-language node-type → signature handler maps.
-        js_types = {k: True for k in {
-            "function_declaration", "class_declaration",
-            "export_statement", "import_statement",
-            "lexical_declaration", "variable_declaration",
-        }}
-        go_types = {k: True for k in {
-            "function_declaration", "method_declaration",
-            "type_declaration", "import_declaration",
-        }}
-        rust_types = {k: True for k in {
-            "function_item", "struct_item", "enum_item",
-            "impl_item", "use_declaration", "trait_item",
-            "type_item", "mod_item", "const_item", "static_item",
-        }}
+        # Per-language node-type → handler mapping. The dict values are
+        # the `_signature` function — every recognized declaration calls
+        # it to emit a one-line signature.
+        js_types = {
+            "function_declaration": _signature,
+            "class_declaration": _signature,
+            # NOTE: export_statement is intentionally NOT in the handlers
+            # — it's a wrapper, not a declaration. We recurse INTO it to
+            # extract the inner fn/class.
+            "import_statement": _signature,
+            "lexical_declaration": _signature,
+            "variable_declaration": _signature,
+            "method_definition": _signature,
+            "abstract_method_signature": _signature,
+            "interface_declaration": _signature,
+            "type_alias_declaration": _signature,
+            "enum_declaration": _signature,
+            "abstract_class_declaration": _signature,
+        }
+        go_types = {
+            "function_declaration": _signature,
+            "method_declaration": _signature,
+            "type_declaration": _signature,
+            "import_declaration": _signature,
+        }
+        rust_types = {
+            "function_item": _signature,
+            "struct_item": _signature,
+            "enum_item": _signature,
+            "impl_item": _signature,
+            "use_declaration": _signature,
+            "trait_item": _signature,
+            "type_item": _signature,
+            "mod_item": _signature,
+            "const_item": _signature,
+            "static_item": _signature,
+        }
 
         _LANGUAGE_PARSERS["javascript"] = (
-            _make_skeleton("javascript", js_types, js_types),
+            _make_skeleton("javascript", js_types),
             lambda code: True,
         )
         _LANGUAGE_PARSERS["typescript"] = (
-            _make_skeleton("typescript", js_types, js_types),
+            _make_skeleton("typescript", js_types),
             lambda code: True,
         )
         _LANGUAGE_PARSERS["tsx"] = (
-            _make_skeleton("tsx", js_types, js_types),
+            _make_skeleton("tsx", js_types),
             lambda code: True,
         )
         _LANGUAGE_PARSERS["go"] = (
-            _make_skeleton("go", go_types, go_types),
+            _make_skeleton("go", go_types),
             lambda code: True,
         )
         _LANGUAGE_PARSERS["rust"] = (
-            _make_skeleton("rust", rust_types, rust_types),
+            _make_skeleton("rust", rust_types),
             lambda code: True,
         )
         return True
