@@ -1434,21 +1434,23 @@ def test_dispatch_skips_spawn_when_skills_preflight_refuses(
     assert refused_task.consecutive_failures == 0
 
 
-def test_dispatch_spawns_when_skills_preflight_ambiguous(
+def test_dispatch_refuses_when_skills_preflight_ambiguous(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """AMBIGUOUS skill resolution must NOT block the spawn.
+    """AMBIGUOUS skill resolution MUST block the spawn.
 
-    ``skills_preflight`` returns ``AMBIGUOUS`` when the same skill
-    resolves in multiple roots. The runtime's ``_find_skill`` walks
-    the same roots and picks the first match, so the worker would
-    load the skill successfully — the preflight must not pre-empt.
+    After the 2026-08-23 live test, ``AMBIGUOUS`` is treated identically
+    to ``NOT_FOUND`` at the dispatcher — when the runtime's
+    ``skill_view`` finds 11 candidates for the same skill name it
+    refuses to pick and the worker hard-fails with
+    ``Error: Unknown skill(s): design-review``. The dispatcher must
+    pre-empt that failure loop (one failure slot per tick is
+    unaffordable) and surface a clear remediation hint to the
+    operator (pin a specific skill path or consolidate duplicates).
 
-    Regression test for the 2026-08-22 upgrade: previously AMBIGUOUS
-    was treated identically to NOT_FOUND, which kept the Vela sweep
-    cards bouncing on every dispatcher tick after the global
-    design-review install (the skill lives at three paths in
-    ``~/.claude/skills/``).
+    This test exercises the actual dispatcher entry path so the
+    bug class — ``preflight says OK, runtime says no`` — cannot
+    regress.
     """
     spawn_calls = []
 
@@ -1489,30 +1491,25 @@ def test_dispatch_spawns_when_skills_preflight_ambiguous(
     monkeypatch.setattr(sp, "validate_task_skills", fake_validate)
 
     def rooted_preflight_check(task):
+        # Faithful reproduction of the dispatcher logic: refuse on
+        # any non-OK status (covers both NOT_FOUND and AMBIGUOUS).
         requested = list(task.skills or [])
         if not requested or not task.assignee:
             return None
-        try:
-            ok, resolutions = fake_validate(
-                requested, profile=task.assignee,
-                extra_skills_dirs=[],
-            )
-        except Exception:
+        ok, resolutions = fake_validate(
+            requested, profile=task.assignee, extra_skills_dirs=[],
+        )
+        if ok:
             return None
-        # Mirror the dispatcher's blocking-status filter — AMBIGUOUS
-        # alone must NOT block.
-        blocking = {
-            sp.SkillStatus.NOT_FOUND,
-            sp.SkillStatus.MISSING_PROFILE,
-            sp.SkillStatus.MISSING_SKILLS_DIR,
-            sp.SkillStatus.INVALID_NAME,
-        }
-        if any(r.status in blocking for r in resolutions):
-            blocking_names = [
-                r.name for r in resolutions if r.status in blocking
-            ]
-            return ",".join(blocking_names), "not_found"
-        return None  # AMBIGUOUS by itself = pass-through
+        unresolved = [r.name for r in resolutions if r.status != sp.SkillStatus.OK]
+        reasons = sorted({r.status for r in resolutions if r.status != sp.SkillStatus.OK})
+        first_remediation = next(
+            (r.remediation for r in resolutions if r.remediation), ""
+        )
+        reason_blob = ",".join(reasons)
+        if first_remediation:
+            reason_blob = f"{reason_blob}: {first_remediation}"
+        return ",".join(unresolved), reason_blob
 
     monkeypatch.setattr(kb, "_skills_preflight_check", rooted_preflight_check)
 
@@ -1524,14 +1521,25 @@ def test_dispatch_spawns_when_skills_preflight_ambiguous(
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=5)
 
-    # AMBIGUOUS doesn't block — spawn_fn fires exactly once.
-    assert spawn_calls == [task], (
-        f"AMBIGUOUS skills must not block spawn; got {spawn_calls}"
+    # AMBIGUOUS blocks the spawn — preflight fails closed, mirroring
+    # the runtime's own refusal so the worker never enters the doomed
+    # path that would burn one failure slot per tick.
+    assert not spawn_calls, (
+        f"AMBIGUOUS skills must block spawn; got {spawn_calls}"
     )
-    assert not res.skills_refused, (
-        f"skills_refused must stay empty when only AMBIGUOUS; "
+    assert res.skills_refused, (
+        f"skills_refused must be populated for ambiguous skills; "
         f"got {res.skills_refused}"
     )
+    refused_id, unresolved_csv, _reason = res.skills_refused[0]
+    assert refused_id == task
+    assert "design-review" in unresolved_csv
+
+    # Task must be re-claimable: status=ready, no claim, no failure bump.
+    refused_task = kb.get_task(conn, task)
+    assert refused_task.status == "ready"
+    assert refused_task.claim_lock is None
+    assert refused_task.consecutive_failures == 0
 
 
 def test_dispatch_still_spawns_when_skills_preflight_passes(

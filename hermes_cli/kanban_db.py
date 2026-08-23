@@ -10885,39 +10885,21 @@ def _skills_preflight_check(
         return None
     if ok:
         return None
-    # ``AMBIGUOUS`` (skill found in multiple roots) is NOT a refusal —
-    # the runtime's ``_find_skill`` walks the same roots and picks the
-    # first match, so the worker would load the skill successfully.
-    # Only hard misses (not_found / missing_profile / missing_skills_dir
-    # / invalid_name) should block the spawn. The remaining ambiguity
-    # is logged at DEBUG so an operator who wants to pin a single root
-    # still has visibility, but the dispatcher does not pre-empt.
-    blocking_statuses = {
-        SkillStatus.NOT_FOUND,
-        SkillStatus.MISSING_PROFILE,
-        SkillStatus.MISSING_SKILLS_DIR,
-        SkillStatus.INVALID_NAME,
-    }
-    blocking_resolutions = [
-        r for r in resolutions if r.status in blocking_statuses
-    ]
-    ambiguous_resolutions = [
-        r for r in resolutions if r.status == SkillStatus.AMBIGUOUS
-    ]
-    if not blocking_resolutions and ambiguous_resolutions:
-        _log.debug(
-            "kanban: skills preflight found %d skill(s) as AMBIGUOUS but resolvable; "
-            "runtime will pick the first; not refusing. Skill names: %s",
-            len(ambiguous_resolutions),
-            [r.name for r in ambiguous_resolutions],
-        )
-        return None
+    # When the resolver returns AMBIGUOUS, the runtime's ``skill_view``
+    # refuses to pick a single root out of 11 candidates and the worker
+    # dies with ``Error: Unknown skill(s): design-review`` (cli.py:8216).
+    # We mirror that policy at the dispatcher: ambiguous skills BLOCK
+    # the spawn so the operator can either pin a specific skill path
+    # (e.g., ``gstack/design-review``) or consolidate duplicates.
+    # This was the right call after 2026-08-23 live test -- the prior
+    # pass-through caused the dispatcher to spawn workers that the
+    # runtime then hard-failed, burning one failure slot per tick.
     unresolved = [
-        r.name for r in blocking_resolutions
+        r.name for r in resolutions if r.status != SkillStatus.OK
     ]
-    reasons = sorted({r.status for r in blocking_resolutions})
+    reasons = sorted({r.status for r in resolutions if r.status != SkillStatus.OK})
     first_remediation = next(
-        (r.remediation for r in blocking_resolutions if r.remediation), ""
+        (r.remediation for r in resolutions if r.remediation), ""
     )
     reason_blob = ",".join(reasons)
     if first_remediation:
