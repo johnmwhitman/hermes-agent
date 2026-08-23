@@ -1357,10 +1357,25 @@ class GatewayKanbanWatchersMixin:
         )
 
         async def _run_dispatch_io(func, *args):
+            # Two independent isolations, both required:
+            #  - dispatcher_executor keeps dispatch off the gateway's default
+            #    executor, which long-running cron/platform work can exhaust
+            #    (leaving every dispatcher call queued forever).
+            #  - _run_in_fresh_context gives each call an empty Context.
+            #    NOTE the mechanism differs from upstream's: run_in_executor
+            #    does NOT copy the caller's context (that is an asyncio.
+            #    to_thread behaviour, which is what _to_thread_process_service
+            #    guards against). The leak here is the other direction — this
+            #    executor's worker thread is long-lived, so a ContextVar set
+            #    during one dispatch call is still set on the next one.
+            #    Measured on py3.11.15: caller ctx -> "unset", but a value set
+            #    in call N is visible in call N+1 until a fresh Context resets
+            #    it. Upstream's helper cannot substitute here anyway: it rides
+            #    asyncio.to_thread and therefore the DEFAULT executor.
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 dispatcher_executor,
-                functools.partial(func, *args),
+                functools.partial(_run_in_fresh_context, func, *args),
             )
 
         def _close_dispatch_executor() -> None:
