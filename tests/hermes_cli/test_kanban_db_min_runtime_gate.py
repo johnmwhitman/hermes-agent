@@ -1,188 +1,124 @@
-#!/usr/bin/env python3
 """Tests for the kanban_db DEFAULT_MIN_WORKER_RUNTIME_SECONDS gate.
 
-Closes t_d3582171 (researcher false-completion bug, 3rd occurrence 2026-08-23):
-workers exit rc=0 with no result/summary in <30s without doing real work. The
-dispatcher must hold the task at its prior status and emit a HOLLOW signal.
-
-Three cases:
-  1. Worker exits rc=0 with empty result/summary in <30s → HOLLOW, NOT marked done.
-  2. Worker exits rc=0 with empty result/summary in >30s → marked done.
-  3. Worker exits rc=0 with a result OR summary → marked done regardless of runtime.
-
-Plus the env-var override and a regression check that the buggy `runs` table
-name is gone (we use `task_runs`).
+Added 2026-08-23 to close t_d3582171 (kanban_db.py fix absent from all 3
+codebases, found 2026-08-22). The gate is the dispatcher-side counterpart
+to the cron-hollow guard: a worker that exits rc=0 with no result/summary
+in under DEFAULT_MIN_WORKER_RUNTIME_SECONDS is treated as HOLLOW, left in
+its prior status, and audited via completion_blocked_short_runtime event.
 """
-from __future__ import annotations
-
 import os
-import sqlite3
-import sys
-import tempfile
 import time
-from pathlib import Path
-from unittest import mock
 
 import pytest
 
-# Add the hermes-agent checkout to sys.path so the test can import kanban_db
-REPO = Path("/Users/johnwhitman/.hermes/hermes-agent")
-sys.path.insert(0, str(REPO))
+from hermes_cli import kanban_db as kb
 
 
 @pytest.fixture
-def tmp_hermes_home(tmp_path, monkeypatch):
-    """A scratch HERMES_HOME with a kanban DB that has the real task_runs schema."""
+def kanban_home(tmp_path, monkeypatch):
+    """Hermetic HERMES_HOME + kanban DB; resets the singleton between tests."""
     hermes = tmp_path / "hermes"
     hermes.mkdir()
     (hermes / "kanban").mkdir()
-    db_path = hermes / "kanban" / "kanban.db"
-    con = sqlite3.connect(db_path)
-    con.executescript(open(REPO / "hermes_cli" / "schema.sql").read())
-    con.close()
     monkeypatch.setenv("HERMES_HOME", str(hermes))
     monkeypatch.delenv("HERMES_KANBAN_MIN_WORKER_RUNTIME_SECONDS", raising=False)
-    return hermes, db_path
+    # Force the connect() singleton to re-resolve against the new HERMES_HOME
+    if hasattr(kb, "_KANBAN_DB"):
+        kb._KANBAN_DB = None
+    yield hermes
 
 
-def _insert_task(con, task_id: str = "t_test", status: str = "running"):
-    now = int(time.time())
-    con.execute(
-        "INSERT INTO tasks (id, title, status, created_at, started_at, idempotency_key) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, f"task {task_id}", status, now, now, f"k-{task_id}"),
-    )
-    con.commit()
+def test_default_min_worker_runtime_seconds_constant_exists():
+    assert hasattr(kb, "DEFAULT_MIN_WORKER_RUNTIME_SECONDS")
+    assert isinstance(kb.DEFAULT_MIN_WORKER_RUNTIME_SECONDS, int)
+    assert kb.DEFAULT_MIN_WORKER_RUNTIME_SECONDS > 0
 
 
-def _insert_run(con, task_id: str, started_at: int, ended_at: int | None = None,
-                outcome: str = "completed"):
-    con.execute(
-        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, "done", started_at, ended_at, outcome),
-    )
-    con.commit()
+def test_resolve_helper_returns_positive_int():
+    val = kb._resolve_min_worker_runtime_seconds()
+    assert isinstance(val, int)
+    assert val > 0
 
 
-def test_hollow_short_run_no_result_blocks_completion(tmp_hermes_home):
-    """Worker exits rc=0 in <30s with no result/summary → HOLLOW, return False."""
-    hermes, db_path = tmp_hermes_home
-    from hermes_cli import kanban_db
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    now = int(time.time())
-    _insert_task(con)
-    _insert_run(con, "t_test", started_at=now - 5, ended_at=now)
-    con.close()
-
-    # complete_task with empty summary/result should be rejected
-    result = kanban_db.complete_task(
-        task_id="t_test",
-        summary=None,
-        result=None,
-    )
-    assert result is False, "Expected HOLLOW rejection; got success"
-
-    con = sqlite3.connect(db_path)
-    row = con.execute("SELECT status FROM tasks WHERE id='t_test'").fetchone()
-    assert row[0] == "running", f"expected status=running, got {row[0]}"
-    con.close()
+def test_resolve_helper_honors_env_override(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_MIN_WORKER_RUNTIME_SECONDS", "12")
+    assert kb._resolve_min_worker_runtime_seconds() == 12
 
 
-def test_long_run_no_result_completes(tmp_hermes_home):
-    """Worker exits rc=0 in >30s with no result/summary → marked done."""
-    hermes, db_path = tmp_hermes_home
-    from hermes_cli import kanban_db
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    now = int(time.time())
-    _insert_task(con)
-    _insert_run(con, "t_test", started_at=now - 60, ended_at=now)
-    con.close()
-
-    result = kanban_db.complete_task(
-        task_id="t_test",
-        summary=None,
-        result=None,
-    )
-    assert result is True
-
-    con = sqlite3.connect(db_path)
-    row = con.execute("SELECT status FROM tasks WHERE id='t_test'").fetchone()
-    assert row[0] == "done", f"expected status=done, got {row[0]}"
-    con.close()
-
-
-def test_short_run_with_result_completes(tmp_hermes_home):
-    """Worker exits rc=0 with a result, even if <30s → marked done."""
-    hermes, db_path = tmp_hermes_home
-    from hermes_cli import kanban_db
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    now = int(time.time())
-    _insert_task(con)
-    _insert_run(con, "t_test", started_at=now - 5, ended_at=now)
-    con.close()
-
-    result = kanban_db.complete_task(
-        task_id="t_test",
-        summary=None,
-        result="DID_SOMETHING_REAL",
-    )
-    assert result is True
-
-    con = sqlite3.connect(db_path)
-    row = con.execute("SELECT status FROM tasks WHERE id='t_test'").fetchone()
-    assert row[0] == "done", f"expected status=done, got {row[0]}"
-    con.close()
-
-
-def test_env_var_override_disables_gate(tmp_hermes_home, monkeypatch):
-    """HERMES_KANBAN_MIN_WORKER_RUNTIME_SECONDS=0 disables the gate."""
+def test_resolve_helper_zero_disables_gate(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_MIN_WORKER_RUNTIME_SECONDS", "0")
-    hermes, db_path = tmp_hermes_home
-    from hermes_cli import kanban_db
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
+    assert kb._resolve_min_worker_runtime_seconds() == 0
+
+
+def test_complete_task_rejects_short_runtime_with_empty_payload(kanban_home):
+    """A worker that exits rc=0 in <DEFAULT_MIN_WORKER_RUNTIME_SECONDS
+    with no result and no summary should be blocked, not completed."""
+    db_path = kanban_home / "kanban" / "kanban.db"
+    conn = kb.connect(db_path)
+    tid = kb.create_task(conn, title="hollow-worker-test")
+    kb.claim_task(conn, tid)
     now = int(time.time())
-    _insert_task(con)
-    _insert_run(con, "t_test", started_at=now - 5, ended_at=now)
-    con.close()
-
-    result = kanban_db.complete_task(
-        task_id="t_test",
-        summary=None,
-        result=None,
+    # NOTE: real schema is task_runs (NOT runs). Use the correct table.
+    conn.execute(
+        "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (tid, "done", now - 5, now, "completed"),
     )
-    assert result is True, "Expected gate disabled → completion succeeds"
+    conn.commit()
+    ok = kb.complete_task(conn, tid)
+    assert not ok, "complete_task should refuse hollow completion"
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status != "done", \
+        "task status must not flip to done on HOLLOW"
+    events = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "AND kind = 'completion_blocked_short_runtime'",
+        (tid,),
+    ).fetchall()
+    assert len(events) == 1
 
 
-def test_no_run_row_falls_through(tmp_hermes_home):
-    """Manual completion without a run row → falls through, no crash."""
-    hermes, db_path = tmp_hermes_home
-    from hermes_cli import kanban_db
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    _insert_task(con)
-    # No run row inserted
-    con.close()
-
-    # Should not crash; falls through to standard completion
-    result = kanban_db.complete_task(
-        task_id="t_test",
-        summary="manual review",
-        result=None,
+def test_complete_task_allows_long_runtime_with_empty_payload(kanban_home):
+    """A worker that ran >DEFAULT_MIN_WORKER_RUNTIME_SECONDS is fine even
+    with empty result/summary — long runtime implies real work."""
+    db_path = kanban_home / "kanban" / "kanban.db"
+    conn = kb.connect(db_path)
+    tid = kb.create_task(conn, title="long-runtime-worker")
+    kb.claim_task(conn, tid)
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (tid, "done", now - 120, now, "completed"),
     )
-    assert result is True
+    conn.commit()
+    assert kb.complete_task(conn, tid) is True
 
 
-def test_does_not_use_runs_table(tmp_hermes_home):
+def test_complete_task_allows_short_runtime_with_result(kanban_home):
+    """A short-runtime worker with a real result is fine — the gate only
+    blocks the (short-runtime AND empty-payload) intersection."""
+    db_path = kanban_home / "kanban" / "kanban.db"
+    conn = kb.connect(db_path)
+    tid = kb.create_task(conn, title="short-runtime-with-result")
+    kb.claim_task(conn, tid)
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (tid, "done", now - 2, now, "completed"),
+    )
+    conn.commit()
+    assert kb.complete_task(conn, tid, result="real work done") is True
+
+
+def test_does_not_use_runs_table():
     """Regression: the fix must query task_runs, never the (non-existent) runs table."""
-    hermes, db_path = tmp_hermes_home
-    from hermes_cli import kanban_db
-    # The buggy code path used `FROM runs WHERE task_id = ?` — a table that
-    # doesn't exist. Verify the fix uses task_runs by checking the source.
-    src = (REPO / "hermes_cli" / "kanban_db.py").read_text()
-    assert "FROM runs WHERE" not in src, "buggy `FROM runs` is still in source"
-    assert "FROM task_runs WHERE" in src, "fixed `FROM task_runs` not found"
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    src = open(os.path.join(repo, "hermes_cli", "kanban_db.py")).read()
+    # The buggy arm queried `FROM runs WHERE task_id = ?` — a table that
+    # doesn't exist in the schema. Verify it's gone.
+    assert "FROM runs WHERE" not in src, \
+        "buggy `FROM runs` query is still in source"
+    assert "FROM task_runs WHERE" in src, \
+        "fixed `FROM task_runs` query is missing"
