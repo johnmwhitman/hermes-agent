@@ -90,6 +90,156 @@ _FENCED_PY_RE = re.compile(
 )
 
 
+# Multi-language support (A1, tree-sitter). The Python path stays
+# stdlib-only; everything else uses tree-sitter. _LANGUAGE_PARSERS maps
+# a fence-language tag to a (parser-factory, body-validity) function.
+# parser-factory returns a callable that takes (code: str) -> str skeleton.
+# body-validity takes (code: str) -> bool — returns True iff the body parses
+# cleanly enough to compress.
+_LANGUAGE_PARSERS: dict = {}
+
+
+def _try_init_tree_sitter():
+    """Lazy init: tree-sitter is a C extension. If it isn't installed,
+    return False and the engine falls back to Python-only.
+
+    The first import attempt that succeeds registers parsers into
+    _LANGUAGE_PARSERS for: javascript, typescript, tsx, go, rust, java, cpp.
+    """
+    global _LANGUAGE_PARSERS
+    if _LANGUAGE_PARSERS:
+        return True  # already initialized
+    try:
+        import tree_sitter  # noqa: F401
+        import tree_sitter_languages  # noqa: F401
+    except ImportError:
+        return False
+    try:
+        import tree_sitter as _ts
+        import tree_sitter_languages as _ts_lang
+
+        def _make_skeleton(language: str, ext_to_kind: dict, kind_extractors: dict):
+            """Return a function that takes (code: str) -> str skeleton.
+
+            The skeleton preserves top-level declarations (imports,
+            functions, classes) and drops bodies. Falls back to a 1-line
+            summary if the body is short enough that nothing compresses.
+            """
+            def skeletonize(code: str) -> str:
+                try:
+                    parser = _ts.Parser()
+                    parser.set_language(_ts_lang.get_language(language))
+                    tree = parser.parse(code.encode("utf-8"))
+                except Exception:
+                    return code  # bail
+                out: list[str] = []
+                # Walk top-level statements
+                for child in tree.root_node.children:
+                    # ext_to_kind maps node-type -> display name; defaults
+                    # to the node-type itself when not in the map.
+                    kind = ext_to_kind.get(child.type, child.type)
+                    handler = kind_extractors.get(kind) if kind in kind_extractors else None
+                    if handler is not None:
+                        line = handler(child, code)
+                        if line:
+                            out.append(line)
+                    else:
+                        # Unknown kind: emit a 1-line summary stub. Trim the
+                        # opening brace so the output is a clean signature.
+                        body = code[child.start_byte:child.end_byte]
+                        first = body.split("\n", 1)[0]
+                        for sfx in (" {", "{", " ("):
+                            if first.rstrip().endswith(sfx):
+                                first = first.rstrip()[:-len(sfx)].rstrip()
+                                break
+                        if not first.strip():
+                            # Empty / whitespace-only line (Go's top-level
+                            # newline quirks). Skip rather than emit noise.
+                            continue
+                        out.append(first[:240])
+                if not out:
+                    return code
+                return "\n".join(out)
+            return skeletonize
+
+        def _js_handler(node, code):
+            """JS / TS top-level: function_declaration, class_declaration, import_statement, etc."""
+            txt = code[node.start_byte:node.end_byte]
+            head = txt.split("\n", 1)[0].rstrip("{").rstrip()
+            return head if len(head) < 200 else head[:200] + " ..."
+
+        def _go_handler(node, code):
+            """Go top-level: function_declaration, type_declaration, import_declaration."""
+            txt = code[node.start_byte:node.end_byte]
+            head = txt.split("\n", 1)[0].rstrip("{").rstrip()
+            return head if len(head) < 200 else head[:200] + " ..."
+
+        def _rust_handler(node, code):
+            """Rust top-level: function_item, struct_item, enum_item, impl_item, use_declaration."""
+            txt = code[node.start_byte:node.end_byte]
+            head = txt.split("\n", 1)[0].rstrip("{").rstrip()
+            return head if len(head) < 200 else head[:200] + " ..."
+
+        # Per-kind handlers: given a top-level node, return a one-line
+        # signature (drops the body). All languages share this pattern.
+        def _signature(node, code):
+            txt = code[node.start_byte:node.end_byte]
+            head = txt.split("\n", 1)[0]
+            # Trim trailing opening brace / paren for cleaner output
+            for suffix in (" {", " {", "{", " ("):
+                if head.rstrip().endswith(suffix):
+                    head = head.rstrip()[:-len(suffix)].rstrip()
+                    break
+            return head if len(head) < 240 else head[:240] + " ..."
+
+        # Per-language node-type → signature handler maps.
+        js_types = {k: True for k in {
+            "function_declaration", "class_declaration",
+            "export_statement", "import_statement",
+            "lexical_declaration", "variable_declaration",
+        }}
+        go_types = {k: True for k in {
+            "function_declaration", "method_declaration",
+            "type_declaration", "import_declaration",
+        }}
+        rust_types = {k: True for k in {
+            "function_item", "struct_item", "enum_item",
+            "impl_item", "use_declaration", "trait_item",
+            "type_item", "mod_item", "const_item", "static_item",
+        }}
+
+        _LANGUAGE_PARSERS["javascript"] = (
+            _make_skeleton("javascript", js_types, js_types),
+            lambda code: True,
+        )
+        _LANGUAGE_PARSERS["typescript"] = (
+            _make_skeleton("typescript", js_types, js_types),
+            lambda code: True,
+        )
+        _LANGUAGE_PARSERS["tsx"] = (
+            _make_skeleton("tsx", js_types, js_types),
+            lambda code: True,
+        )
+        _LANGUAGE_PARSERS["go"] = (
+            _make_skeleton("go", go_types, go_types),
+            lambda code: True,
+        )
+        _LANGUAGE_PARSERS["rust"] = (
+            _make_skeleton("rust", rust_types, rust_types),
+            lambda code: True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+# Try to initialize at module load. Failure is fine — Python path stays.
+try:
+    _try_init_tree_sitter()
+except Exception:
+    pass
+
+
 class AstCodeCompressor(ContextEngine):
     """ContextEngine that AST-skeleton-replaces large Python code blocks.
 
