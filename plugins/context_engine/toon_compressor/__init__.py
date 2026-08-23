@@ -30,6 +30,37 @@ from agent.context_engine import ContextEngine
 logger = logging.getLogger(__name__)
 
 
+# --- Compression telemetry -------------------------------------------------
+#
+# Appends one JSONL line per compress() / select_context() call to
+# <HERMES_HOME>/compression_attempts.jsonl. Best-effort: never raise.
+# Schema at agents/capabilities/designs/compression-telemetry-schema.md.
+
+_COMPRESSION_ATTEMPTS_FILENAME = "compression_attempts.jsonl"
+
+
+def _resolve_telemetry_path():
+    import os as _os
+    from pathlib import Path as _P
+    home = _os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return None
+    return _P(home) / _COMPRESSION_ATTEMPTS_FILENAME
+
+
+def _write_telemetry(event):
+    try:
+        path = _resolve_telemetry_path()
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            import json as _json
+            f.write(_json.dumps(event, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.warning("compression telemetry write failed: %s", exc)
+
+
 # Minimum JSON array size (in characters) to consider TOON-encoding.
 # Below this, the header line adds overhead that offsets the savings.
 _MIN_JSON_CHARS = 700
@@ -93,6 +124,13 @@ class ToonCompressor(ContextEngine):
         compressed, stats = self._compress_messages(request_messages)
         if stats["compressed"] > 0:
             self._compression_count = getattr(self, "_compression_count", 0) + 1
+            _write_telemetry({
+                "ts": __import__("time").time(),
+                "engine": "toon_compressor",
+                "hook": "select_context",
+                "compressed": stats.get("compressed", 0),
+                "bytes_saved": stats.get("bytes_saved", 0),
+            })
         return compressed
 
     def compress(
@@ -108,6 +146,13 @@ class ToonCompressor(ContextEngine):
         out, stats = self._compress_messages(messages)
         if stats["compressed"] > 0:
             self.compression_count += 1
+            _write_telemetry({
+                "ts": __import__("time").time(),
+                "engine": "toon_compressor",
+                "hook": "compress",
+                "compressed": stats.get("compressed", 0),
+                "bytes_saved": stats.get("bytes_saved", 0),
+            })
             self._last_compression_savings_pct = (
                 100.0 * stats["bytes_saved"]
                 / max(1, stats["bytes_saved"] + stats["compressed"] * _MIN_JSON_CHARS)

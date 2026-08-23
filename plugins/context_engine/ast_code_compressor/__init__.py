@@ -33,6 +33,47 @@ from agent.context_engine import ContextEngine
 logger = logging.getLogger(__name__)
 
 
+# --- Compression telemetry -------------------------------------------------
+#
+# Each compression engine writes one JSONL line per compress() / select_context()
+# call to <profile_home>/compression_attempts.jsonl. Schema is documented at
+# `agents/capabilities/designs/compression-telemetry-schema.md`. The watchdog
+# `portfolio-compression-rollup` (see NEXT-CYCLE-QUEUE D3) reads the file to
+# emit per-day/per-profile rollups so we can see exactly how often each
+# engine fires, what it saves, and which profile runs it most.
+#
+# The telemetry is best-effort: if HERMES_HOME is unset or the file write
+# fails (disk full, permissions), compression still proceeds. We log a warning
+# rather than failing the engine.
+
+_COMPRESSION_ATTEMPTS_FILENAME = "compression_attempts.jsonl"
+
+
+def _resolve_telemetry_path() -> Optional["Path"]:
+    """Return the per-profile JSONL path, or None if HERMES_HOME is unset."""
+    import os as _os
+    from pathlib import Path as _P
+    home = _os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return None
+    return _P(home) / _COMPRESSION_ATTEMPTS_FILENAME
+
+
+def _write_telemetry(event: Dict[str, Any]) -> None:
+    """Append one JSONL line. Best-effort: never raise."""
+    try:
+        path = _resolve_telemetry_path()
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            import json as _json
+            f.write(_json.dumps(event, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.warning("compression telemetry write failed: %s", exc)
+
+
+
 # Minimum size in characters for a code block to be considered for skeleton
 # compression. Below this threshold, the overhead exceeds the savings.
 _MIN_BLOCK_CHARS = 600
@@ -114,6 +155,14 @@ class AstCodeCompressor(ContextEngine):
         compressed, stats = self._compress_messages(request_messages)
         if stats["blocks_compressed"] > 0:
             self._compression_count = getattr(self, "_compression_count", 0) + 1
+        _write_telemetry({
+            "ts": __import__("time").time(),
+            "engine": "ast_code_compressor",
+            "hook": "select_context",
+            "blocks_found": stats.get("blocks_found", 0),
+            "blocks_compressed": stats.get("blocks_compressed", 0),
+            "bytes_saved": stats.get("bytes_saved", 0),
+        })
         return compressed
 
     def compress(
@@ -158,15 +207,23 @@ class AstCodeCompressor(ContextEngine):
 
         if stats["blocks_compressed"] > 0:
             self.compression_count += 1
-            self._last_compression_savings_pct = (
-                100.0 * stats["bytes_saved"]
-                / max(1, stats["bytes_saved"] + stats["blocks_compressed"] * _MIN_BLOCK_CHARS)
-            )
-            logger.info(
-                "ast_code_compressor: %d Python block(s) compressed, %d bytes saved (%.1f%%)",
-                stats["blocks_compressed"], stats["bytes_saved"],
-                self._last_compression_savings_pct,
-            )
+        _write_telemetry({
+            "ts": __import__("time").time(),
+            "engine": "ast_code_compressor",
+            "hook": "compress",
+            "blocks_found": stats.get("blocks_found", 0),
+            "blocks_compressed": stats.get("blocks_compressed", 0),
+            "bytes_saved": stats.get("bytes_saved", 0),
+        })
+        self._last_compression_savings_pct = (
+            100.0 * stats["bytes_saved"]
+            / max(1, stats["bytes_saved"] + stats["blocks_compressed"] * _MIN_BLOCK_CHARS)
+        )
+        logger.info(
+            "ast_code_compressor: %d Python block(s) compressed, %d bytes saved (%.1f%%)",
+            stats["blocks_compressed"], stats["bytes_saved"],
+            self._last_compression_savings_pct,
+        )
         return out
 
     def _compress_messages(self, messages):
