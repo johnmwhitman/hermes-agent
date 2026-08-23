@@ -33116,6 +33116,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _ensure_windows_gateway_venv_imports()
 
+    # Built-in tool discovery — the registry only knows toolsets whose
+    # modules have been imported.  A gateway whose first traffic is the
+    # A2A agent-card introspection (``/.well-known/agent.json``) can boot
+    # with only 3 tools visible (a2a, spotify, terminal — whatever the
+    # adapter's transitive imports happened to pull in) and never reach
+    # the lazy ``from model_tools import ...`` path on the first
+    # turn.  Run the registry populator at gateway startup so the agent
+    # card advertises every self-registering toolset this Python build
+    # actually has, not the ones a coincidental import chain revealed.
+    # Opt-out: ``HERMES_GATEWAY_SKIP_TOOL_DISCOVERY=1`` restores the
+    # pre-fix three-skill baseline (used by the canonical receipt
+    # comparison and any tooling that still wants to validate the
+    # regression).  Mirrors the executor pattern used for MCP discovery
+    # below (loop-blocking scan, ~145 ms over ~100 files on warm cache).
+    if not os.environ.get("HERMES_GATEWAY_SKIP_TOOL_DISCOVERY"):
+        try:
+            from tools.registry import discover_builtin_tools, registry
+
+            _loop = asyncio.get_running_loop()
+            imported = await _loop.run_in_executor(None, discover_builtin_tools)
+            logger.info(
+                "Gateway built-in tool discovery imported %d module(s); registry toolset count=%d",
+                len(imported),
+                len(registry.get_registered_toolset_names()),
+            )
+        except Exception as e:
+            logger.debug("Built-in tool discovery failed: %s", e)
+
     # MCP tool discovery — run in an executor so the asyncio event loop
     # stays responsive even when a configured MCP server is slow or
     # unreachable.  discover_mcp_tools() uses a blocking 120s wait

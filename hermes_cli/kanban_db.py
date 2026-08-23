@@ -450,6 +450,35 @@ def _resolve_crash_grace_seconds() -> int:
     return DEFAULT_CRASH_GRACE_SECONDS
 
 
+# Minimum runtime (seconds) before the dispatcher considers a worker's exit
+# "real". Sub-30s exits with rc=0 are treated as a soft no-op (HOLLOW pattern:
+# subagent echoed 'done' without doing real work, OR a provider round-trip
+# bailed before any tool call landed). The dispatcher holds the task at
+# ``ready`` rather than marking it ``done`` so the next tick retries, while
+# still emitting a low-severity signal for the lane to investigate. Set to 0
+# to disable (back-compat for installs that genuinely have fast rc=0 paths
+# like cron profile or read-only audit scripts).
+DEFAULT_MIN_WORKER_RUNTIME_SECONDS = 30
+
+
+def _resolve_min_worker_runtime_seconds() -> int:
+    """Return the minimum worker runtime gate in seconds.
+
+    Reads ``HERMES_KANBAN_MIN_WORKER_RUNTIME_SECONDS`` from the environment;
+    falls back to ``DEFAULT_MIN_WORKER_RUNTIME_SECONDS`` when absent, empty,
+    non-integer, or negative. A value of 0 disables the gate entirely.
+    """
+    raw = os.environ.get("HERMES_KANBAN_MIN_WORKER_RUNTIME_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_MIN_WORKER_RUNTIME_SECONDS
+
+
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """Return the rate-limit requeue cooldown in seconds.
 
@@ -5440,6 +5469,46 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    # Minimum-runtime gate: a worker that exits rc=0 in under
+    # DEFAULT_MIN_WORKER_RUNTIME_SECONDS is treated as HOLLOW — the
+    # subagent echoed 'done' without doing real work. Reject the completion,
+    # leave the task at its prior status for the next tick to retry, and
+    # emit an auditable event. This is the dispatcher-side counterpart to
+    # the cron-hollow guard: both filters protect against false-green.
+    _min_runtime = _resolve_min_worker_runtime_seconds()
+    if _min_runtime > 0 and not summary and not result:
+        # Fetch the latest run's start time to measure real wall-clock
+        # worker runtime. Skip when there is no run (manual / review
+        # completion paths never have a run row to read).
+        run_row = conn.execute(
+            "SELECT started_at, ended_at FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if run_row and run_row["started_at"]:
+            run_seconds = (run_row["ended_at"] or now) - int(run_row["started_at"])
+            if run_seconds < _min_runtime:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        task_id,
+                        "completion_blocked_short_runtime",
+                        {
+                            "min_runtime_seconds": _min_runtime,
+                            "actual_runtime_seconds": run_seconds,
+                            "started_at": int(run_row["started_at"]),
+                            "ended_at": run_row["ended_at"],
+                        },
+                    )
+                _log.warning(
+                    "kanban complete_task: task %s completed in %ds (< %ds min) "
+                    "with empty result/summary — treating as HOLLOW, leaving task "
+                    "in its prior status for retry",
+                    task_id, run_seconds, _min_runtime,
+                )
+                return False
+
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
