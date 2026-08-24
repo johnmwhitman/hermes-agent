@@ -84,8 +84,11 @@ _MIN_BLOCK_CHARS = 600
 # ```
 # or is fenced with ```py / ```python. We also catch raw triple-quoted
 # blocks when fenced detection fails.
+# Language tag is REQUIRED. A bare ``` fence is used by JSON, YAML,
+# tool transcripts, and shell dumps — matching those as Python was
+# eating live dog-food (2026-08-24 capability-enablement).
 _FENCED_PY_RE = re.compile(
-    r"(?P<full>```(?:python|py)?\n(?P<body>.*?)```)",
+    r"(?P<full>```(?:python|py)\n(?P<body>.*?)```)",
     re.DOTALL,
 )
 
@@ -489,14 +492,20 @@ class AstCodeCompressor(ContextEngine):
     def _process_message(self, msg: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, int]]:
         """Compress any large Python code block in the message content.
 
-        Returns the new message (or unchanged) and stats. Only touches
-        message roles that carry text content (user/assistant/tool/system
+        Returns the new message (or unchanged) and stats. Skips tool/function
+        roles so transcripts and file dumps stay readable. Touches
+        message roles that carry chat text (user/assistant/system
         all possible — we check any "content" or "text" key).
         """
         stats = {"blocks_found": 0, "blocks_compressed": 0, "bytes_saved": 0}
 
         # Skip non-message types and dicts without a content key.
         if not isinstance(msg, dict):
+            return msg, stats
+
+        # Tool transcripts are evidence. Compressing them (2026-08-24 dog-food)
+        # turned live probe output into AST skeletons. Never touch those roles.
+        if str(msg.get("role") or "").lower() in {"tool", "function"}:
             return msg, stats
 
         content = msg.get("content")

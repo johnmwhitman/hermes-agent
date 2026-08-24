@@ -23,7 +23,7 @@ class AstCcrIntegrationTests(unittest.TestCase):
             {"role": "user", "content": "small"},
             {"role": "assistant", "content": "small"},
             {"role": "user", "content": "small"},
-            {"role": "tool", "content": f"```python\n{big_py}\n```"},
+            {"role": "user", "content": f"```python\n{big_py}\n```"},
         ]
 
     def test_compress_stores_original(self):
@@ -82,7 +82,7 @@ class ToonCcrIntegrationTests(unittest.TestCase):
             {"role": "user", "content": "small"},
             {"role": "assistant", "content": "small"},
             {"role": "user", "content": "small"},
-            {"role": "tool", "content": big_json},
+            {"role": "user", "content": big_json},
         ]
         out = self.eng.compress(msgs)
         compressed = out[4]["content"]

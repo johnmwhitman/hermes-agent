@@ -162,7 +162,7 @@ class EngineCompressTests(unittest.TestCase):
     def test_compresses_large_python_block(self):
         # Construct a message with a large Python block.
         big_py = "import os\n" + ("def f():\n    return 1\n" * 100) + "\n```"
-        big_msg = {"role": "tool", "content": f"```python\n{big_py}"}
+        big_msg = {"role": "user", "content": f"```python\n{big_py}"}
         msgs = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "small"},
@@ -208,7 +208,7 @@ class EngineCompressTests(unittest.TestCase):
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "x"}, {"role": "assistant", "content": "y"},
             {"role": "user", "content": "z"},
-            {"role": "tool", "content": f"```python\n{big_py}\n```"},
+            {"role": "user", "content": f"```python\n{big_py}\n```"},
         ]
         before = self.eng.compression_count
         self.eng.compress(msgs)
@@ -220,7 +220,7 @@ class EngineCompressTests(unittest.TestCase):
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "x"}, {"role": "assistant", "content": "y"},
             {"role": "user", "content": "z"},
-            {"role": "tool", "content": f"```python\n{big_py}\n```"},
+            {"role": "user", "content": f"```python\n{big_py}\n```"},
         ]
         self.eng.compress(msgs)
         self.assertGreater(self.eng._last_compression_savings_pct, 50)
