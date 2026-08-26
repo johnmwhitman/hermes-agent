@@ -31,6 +31,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import sqlite3
+import subprocess
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -138,6 +142,199 @@ def _check_kanban_orchestrator_mode() -> bool:
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Receipt gating (close-time)
+# ---------------------------------------------------------------------------
+# Mirrors the rules in
+# profiles/conductor/scripts/kanban_completion_verifier.py so a worker
+# cannot move a card to done with hollow / unobservable prose — the
+# verifier is an after-the-fact audit, this is the hard gate.
+#
+# A receipt is "observable" when ANY of:
+#   * result/summary names an absolute path that exists on disk
+#   * result/summary names a git SHA that resolves in ~/AI
+#   * the task still has at least one attachment whose stored_path exists
+#   * result/summary carries both a VERIFIED token AND a command-shaped
+#     fragment (a "command I ran, with the receipt of having run it")
+#
+# Anything else is refused; the tool returns a tool_error so the worker
+# can fix the call rather than the board silently accepting it.
+
+_RECEIPT_PATH_RE = re.compile(
+    r"(?<![\w.-])((?:/Users|/tmp|/private|~/AI)[^\s`'\"><)\]]+)"
+)
+# 10-40 hex, must include at least one a-f so date strings like 20260815
+# do not match.
+_RECEIPT_SHA_RE = re.compile(r"\b([0-9a-f]*[a-f][0-9a-f]{9,39})\b", re.I)
+# Kanban task ids look like t_<8 hex>; strip them so we never treat a
+# sibling card id as a "git SHA".
+_RECEIPT_TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{6,}\b", re.I)
+_RECEIPT_CMD_RE = re.compile(
+    r"(?m)^(?:\$ |# )?(?:git |bash |python3? |hermes |rg |grep |ls |test |wc |curl ).+"
+)
+_RECEIPT_VERIFIED_RE = re.compile(r"\bVERIFIED\b")
+_RECEIPT_AI_ROOT = Path("/Users/johnwhitman/AI")
+# Minimum prose so a "summary" or "result" cannot squeak past by being
+# one accidental word. Matches kanban_completion_verifier.MIN_PROSE.
+_RECEIPT_MIN_PROSE = 80
+
+
+def _receipt_expand_path(token: str) -> Path:
+    return Path(os.path.expanduser(token.rstrip(".,;:")))
+
+
+def _receipt_extract_paths(text: str) -> list[str]:
+    seen: list[str] = []
+    for m in _RECEIPT_PATH_RE.finditer(text or ""):
+        token = m.group(1).rstrip(".,;:")
+        if token not in seen:
+            seen.append(token)
+    return seen
+
+
+def _receipt_extract_shas(text: str) -> list[str]:
+    cleaned = _RECEIPT_TASK_ID_RE.sub(" ", text or "")
+    seen: list[str] = []
+    for m in _RECEIPT_SHA_RE.finditer(cleaned):
+        sha = m.group(1).lower()
+        if sha.isdigit():
+            continue
+        if len(sha) < 10:
+            continue
+        if sha not in seen:
+            seen.append(sha)
+    return seen
+
+
+def _receipt_sha_resolves(sha: str, repo: Path = _RECEIPT_AI_ROOT) -> bool:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", sha + "^{commit}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if r.returncode == 0:
+            return True
+        r2 = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", sha],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return r2.returncode == 0
+    except OSError:
+        return False
+
+
+def _receipt_existing_attachments(
+    conn: sqlite3.Connection, task_id: str
+) -> list[str]:
+    """Return stored_path values for the task that still exist on disk."""
+    try:
+        rows = conn.execute(
+            "SELECT stored_path FROM task_attachments WHERE task_id=?",
+            (task_id,),
+        ).fetchall()
+    except Exception:
+        return []
+    found: list[str] = []
+    for r in rows:
+        p = r["stored_path"] if isinstance(r, sqlite3.Row) else r[0]
+        if p and Path(str(p)).exists():
+            found.append(str(p))
+    return found
+
+
+def _receipt_classify(
+    text: str, attachments: list[str]
+) -> dict:
+    """Return the same evidence dict shape the after-the-fact verifier uses,
+    so the gate and the audit cannot disagree."""
+    paths = _receipt_extract_paths(text)
+    shas = _receipt_extract_shas(text)
+    existing_paths = [p for p in paths if _receipt_expand_path(p).exists()]
+    missing_paths = [p for p in paths if p not in existing_paths]
+    existing_shas = [s for s in shas if _receipt_sha_resolves(s)]
+    has_verified = bool(_RECEIPT_VERIFIED_RE.search(text or ""))
+    has_cmd = bool(_RECEIPT_CMD_RE.search(text or ""))
+    return {
+        "paths": paths,
+        "existing_paths": existing_paths,
+        "missing_paths": missing_paths,
+        "shas": shas,
+        "existing_shas": existing_shas,
+        "has_verified": has_verified,
+        "has_cmd": has_cmd,
+        "attachments": list(attachments),
+    }
+
+
+def _enforce_receipt_on_complete(
+    args: dict, conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Hard-gate kanban_complete: refuse DONE without an observable receipt.
+
+    Returns a tool_error string when the receipt is missing or unauditable,
+    or None when the close is permitted. Mirrors the verdicts in
+    profiles/conductor/scripts/kanban_completion_verifier.py.
+
+    The receipt text is the concatenation of the (redacted) summary,
+    result, and any artifacts paths the worker declared — those are the
+    only durable fields the close-time write persists, and the board
+    downstream does not separately audit them.
+    """
+    summary = args.get("summary") or ""
+    result = args.get("result") or ""
+    metadata = args.get("metadata") or {}
+    artifacts = args.get("artifacts") or []
+    if not isinstance(metadata, dict):
+        # Already rejected upstream; defensive: do not let a non-dict slip
+        # into json.dumps in the receipt text below.
+        metadata = {}
+    artifact_lines = "\n".join(str(p) for p in artifacts)
+    receipt_text = "\n".join(
+        part for part in (summary, result, artifact_lines) if part
+    )
+    attachments = _receipt_existing_attachments(conn, task_id)
+    ev = _receipt_classify(receipt_text, attachments)
+
+    if (
+        ev["existing_paths"]
+        or ev["existing_shas"]
+        or ev["attachments"]
+        or (ev["has_verified"] and ev["has_cmd"])
+    ):
+        return None  # observable receipt → permit the close
+
+    if ev["missing_paths"]:
+        example = ev["missing_paths"][0]
+        return tool_error(
+            "kanban_complete refused: claimed receipt paths do not exist on disk "
+            f"(e.g. {example}). Pass an existing absolute path, an existing "
+            "attachment, a resolvable git SHA, or a VERIFIED token + a "
+            "command-shaped fragment. Card not moved to done.",
+        )
+
+    prose_len = len((result or "").strip())
+    if prose_len < _RECEIPT_MIN_PROSE and not ev["has_verified"]:
+        return tool_error(
+            "kanban_complete refused: result/summary is too short to be a "
+            "receipt. Provide an existing absolute path, an existing "
+            "attachment, a resolvable git SHA, or a longer summary that "
+            "includes a VERIFIED token and a command-shaped fragment. "
+            "Card not moved to done.",
+        )
+
+    # Long prose with no observable handle is still hollow.
+    return tool_error(
+        "kanban_complete refused: result/summary has no observable receipt. "
+        "Add an existing absolute path, an existing attachment, a "
+        "resolvable git SHA, or a VERIFIED token + a command-shaped "
+        "fragment. Card not moved to done.",
+    )
+
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
@@ -764,6 +961,15 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"or (2) create continuation tasks with parents=[{tid}] "
                     f"and keep this task alive."
                 )
+
+            # Receipt gate (close-time hard gate, sibling of
+            # profiles/conductor/scripts/kanban_completion_verifier.py).
+            # A card may not move to done with hollow / unobservable
+            # prose — refuse the close and keep the card alive so the
+            # worker can fix the call.
+            receipt_err = _enforce_receipt_on_complete(args, conn, tid)
+            if receipt_err:
+                return receipt_err
 
             try:
                 ok = kb.complete_task(

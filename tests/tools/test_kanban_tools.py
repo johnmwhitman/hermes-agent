@@ -111,10 +111,13 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
-def test_complete_happy_path(worker_env):
+def test_complete_happy_path(worker_env, tmp_path):
     from tools import kanban_tools as kt
+    artifact = tmp_path / "out.txt"
+    artifact.write_text("ok\n")
     out = kt._handle_complete({
         "summary": "got the thing done",
+        "result": f"VERIFIED receipt at {artifact} via write+stat",
         "metadata": {"files": 2},
     })
     d = json.loads(out)
@@ -132,30 +135,120 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
-def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
-    """After a phantom rejection, retrying kanban_complete with
+def test_complete_retry_with_empty_created_cards_succeeds(worker_env, tmp_path):
+    """After a phantom-id rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
-    task. Regression for #22923."""
+    task. Regression for #22923. The retry must also carry an observable
+    receipt (close-time hard gate, t_948219e1)."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    # Hit the gate first.
+    # Hit the phantom-id gate first.
     rejected = json.loads(kt._handle_complete({
         "summary": "oops",
+        "result": f"VERIFIED\n$ cat {tmp_path/'x'}",
         "created_cards": ["t_phantomdeadbeef"],
     }))
-    assert rejected.get("error")
+    assert rejected.get("error"), rejected
 
-    # Retry with the escape hatch.
+    # Retry with the escape hatch + a real receipt (existing path).
+    artifact = tmp_path / "retry.txt"
+    artifact.write_text("ok\n")
     ok = json.loads(kt._handle_complete({
-        "summary": "retry without claims",
+        "summary": f"retry without claims; see {artifact}",
         "created_cards": [],
     }))
-    assert ok.get("ok") is True
+    assert ok.get("ok") is True, ok
 
     conn = kb.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "done"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Receipt gate (close-time hard gate, card t_948219e1)
+# ---------------------------------------------------------------------------
+
+
+def test_complete_refuses_hollow_call(worker_env):
+    """A real call to _handle_complete with hollow prose keeps the card
+    running. Regression for t_948219e1."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_complete({"summary": "yep done"})
+    parsed = json.loads(out)
+    assert "error" in parsed, f"expected refusal, got: {parsed}"
+    assert "refused" in parsed["error"]
+    conn = kb.connect()
+    try:
+        status = kb.get_task(conn, worker_env).status
+    finally:
+        conn.close()
+    assert status != "done", (
+        f"card moved to done despite hollow receipt (status={status})"
+    )
+
+
+def test_complete_refuses_short_retry(worker_env):
+    """Retry with the documented 'created_cards=[]' escape hatch is NOT
+    an escape from the receipt gate."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_complete({
+        "summary": "nope",
+        "created_cards": [],
+    })
+    parsed = json.loads(out)
+    assert "error" in parsed
+    assert "refused" in parsed["error"]
+    conn = kb.connect()
+    try:
+        status = kb.get_task(conn, worker_env).status
+    finally:
+        conn.close()
+    assert status != "done"
+
+
+def test_complete_accepts_observed_path(worker_env, tmp_path):
+    """An existing path in result/summary lets the close through."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    artifact = tmp_path / "happy.txt"
+    artifact.write_text("ok\n")
+    out = kt._handle_complete({
+        "summary": f"see {artifact}",
+        "result": "",
+    })
+    parsed = json.loads(out)
+    assert parsed.get("ok") is True, parsed
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.outcome == "completed"
+    finally:
+        conn.close()
+
+
+def test_complete_accepts_verified_command(worker_env):
+    """A VERIFIED + command fragment lets the close through."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_complete({
+        "summary": "",
+        "result": "VERIFIED\n$ python3 -m pytest tests/ -q",
+    })
+    parsed = json.loads(out)
+    assert parsed.get("ok") is True, parsed
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.outcome == "completed"
     finally:
         conn.close()
 
@@ -517,6 +610,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     # 5. complete with structured handoff
     comp = json.loads(kt._handle_complete({
         "summary": "implemented + spawned QA follow-up",
+        "result": "VERIFIED\n$ python3 -m pytest tests/tools/test_kanban_tools.py -q",
         "metadata": {"child_task": child_out["task_id"]},
     }))
     assert comp["ok"]
@@ -710,7 +804,12 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
         conn.close()
 
     from tools import kanban_tools as kt
-    out = kt._handle_complete({"task_id": tid, "summary": "orchestrator close"})
+    receipt = tmp_path / "orch-receipt.txt"
+    receipt.write_text("ok\n")
+    out = kt._handle_complete({
+        "task_id": tid,
+        "summary": f"orchestrator close; see {receipt}",
+    })
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == tid
 
