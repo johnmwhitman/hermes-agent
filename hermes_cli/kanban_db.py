@@ -5569,6 +5569,66 @@ def complete_task(
                     size=path.stat().st_size,
                     created_at=now,
                 )
+        # Canonicalize any kanban/workspaces/<task_id>/... citations in
+        # summary / result / changed_files to point at the durable
+        # attachments/<task_id>/ location now that the artifact copy is
+        # complete. Without this pass the receipt text points at a path
+        # the worker has seconds to live — verifiers following the cited
+        # path then false-negative on otherwise good evidence. The
+        # rewrite only fires when the substituted attachments path
+        # actually exists on disk, so we never silently mis-cite a
+        # missing file.
+        try:
+            attach_dir = task_attachments_dir(task_id)
+        except Exception:
+            attach_dir = None
+        canonicalize_log: list[dict] = []
+        for field_name, field_value in (
+            ("summary", summary),
+            ("result", result),
+        ):
+            if not field_value:
+                continue
+            new_value, n = _canonicalize_workspaces_citations(
+                field_value, task_id, attach_dir
+            )
+            if n:
+                canonicalize_log.append(
+                    {"field": field_name, "rewrites": n}
+                )
+                if field_name == "summary":
+                    summary = new_value
+                else:
+                    result = new_value
+        if (
+            isinstance(metadata, dict)
+            and "changed_files" in metadata
+            and isinstance(metadata["changed_files"], list)
+            and attach_dir is not None
+        ):
+            new_cf = []
+            cf_rewrites = 0
+            for entry in metadata["changed_files"]:
+                if not isinstance(entry, str):
+                    new_cf.append(entry)
+                    continue
+                new_entry, n = _canonicalize_workspaces_citations(
+                    entry, task_id, attach_dir
+                )
+                cf_rewrites += n
+                new_cf.append(new_entry)
+            if cf_rewrites:
+                metadata["changed_files"] = new_cf
+                canonicalize_log.append(
+                    {"field": "changed_files", "rewrites": cf_rewrites}
+                )
+        if canonicalize_log:
+            _append_event(
+                conn,
+                task_id,
+                "receipt_citations_canonicalized",
+                {"rewrites": canonicalize_log},
+            )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -5856,6 +5916,73 @@ def _insert_completion_attachment(
         "attached",
         {"filename": filename, "size": size, "by": "kanban_complete"},
     )
+
+
+def _canonicalize_workspaces_citations(
+    text: Optional[str],
+    task_id: str,
+    attachment_dir: Optional[Path],
+) -> tuple[Optional[str], int]:
+    """Rewrite ``kanban/workspaces/<task_id>/...`` references to ``attachments/...``.
+
+    ``_persist_scratch_completion_artifacts`` copies declared scratch artifacts
+    into the durable ``attachments/<task_id>/`` directory and rewrites
+    ``metadata["artifacts"]`` to point there — but worker prose (the
+    ``summary`` text and ``metadata.changed_files`` entries) still cites the
+    scratch path that gets cleaned up seconds later. Verifiers that follow
+    the cited path then score the card UNSUPPORTED for evidence that is
+    genuinely there. This pass normalizes the durable record so the receipt
+    text points at the same durable artifact the attachments table does.
+
+    Substitution only fires when ``attachments/<task_id>/<relpath>`` exists
+    on disk — otherwise we leave the citation alone (the worker may have
+    cited a different file that happens to share the dir prefix, and we do
+    not want to silently rewrite to a non-existent path).
+    """
+    if not text or not attachment_dir:
+        return text, 0
+    try:
+        root = attachment_dir.resolve()
+    except OSError:
+        return text, 0
+
+    # Match either /kanban/workspaces/<task_id>/<rel> (default board) or
+    # /kanban/boards/<slug>/workspaces/<task_id>/<rel> (non-default board).
+    pattern = re.compile(
+        r"(?P<prefix>(?:[^\s'\"<>]*?kanban(?:[/\\]boards[/\\][\w.-]+)?[/\\]workspaces[/\\])"
+        + re.escape(task_id)
+        + r"[/\\])(?P<rel>[^\s'\"<>]*)"
+    )
+
+    rewrites = 0
+
+    def _sub(match: "re.Match[str]") -> str:
+        nonlocal rewrites
+        rel = match.group("rel")
+        candidate = (root / rel).resolve()
+        try:
+            ok = candidate.is_file() or candidate.is_dir()
+        except OSError:
+            ok = False
+        if not ok:
+            return match.group(0)
+        rewrites += 1
+        # Rebuild the prefix against the attachments root.
+        prefix = match.group("prefix")
+        # Replace only the `workspaces[/\\]<task_id>[/\\]` segment with
+        # `attachments[/\\]<task_id>[/\\]`, leaving any kanban-home prefix
+        # and any kanban/boards/<slug>/ prefix intact.
+        new_prefix = re.sub(
+            r"[/\\]workspaces[/\\]" + re.escape(task_id) + r"[/\\]",
+            lambda m: m.group(0).replace("/workspaces/", "/attachments/").replace(
+                "\\workspaces\\", "\\attachments\\"
+            ),
+            prefix,
+        )
+        return new_prefix + rel
+
+    new_text = pattern.sub(_sub, text)
+    return (new_text, rewrites)
 
 
 def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:

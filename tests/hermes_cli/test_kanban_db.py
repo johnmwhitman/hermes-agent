@@ -615,6 +615,76 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
 
 
 
+def test_complete_task_canonicalizes_workspaces_citations_to_attachments(kanban_home):
+    """Receipts citing ``kanban/workspaces/<id>/...`` are rewritten to the durable
+    ``kanban/attachments/<id>/...`` path that the artifact copy lives at, so
+    verifiers following the cited path find the evidence instead of getting
+    false-negative 'file not found'. See card t_0aa89f85."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="finding")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        finding = ws / "FINDING.md"
+        finding.write_text("# finding body")
+        ws_in_text = str(finding)
+        # Worker cites the (soon-to-be-deleted) workspaces/ path in summary.
+        summary = f"VERIFIED diagnostic at {ws_in_text} (1234B)"
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            summary=summary,
+            metadata={"artifacts": [str(finding)]},
+        )
+
+    run = None
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, t)
+        events = [e for e in kb.list_events(conn, t) if e.kind == "receipt_citations_canonicalized"]
+
+    # The scratch workspace is gone, as designed.
+    assert not Path(ws_in_text).exists()
+    # The summary was rewritten to the durable attachments/ path.
+    assert run is not None
+    assert ws_in_text not in run.summary, f"workspaces/ citation should have been rewritten: {run.summary!r}"
+    att_dir = kb.task_attachments_dir(t)
+    att_path = att_dir / "FINDING.md"
+    assert att_path.exists()
+    assert str(att_path) in run.summary
+    # The audit event was emitted with per-field counts.
+    assert len(events) == 1
+    payload = events[0].payload
+    assert any(r["field"] == "summary" and r["rewrites"] >= 1 for r in payload["rewrites"])
+
+
+def test_complete_task_leaves_unknown_workspaces_paths_alone(kanban_home):
+    """If a worker cites a workspaces/ path with NO matching attachments/ file,
+    the canonicalizer leaves it alone — we never silently mis-cite to a missing
+    path."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="advisory")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        # Build a fake workspaces/ path that points OUTSIDE the scratch
+        # workspace and never had a real file — the attachments copy cannot
+        # create this sibling because it isn't a managed scratch artifact.
+        ghost = Path("/tmp") / f"never-existed-{t}" / "GHOST.md"
+        summary = f"Note: see {ghost} (also wrote elsewhere)"
+
+        assert kb.complete_task(conn, t, result="ok", summary=summary)
+
+    run = None
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, t)
+        events = [e for e in kb.list_events(conn, t) if e.kind == "receipt_citations_canonicalized"]
+    # workspaces/ citation survives because no attachments/ sibling exists.
+    assert str(ghost) in run.summary
+    assert events == []
+
+
 # ---------------------------------------------------------------------------
 # Deferred scratch cleanup for parent/child handoff (#33774)
 # ---------------------------------------------------------------------------
