@@ -3595,6 +3595,20 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # ``recompute_ready`` intentionally revisits non-sticky
+                    # blocked tasks so dependency and circuit-breaker states
+                    # can recover.  An explicit initial block is instead a
+                    # human-ops gate and must carry the same durable marker as
+                    # ``block_task``; otherwise the next dispatcher tick sees
+                    # a parentless task as dependency-clear, promotes it, and
+                    # may spawn a worker despite ``--initial-status blocked``.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"initial": True},
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:

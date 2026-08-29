@@ -142,6 +142,47 @@ def test_dispatch_red_defers_ready_task_without_claiming(
     assert all(event.kind != "claimed" for event in events_after)
 
 
+def test_initial_blocked_task_stays_sticky_until_explicit_unblock(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """An initial human-ops block must survive every dispatcher tick."""
+    monkeypatch.setattr(kb, "_configured_dispatch_governor_state_path", lambda: None)
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="explicitly parked",
+            assignee="alice",
+            initial_status="blocked",
+        )
+
+        blocked_result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        blocked_task = kb.get_task(conn, task_id)
+        blocked_events = kb.list_events(conn, task_id)
+        blocked_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+
+        assert blocked_task is not None and blocked_task.status == "blocked"
+        assert blocked_result.promoted == 0
+        assert blocked_result.spawned == []
+        assert spawns == []
+        assert blocked_runs == 0
+        assert any(event.kind == "blocked" for event in blocked_events)
+        assert all(event.kind != "claimed" for event in blocked_events)
+
+        assert kb.unblock_task(conn, task_id) is True
+        allowed_result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert allowed_result.spawned
+    assert spawns == [task_id]
+
+
 def test_dispatch_unknown_governor_state_fails_closed(
     kanban_home, all_assignees_spawnable, monkeypatch, tmp_path
 ):
