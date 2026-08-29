@@ -611,6 +611,25 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                         provider=provider.strip() or current_provider,
                         base_url="",
                     )
+
+        # --- shared hermes_aliases.yaml (allowlisted fragment gate) ---
+        # Imported LAST so any profile-local entry — whether via the dict
+        # ``model_aliases:`` surface or the string ``model.aliases:`` block
+        # — wins over the shared library's default for that key. The gate
+        # ``_should_import_alias_registry(cfg)`` is the only thing that
+        # opens the registry file; profiles without ``imports:``
+        # ``hermes_aliases.yaml`` in their config observe no behavior
+        # change. See docs/architecture/hermes-aliases-design.md §3.1,
+        # §4, §6.1 for the migration-safety contract.
+        try:
+            from hermes_cli.alias_registry import load_alias_registry
+        except Exception:
+            load_alias_registry = None  # type: ignore[assignment]
+        if load_alias_registry is not None:
+            for name, entry in load_alias_registry(cfg).items():
+                if name in merged:
+                    continue  # profile-local override wins
+                merged[name] = entry
     except Exception:
         pass
     return merged
