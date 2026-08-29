@@ -21,8 +21,12 @@ from __future__ import annotations
 
 import inspect
 import re
+from types import SimpleNamespace
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _dispatch_result_is_expected_idle,
+)
 
 
 def _dispatcher_watcher_source() -> str:
@@ -86,7 +90,7 @@ def test_skipped_per_profile_capped_classified_correctly():
     """The cap-aware classification logic should look at the per-board
     DispatchResult's ``skipped_per_profile_capped`` field and treat ONLY
     cap-skips as 'correctly idle'."""
-    src = _dispatcher_watcher_source()
+    src = inspect.getsource(_dispatch_result_is_expected_idle)
     assert "skipped_per_profile_capped" in src
     # The skip-reason check should NOT treat unassigned / nonspawnable as cap.
     # Find the variable that holds the per-board cap count.
@@ -104,3 +108,33 @@ def test_no_regression_in_pause_short_circuit():
     src = _dispatcher_watcher_source()
     assert "ready_pending = False" in src
     assert "bad_ticks = 0" in src
+
+
+def test_disk_governor_block_is_classified_as_expected_idle():
+    """RED/UNKNOWN disk admission is intentional throttling, not stuck."""
+    for pressure in ("RED", "UNKNOWN"):
+        result = SimpleNamespace(
+            disk_pressure=pressure,
+            skipped_per_profile_capped=[],
+            skipped_unassigned=[],
+            skipped_nonspawnable=[],
+            reclaimed=[],
+            crashed=[],
+            timed_out=[],
+        )
+        assert _dispatch_result_is_expected_idle(result) is True
+
+
+def test_disk_governor_green_or_unset_does_not_mask_stuck_ready_work():
+    """Only blocking governor states reset the stuck-warning accumulator."""
+    for pressure in (None, "GREEN", "YELLOW"):
+        result = SimpleNamespace(
+            disk_pressure=pressure,
+            skipped_per_profile_capped=[],
+            skipped_unassigned=[],
+            skipped_nonspawnable=[],
+            reclaimed=[],
+            crashed=[],
+            timed_out=[],
+        )
+        assert _dispatch_result_is_expected_idle(result) is False

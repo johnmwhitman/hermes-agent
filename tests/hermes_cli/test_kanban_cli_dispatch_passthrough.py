@@ -94,3 +94,39 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+def test_cli_dispatch_json_surfaces_disk_pressure(
+    isolated_kanban_home, monkeypatch, capsys
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda conn, **kwargs: kanban_db.DispatchResult(disk_pressure="RED"),
+    )
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=True)
+
+    assert kb_cli._cmd_dispatch(args) == 0
+    output = __import__("json").loads(capsys.readouterr().out)
+    assert output["disk_pressure"] == "RED"
+
+
+def test_cli_dispatch_text_surfaces_disk_pressure(
+    isolated_kanban_home, monkeypatch, capsys
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda conn, **kwargs: kanban_db.DispatchResult(disk_pressure="UNKNOWN"),
+    )
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+
+    assert kb_cli._cmd_dispatch(args) == 0
+    assert "Disk governor: UNKNOWN (dispatch deferred)" in capsys.readouterr().out
+

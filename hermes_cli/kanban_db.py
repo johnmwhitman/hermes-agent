@@ -8305,6 +8305,15 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    disk_pressure: Optional[str] = None
+    """Configured disk-governor level that suppressed new dispatches.
+
+    ``"RED"`` means the canonical governor explicitly stopped discretionary
+    launches. ``"UNKNOWN"`` means a configured state file was missing,
+    unreadable, malformed, or carried an unsupported level, so dispatch
+    failed closed. ``None`` means the guard was not configured or the state
+    was GREEN/YELLOW. Existing workers and normal reclaim/promotion
+    bookkeeping are never altered by this guard."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9834,7 +9843,7 @@ def review_dispatch_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Memory-aware dispatch guard (OOF-30 / OOF-77)
+# Resource-aware dispatch guards (OOF-30 / OOF-77)
 #
 # Two production incidents ("larrikin-lollies", "synclare-task-manager")
 # followed the same shape: no ``kanban.max_in_progress`` configured, a busy
@@ -9865,6 +9874,57 @@ MEMORY_GUARD_MB_PER_WORKER = 512
 # more fan-out on big iron should say so explicitly in config).
 DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
+
+# A governor state is tiny (normally tens of KiB). Refuse unexpectedly large
+# configured inputs before JSON parsing so a misplaced path cannot turn a
+# dispatch tick into an unbounded read.
+DISPATCH_GOVERNOR_MAX_BYTES = 1024 * 1024
+
+
+def _configured_dispatch_governor_state_path() -> Optional[Path]:
+    """Return the opt-in Kanban dispatch-governor state path.
+
+    Generic Hermes installations remain unchanged when
+    ``kanban.disk_governor_state_path`` is absent. Once the operator sets
+    the key, invalid values raise so :func:`_dispatch_governor_level` can fail
+    closed instead of silently disabling an intended safety gate.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly() or {}
+    kanban = config.get("kanban", {})
+    if not isinstance(kanban, Mapping):
+        raise ValueError("kanban config must be an object")
+    raw = kanban.get("disk_governor_state_path")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("disk_governor_state_path must be a non-empty string")
+    return Path(raw).expanduser()
+
+
+def _dispatch_governor_level() -> Optional[str]:
+    """Read the configured canonical disk-governor level.
+
+    Returns ``None`` when the guard is not configured, a known uppercase
+    level for valid state, and ``"UNKNOWN"`` for any configured read/schema
+    failure. This mirrors the portfolio fleet gate: RED and UNKNOWN suppress
+    discretionary launches; GREEN and YELLOW permit normal dispatch.
+    """
+    try:
+        path = _configured_dispatch_governor_state_path()
+    except Exception:
+        return "UNKNOWN"
+    if path is None:
+        return None
+    try:
+        if path.stat().st_size > DISPATCH_GOVERNOR_MAX_BYTES:
+            return "UNKNOWN"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        level = str(payload["inventory"]["pressure"]["level"]).upper()
+    except Exception:
+        return "UNKNOWN"
+    return level if level in {"GREEN", "YELLOW", "RED"} else "UNKNOWN"
 
 
 def _system_memory_sample() -> dict:
@@ -10193,6 +10253,23 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Optional disk/swap-governor admission. This is intentionally inside the
+    # dispatcher's single-writer tick and before both concurrency short-circuits
+    # and ready/review enumeration, so every gateway/CLI tick reports the
+    # canonical pressure state and no task can be claimed between the check and
+    # spawn. Reclaim, crash detection, timeout enforcement, and todo->ready
+    # promotion above still run; existing workers are untouched. Once
+    # configured, unreadable state fails closed.
+    disk_level = _dispatch_governor_level()
+    if disk_level in {"RED", "UNKNOWN"}:
+        result.disk_pressure = disk_level
+        _log.warning(
+            "kanban dispatch: configured disk governor is %s; "
+            "spawning no new workers this tick (deferred, not dropped)",
+            disk_level,
+        )
+        return result
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full

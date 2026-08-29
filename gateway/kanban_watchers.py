@@ -99,6 +99,28 @@ def _kanban_dispatch_allowed() -> bool:
     return not check_paused("kanban", logger)
 
 
+def _dispatch_result_is_expected_idle(result: Any) -> bool:
+    """Return True when a zero-spawn board was intentionally throttled.
+
+    Disk-governor RED/UNKNOWN and a pure per-profile-cap skip are expected
+    idle states. Other skip/reclaim outcomes still count toward the stuck
+    warning because at least one ready task may be unexpectedly unspawnable.
+    """
+    if getattr(result, "disk_pressure", None) in {"RED", "UNKNOWN"}:
+        return True
+    skipped_capped = list(
+        getattr(result, "skipped_per_profile_capped", []) or []
+    )
+    skipped_others = (
+        len(getattr(result, "skipped_unassigned", []) or [])
+        + len(getattr(result, "skipped_nonspawnable", []) or [])
+        + len(getattr(result, "reclaimed", []) or [])
+        + len(getattr(result, "crashed", []) or [])
+        + len(getattr(result, "timed_out", []) or [])
+    )
+    return bool(skipped_capped) and skipped_others == 0
+
+
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
     """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
 
@@ -1857,24 +1879,10 @@ class GatewayKanbanWatchersMixin:
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
                         elif res is not None:
-                            # Did this board skip ALL ready tasks purely due
-                            # to per-profile-cap? If so, that's correct
-                            # throttling (a sibling task is already running),
-                            # not a stuck dispatcher. Don't count toward
-                            # ``bad_ticks``; reset to False so any board
-                            # that actually had a spawnable-and-unskipped
-                            # ready task keeps the warning firing.
-                            skipped_capped = list(
-                                getattr(res, "skipped_per_profile_capped", [])
-                            )
-                            skipped_others = (
-                                len(getattr(res, "skipped_unassigned", []) or [])
-                                + len(getattr(res, "skipped_nonspawnable", []) or [])
-                                + len(getattr(res, "reclaimed", []) or [])
-                                + len(getattr(res, "crashed", []) or [])
-                                + len(getattr(res, "timed_out", []) or [])
-                            )
-                            if not skipped_capped or skipped_others > 0:
+                            # RED/UNKNOWN disk admission and a pure per-profile
+                            # cap are expected idle. Any other zero-spawn result
+                            # keeps the stuck-warning accumulator live.
+                            if not _dispatch_result_is_expected_idle(res):
                                 cap_blocked_all = False
                     # Health telemetry (aggregate across boards).
                     # Treat "ready tasks exist BUT every board skipped purely

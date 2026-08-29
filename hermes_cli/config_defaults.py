@@ -2836,6 +2836,11 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Optional canonical host disk-governor state. Unset preserves the
+        # generic Hermes behavior. Once configured, GREEN/YELLOW permit new
+        # claims while RED, missing, malformed, or unsupported state defers
+        # them; already-running workers and reclaim/promotion still proceed.
+        "disk_governor_state_path": None,
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
