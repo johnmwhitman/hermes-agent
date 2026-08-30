@@ -20,6 +20,59 @@ logger = logging.getLogger(__name__)
 __all__ = ["register"]
 
 
+def _listener_policy(extra: object) -> tuple[bool, str | None]:
+    """Return ``(inbound_enabled, error)`` for one A2A platform config.
+
+    A missing role preserves the historical inbound-listener default.  The
+    explicit ``remote`` role and exact-boolean ``inbound_disabled: true`` are
+    outbound-only.  Unknown or loosely typed values must never fall through to
+    opening the default port.
+    """
+    if not isinstance(extra, dict):
+        return False, "A2A extra config must be a mapping"
+
+    if "inbound_disabled" in extra:
+        inbound_disabled = extra["inbound_disabled"]
+        if type(inbound_disabled) is not bool:
+            return False, "A2A inbound_disabled must be a boolean"
+    else:
+        inbound_disabled = False
+
+    if "role" not in extra:
+        role = "inbound"
+    else:
+        raw_role = extra["role"]
+        if not isinstance(raw_role, str):
+            return False, "A2A role must be one of: inbound, local, remote"
+        role = raw_role.strip().lower()
+        if role not in {"inbound", "local", "remote"}:
+            return False, "A2A role must be one of: inbound, local, remote"
+
+    return not (inbound_disabled or role == "remote"), None
+
+
+def _apply_yaml_config(_yaml_cfg: dict, a2a_cfg: dict) -> dict | None:
+    """Preserve top-level A2A startup keys in ``PlatformConfig.extra``.
+
+    ``PlatformConfig`` intentionally stores plugin-specific settings only in
+    ``extra``.  Operators commonly place ``role`` and ``port`` beside
+    ``enabled``; bridge those values without overriding an explicit nested
+    value.  The generic config loader merges the returned mapping into the
+    existing ``extra`` block.
+    """
+    if not isinstance(a2a_cfg, dict):
+        return None
+    nested = a2a_cfg.get("extra")
+    if not isinstance(nested, dict):
+        nested = {}
+    seeded = {
+        key: a2a_cfg[key]
+        for key in ("role", "port", "inbound_disabled")
+        if key in a2a_cfg and key not in nested
+    }
+    return seeded or None
+
+
 def check_requirements() -> bool:
     """The inbound adapter is always loadable — stdlib only, no external deps.
 
@@ -30,7 +83,12 @@ def check_requirements() -> bool:
 
 
 def validate_config(config) -> bool:
-    """Inbound A2A has no required config — port/host have safe defaults."""
+    """Validate the listener posture before any adapter can bind a port."""
+    extra = getattr(config, "extra", {}) or {}
+    _enabled, error = _listener_policy(extra)
+    if error:
+        logger.error("A2A: invalid listener configuration: %s", error)
+        return False
     return True
 
 
@@ -121,6 +179,7 @@ def register(ctx) -> None:
             allowed_users_env="A2A_ALLOWED_USERS",
             allow_all_env="A2A_ALLOW_ALL_USERS",
             cron_deliver_env_var="A2A_HOME_CHANNEL",
+            apply_yaml_config_fn=_apply_yaml_config,
             allow_update_command=False,
             platform_hint=(
                 "You are reachable over the A2A (Agent-to-Agent) protocol. "

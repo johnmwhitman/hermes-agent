@@ -57,7 +57,7 @@ from gateway.platforms.base import (
 )
 from gateway.config import Platform
 
-from . import posture, protocol, security
+from . import _listener_policy, posture, protocol, security
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +385,7 @@ class A2AAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=platform)
 
         extra = getattr(config, "extra", {}) or {}
+        self._inbound_enabled, self._listener_mode_error = _listener_policy(extra)
         self.port = int(os.getenv("A2A_PORT") or extra.get("port", _DEFAULT_PORT))
         self.host = security.resolve_bind_host()
         self.agent_name = _default_agent_name()
@@ -518,6 +519,25 @@ class A2AAdapter(BasePlatformAdapter):
         # Gateway reconnection plumbing passes adapter-agnostic kwargs such as
         # ``is_reconnect``. A2A does not need them, but accepting them keeps the
         # plugin compatible with the BasePlatformAdapter lifecycle contract.
+        if self._listener_mode_error is not None:
+            logger.error(
+                "A2A: invalid listener configuration: %s",
+                self._listener_mode_error,
+            )
+            self._set_fatal_error(
+                "invalid_listener_mode",
+                self._listener_mode_error,
+                retryable=False,
+            )
+            return False
+
+        if not self._inbound_enabled:
+            self._mark_connected()
+            logger.info(
+                "A2A: outbound client mode enabled; inbound HTTP listener disabled"
+            )
+            return True
+
         # Capture the running gateway loop so the HTTP thread can marshal
         # events onto it via run_coroutine_threadsafe.
         try:
