@@ -398,14 +398,47 @@ class TestDesktopServeCommandParser:
         ) is None
 
     @pytest.mark.parametrize(
+        ("command", "profile", "kind"),
+        [
+            (
+                "python -m hermes_cli.main serve --profile default --port 0 --status",
+                "default",
+                "serve",
+            ),
+            (
+                "python -m hermes_cli.main dashboard --no-open -p work --port 0",
+                "work",
+                "dashboard",
+            ),
+        ],
+    )
+    def test_accepts_one_profile_selector_after_backend_subcommand(
+        self, command, profile, kind
+    ):
+        parsed = ui._parse_desktop_serve_command(command)
+        assert parsed.profile == profile
+        assert parsed.kind == kind
+
+    @pytest.mark.parametrize(
         "command",
         [
             "python -m hermes_cli.main --profile first serve -p second --port 0",
             "python -m hermes_cli.main serve --profile first -p second --port 0",
-            "python -m hermes_cli.main dashboard --no-open --profile=first --port 0",
+            "python -m hermes_cli.main --profile first --profile second serve --port 0",
         ],
     )
-    def test_rejects_profile_selectors_after_backend_subcommand(self, command):
+    def test_rejects_duplicate_profile_selectors_in_any_position(self, command):
+        assert ui._parse_desktop_serve_command(command) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python -m hermes_cli.main serve --profile --port 0",
+            "python -m hermes_cli.main serve -p --port 0",
+            "python -m hermes_cli.main serve --profile= --port 0",
+        ],
+    )
+    def test_rejects_missing_or_invalid_tail_profile_value(self, command):
         assert ui._parse_desktop_serve_command(command) is None
 
     def test_accepts_legacy_dashboard_and_remote_python_script_family(self):
