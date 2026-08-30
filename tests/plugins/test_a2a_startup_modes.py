@@ -157,6 +157,21 @@ def test_top_level_remote_config_is_bridged_into_platform_extra():
     }
 
 
+def test_nested_a2a_shorthand_wins_within_one_source_block():
+    raw = {
+        "role": "remote",
+        "port": 9901,
+        "inbound_disabled": False,
+        "extra": {
+            "role": "inbound",
+            "port": 9902,
+            "inbound_disabled": True,
+        },
+    }
+
+    assert a2a_plugin._apply_yaml_config({}, raw) == raw["extra"]
+
+
 @pytest.mark.parametrize(
     "extra",
     [

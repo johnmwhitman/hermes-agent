@@ -79,8 +79,10 @@ reserved for the default profile and are rejected before startup/config write.
 For compatibility, Hermes accepts four A2A YAML locations. Precedence from
 lowest to highest is `gateway.platforms.a2a`, `gateway.a2a`,
 `platforms.a2a`, then the legacy direct root `a2a` block. Higher sources
-replace ordinary keys, while `extra` is deep-merged. Within the resulting
-block, an explicit nested `extra` value wins over the matching shorthand.
+replace ordinary keys, while `extra` is deep-merged. Within each individual
+source block, an explicit nested `extra` value wins over its shorthand; Hermes
+normalizes that block before merging, so the higher source wins regardless of
+which shape either source uses.
 
 ## Outbound: calling other agents
 

@@ -3375,9 +3375,9 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
 
     Reads the platforms the running gateway reported in its
     ``gateway_state.json`` and resolves each port-binding platform's port from
-    the profile's ``config.yaml`` (top-level ``platforms:`` wins over
-    ``gateway.platforms:``, matching ``load_gateway_config`` precedence),
-    falling back to the adapter default.  Display-only: env-var port overrides
+    the profile's ``config.yaml`` using ``load_gateway_config``'s canonical
+    four-source precedence, falling back to the adapter default.  Display-only:
+    env-var port overrides
     (e.g. ``WEBHOOK_PORT`` in that profile's .env) are not resolved here.
     """
     platforms = (runtime or {}).get("platforms") or {}
@@ -3411,12 +3411,12 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
         block = blocks.get(name) or {}
         extra = block.get("extra") if isinstance(block.get("extra"), dict) else {}
         effective_extra = dict(extra or {})
-        for mode_key in ("role", "inbound_disabled"):
-            if mode_key in block and mode_key not in effective_extra:
-                effective_extra[mode_key] = block[mode_key]
         if not platform_binds_port(name, effective_extra):
             continue
-        raw = block.get(port_key, (extra or {}).get(port_key, default_port))
+        if name == "a2a":
+            raw = (extra or {}).get(port_key, default_port)
+        else:
+            raw = block.get(port_key, (extra or {}).get(port_key, default_port))
         try:
             ports[name] = int(raw)
         except (TypeError, ValueError):

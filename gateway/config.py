@@ -306,6 +306,36 @@ def _merge_platform_config_blocks(*blocks: object) -> dict:
     return merged
 
 
+_PLATFORM_EXTRA_SHORTHAND_KEYS: dict[str, tuple[str, ...]] = {
+    "a2a": ("role", "port", "inbound_disabled"),
+}
+
+
+def _normalize_platform_config_block(name: str, block: object) -> dict:
+    """Normalize one source block before cross-source precedence is applied.
+
+    A2A accepts listener keys both as shorthands and under ``extra``. Within a
+    single source, explicit ``extra`` wins. Moving the semantic value into
+    ``extra`` before merging ensures a higher source wins even when the two
+    sources use different shapes.
+    """
+    if not isinstance(block, dict):
+        return {}
+    normalized = dict(block)
+    shorthand_keys = _PLATFORM_EXTRA_SHORTHAND_KEYS.get(name, ())
+    if not shorthand_keys:
+        return normalized
+    raw_extra = block.get("extra")
+    extra = dict(raw_extra) if isinstance(raw_extra, dict) else {}
+    for key in shorthand_keys:
+        if key in block and key not in extra:
+            extra[key] = block[key]
+        normalized.pop(key, None)
+    if extra or "extra" in block:
+        normalized["extra"] = extra
+    return normalized
+
+
 def _effective_yaml_platform_config(yaml_cfg: object, name: str) -> dict:
     """Return one platform's canonical config.yaml block.
 
@@ -331,10 +361,10 @@ def _effective_yaml_platform_config(yaml_cfg: object, name: str) -> dict:
     if not isinstance(top_platforms, dict):
         top_platforms = {}
     return _merge_platform_config_blocks(
-        gateway_platforms.get(name),
-        gateway_cfg.get(name),
-        top_platforms.get(name),
-        yaml_cfg.get(name),
+        _normalize_platform_config_block(name, gateway_platforms.get(name)),
+        _normalize_platform_config_block(name, gateway_cfg.get(name)),
+        _normalize_platform_config_block(name, top_platforms.get(name)),
+        _normalize_platform_config_block(name, yaml_cfg.get(name)),
     )
 
 
@@ -1676,6 +1706,10 @@ def load_gateway_config() -> GatewayConfig:
                     existing = platforms_data.get(plat_name, {})
                     if not isinstance(existing, dict):
                         existing = {}
+                    existing = _normalize_platform_config_block(plat_name, existing)
+                    plat_block = _normalize_platform_config_block(
+                        plat_name, plat_block
+                    )
                     # Deep-merge extra dicts so gateway.json defaults survive.
                     merged = _merge_platform_config_blocks(existing, plat_block)
                     if "enabled" in plat_block:

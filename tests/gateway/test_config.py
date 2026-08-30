@@ -28,6 +28,26 @@ from gateway.config import (
 )
 
 
+_A2A_ADJACENT_SOURCE_PAIRS = (
+    ("gateway.platforms", "gateway.direct"),
+    ("gateway.direct", "platforms"),
+    ("platforms", "direct"),
+)
+
+
+def _set_a2a_source(document, location, block):
+    if location == "gateway.platforms":
+        document.setdefault("gateway", {}).setdefault("platforms", {})["a2a"] = block
+    elif location == "gateway.direct":
+        document.setdefault("gateway", {})["a2a"] = block
+    elif location == "platforms":
+        document.setdefault("platforms", {})["a2a"] = block
+    elif location == "direct":
+        document["a2a"] = block
+    else:  # pragma: no cover - test table is closed
+        raise AssertionError(location)
+
+
 class TestHomeChannelRoundtrip:
     def test_to_dict_from_dict(self):
         hc = HomeChannel(
@@ -279,6 +299,67 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    @pytest.mark.parametrize(
+        ("lower_location", "higher_location"),
+        _A2A_ADJACENT_SOURCE_PAIRS,
+    )
+    @pytest.mark.parametrize("lower_shape", ["extra", "direct"])
+    @pytest.mark.parametrize(
+        ("key", "lower_value", "higher_value", "expected_binds"),
+        [
+            pytest.param("role", "inbound", "remote", False, id="role"),
+            pytest.param(
+                "inbound_disabled", False, True, False, id="inbound-disabled"
+            ),
+            pytest.param("port", 9901, 9902, True, id="port"),
+        ],
+    )
+    def test_a2a_higher_source_wins_across_shorthand_shapes(
+        self,
+        tmp_path,
+        monkeypatch,
+        lower_location,
+        higher_location,
+        lower_shape,
+        key,
+        lower_value,
+        higher_value,
+        expected_binds,
+    ):
+        import yaml
+
+        lower = (
+            {"enabled": True, "extra": {key: lower_value}}
+            if lower_shape == "extra"
+            else {"enabled": True, key: lower_value}
+        )
+        higher = (
+            {key: higher_value}
+            if lower_shape == "extra"
+            else {"extra": {key: higher_value}}
+        )
+        document = {}
+        _set_a2a_source(document, lower_location, lower)
+        _set_a2a_source(document, higher_location, higher)
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump(document), encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("A2A_PORT", raising=False)
+
+        config = load_gateway_config()
+        a2a = next(
+            platform_config
+            for platform, platform_config in config.platforms.items()
+            if platform.value == "a2a"
+        )
+
+        assert a2a.extra[key] == higher_value
+        assert platform_binds_port("a2a", a2a.extra) is expected_binds
+
     @pytest.mark.parametrize(
         ("direct_extra", "expected_binds", "expected_valid"),
         [

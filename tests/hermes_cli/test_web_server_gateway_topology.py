@@ -14,11 +14,79 @@ from hermes_cli.web_server import (
 )
 
 
+_A2A_ADJACENT_SOURCE_PAIRS = (
+    ("gateway.platforms", "gateway.direct"),
+    ("gateway.direct", "platforms"),
+    ("platforms", "direct"),
+)
+
+
+def _set_a2a_source(document, location, block):
+    if location == "gateway.platforms":
+        document.setdefault("gateway", {}).setdefault("platforms", {})["a2a"] = block
+    elif location == "gateway.direct":
+        document.setdefault("gateway", {})["a2a"] = block
+    elif location == "platforms":
+        document.setdefault("platforms", {})["a2a"] = block
+    elif location == "direct":
+        document["a2a"] = block
+    else:  # pragma: no cover - test table is closed
+        raise AssertionError(location)
+
+
 # ---------------------------------------------------------------------------
 # _profile_platform_ports
 # ---------------------------------------------------------------------------
 
 class TestProfilePlatformPorts:
+    @pytest.mark.parametrize(
+        ("lower_location", "higher_location"),
+        _A2A_ADJACENT_SOURCE_PAIRS,
+    )
+    @pytest.mark.parametrize("lower_shape", ["extra", "direct"])
+    @pytest.mark.parametrize(
+        ("key", "lower_value", "higher_value", "expected"),
+        [
+            pytest.param("role", "inbound", "remote", {}, id="role"),
+            pytest.param(
+                "inbound_disabled", False, True, {}, id="inbound-disabled"
+            ),
+            pytest.param("port", 9901, 9902, {"a2a": 9902}, id="port"),
+        ],
+    )
+    def test_a2a_topology_matches_cross_shape_source_precedence(
+        self,
+        tmp_path,
+        lower_location,
+        higher_location,
+        lower_shape,
+        key,
+        lower_value,
+        higher_value,
+        expected,
+    ):
+        import yaml
+
+        lower = (
+            {"extra": {key: lower_value}}
+            if lower_shape == "extra"
+            else {key: lower_value}
+        )
+        higher = (
+            {key: higher_value}
+            if lower_shape == "extra"
+            else {"extra": {key: higher_value}}
+        )
+        document = {}
+        _set_a2a_source(document, lower_location, lower)
+        _set_a2a_source(document, higher_location, higher)
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(document), encoding="utf-8"
+        )
+        runtime = {"platforms": {"a2a": {"state": "connected"}}}
+
+        assert _profile_platform_ports(tmp_path, runtime) == expected
+
     def test_no_runtime_platforms_returns_empty(self, tmp_path):
         assert _profile_platform_ports(tmp_path, None) == {}
         assert _profile_platform_ports(tmp_path, {"platforms": {}}) == {}
