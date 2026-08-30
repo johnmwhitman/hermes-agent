@@ -6,6 +6,8 @@ context_length, causing the CLI status bar to show 'ctx --'.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.context_engine import ContextEngine
 
 
@@ -105,6 +107,51 @@ def test_active_context_engine_tools_survive_explicit_platform_toolsets():
         tool.get("function", {}).get("name")
         for tool in getattr(agent, "tools", [])
     }
+
+
+def test_forwarded_a2a_policy_rejects_late_context_engine_tool_drift(
+    monkeypatch, tmp_path,
+):
+    """The child fingerprint must cover schemas appended after base tools."""
+    from plugins.platforms.a2a import posture
+
+    engine = _ToolEngine()
+    cfg = {"context": {"engine": "stub"}, "agent": {}}
+    secret = b"c" * 32
+    key_path = tmp_path / "a2a_child_issuer.key"
+    key_path.write_bytes(secret)
+    key_path.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    binding = posture.make_binding("alice", "research", "ctx-1", [])
+    policy = posture.sign_child_policy({
+        "authenticated": True,
+        "served_agent_slug": "research",
+        "context_id": "ctx-1",
+        "mutation_enabled": False,
+        "allowed_tool_names": [],
+        "binding": binding,
+    }, secret=secret)
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.context_engine.load_context_engine", return_value=engine),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        pytest.raises(ValueError, match="post-assembly toolset fingerprint mismatch"),
+    ):
+        from run_agent import AIAgent
+
+        AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            a2a_policy=policy,
+        )
 
 
 def test_plugin_engine_update_model_args():
@@ -208,5 +255,4 @@ def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
     assert agent.context_compressor.threshold_percent == 0.85
     # Gateway parity: the notice is stashed for replay on turn 1.
     assert agent._compression_warning and "85%" in agent._compression_warning
-
 

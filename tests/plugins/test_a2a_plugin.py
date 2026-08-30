@@ -443,6 +443,39 @@ class TestPersistence:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         assert protocol.load_conversation("nope") == []
 
+    def test_context_filename_mapping_is_collision_resistant(self, monkeypatch, tmp_path):
+        """Distinct wire context IDs must never share one conversation file."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        protocol.persist_message("foo/bar", "user", "slash", "task-a")
+        protocol.persist_message("foobar", "user", "plain", "task-b")
+
+        assert [row["text"] for row in protocol.load_conversation("foo/bar")] == ["slash"]
+        assert [row["text"] for row in protocol.load_conversation("foobar")] == ["plain"]
+        assert len(list((tmp_path / "a2a_conversations").glob("*.jsonl"))) == 2
+
+    def test_long_context_ids_with_the_same_prefix_remain_independent(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        prefix = "x" * 160
+        protocol.persist_message(prefix + "-a", "user", "A", "task-a")
+        protocol.persist_message(prefix + "-b", "user", "B", "task-b")
+
+        assert [row["text"] for row in protocol.load_conversation(prefix + "-a")] == ["A"]
+        assert [row["text"] for row in protocol.load_conversation(prefix + "-b")] == ["B"]
+
+    def test_safe_legacy_context_remains_locally_readable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        legacy_dir = tmp_path / "a2a_conversations"
+        legacy_dir.mkdir()
+        (legacy_dir / "ctx-legacy.jsonl").write_text(
+            json.dumps({"role": "user", "text": "legacy", "task_id": "old"}) + "\n",
+            encoding="utf-8",
+        )
+
+        assert protocol.load_conversation("ctx-legacy")[0]["text"] == "legacy"
+        assert protocol.load_conversation(
+            "ctx-legacy", peer="alice", agent_slug="research",
+        ) == []
+
     def test_a2a_history_tool_recalls_conversation(self, monkeypatch, tmp_path):
         """load_conversation is wired to production via the a2a_history tool."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -476,6 +509,90 @@ class TestClientTools:
         monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {}})
         out = tools.a2a_call({"agent": "ghost", "message": "hi"})
         assert "unknown agent" in out
+
+    def test_peer_token_auth_selects_the_named_peer_credential(self, monkeypatch):
+        monkeypatch.setenv(
+            "A2A_PEER_TOKENS",
+            "arkfunk:ark-secret,hool:hool-secret,yourbrief:brief-secret",
+        )
+        monkeypatch.setattr(
+            tools,
+            "_load_config",
+            lambda: {"a2a_agents": {"hool": {
+                "url": "http://localhost:9900/hool",
+                "auth": {"type": "peer-token"},
+            }}},
+        )
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured["authorization"] = headers.get("Authorization")
+            context_id = body["params"]["message"]["contextId"]
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task("t", context_id, protocol.STATE_COMPLETED, "PONG"),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        out = tools.a2a_call({"agent": "hool", "message": "ping"})
+        assert "PONG" in out
+        assert captured["authorization"] == "Bearer hool-secret"
+
+    def test_peer_token_auth_fails_closed_without_one_exact_match(self, monkeypatch):
+        monkeypatch.setattr(
+            tools,
+            "_load_config",
+            lambda: {"a2a_agents": {"hool": {
+                "url": "http://localhost:9900/hool",
+                "auth": {"type": "peer-token"},
+            }}},
+        )
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+
+        def must_not_post(*args, **kwargs):
+            raise AssertionError("peer-token resolution must fail before POST")
+
+        monkeypatch.setattr(tools, "_http_post_json", must_not_post)
+        for raw in ("arkfunk:ark-secret", "hool:first-secret,hool:second-secret"):
+            monkeypatch.setenv("A2A_PEER_TOKENS", raw)
+            out = tools.a2a_call({"agent": "hool", "message": "ping"})
+            assert "peer-token auth unavailable" in out
+            assert "secret" not in out
+
+    def test_peer_token_auth_is_not_forwarded_cross_origin(self, monkeypatch):
+        monkeypatch.setenv("A2A_PEER_TOKENS", "hool:hool-secret")
+        monkeypatch.setattr(
+            tools,
+            "_load_config",
+            lambda: {"a2a_agents": {"hool": {
+                "url": "http://localhost:9900/hool",
+                "auth": {"type": "peer-token"},
+            }}},
+        )
+        monkeypatch.setattr(
+            tools,
+            "_http_get_json",
+            lambda url, headers, timeout: {"supportedInterfaces": [{
+                "protocolBinding": "JSONRPC",
+                "url": "https://collector.example/rpc",
+            }]},
+        )
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured.update(url=url, headers=headers)
+            context_id = body["params"]["message"]["contextId"]
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task("t", context_id, protocol.STATE_COMPLETED, "PONG"),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        out = tools.a2a_call({"agent": "hool", "message": "ping"})
+        assert "PONG" in out
+        assert captured["url"] == "https://collector.example/rpc"
+        assert "Authorization" not in captured["headers"]
 
     def test_discover_summarizes_v1_card(self, monkeypatch):
         card = protocol.build_agent_card(
@@ -520,19 +637,52 @@ class TestClientTools:
         # Outbound redaction applied before sending.
         assert "sk-abcdefghij" not in part["text"]
 
+    def test_peer_cannot_redirect_persistence_to_another_context(self, monkeypatch):
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        persisted = []
+        monkeypatch.setattr(
+            protocol,
+            "persist_message",
+            lambda *args, **kwargs: persisted.append((args, kwargs)),
+        )
+
+        for returned_context in ("ctx-other", 7, None):
+            monkeypatch.setattr(
+                tools,
+                "_http_post_json",
+                lambda url, body, headers, timeout, value=returned_context: protocol.jsonrpc_result(
+                    body["id"],
+                    protocol.build_task(
+                        "task-1", value, protocol.STATE_COMPLETED, "poison",
+                    ),
+                ),
+            )
+            with pytest.raises(ValueError, match="contextId"):
+                tools._send_task(
+                    "peer",
+                    {"url": "http://peer.example", "auth": {}, "timeout": 5},
+                    "hello",
+                    "ctx-requested",
+                )
+
+        assert persisted == []
+
     def test_call_reports_input_required(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
         monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
 
         def fake_post(url, body, headers, timeout):
+            context_id = body["params"]["message"]["contextId"]
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t", "ctx-q", protocol.STATE_INPUT_REQUIRED, "Which repo?"),
+                protocol.build_task("t", context_id, protocol.STATE_INPUT_REQUIRED, "Which repo?"),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
-        out = tools.a2a_call({"agent": "r", "message": "review the code"})
+        out = tools.a2a_call({
+            "agent": "r", "message": "review the code", "context_id": "ctx-q",
+        })
         assert "Which repo?" in out
         assert "input-required" in out
         assert "ctx-q" in out
@@ -593,9 +743,10 @@ class TestRegistryDispatchConvention:
 
         def fake_post(url, body, headers, timeout):
             captured["sent"] = True
+            context_id = body["params"]["message"]["contextId"]
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "PONG"))
+                protocol.build_task("t", context_id, protocol.STATE_COMPLETED, "PONG"))
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
         out = tools.a2a_call({"agent_name": "peer", "message": "ping"})
@@ -611,6 +762,15 @@ def _bare_adapter():
     from plugins.platforms.a2a.adapter import A2AAdapter
     from gateway.config import PlatformConfig
     return A2AAdapter(PlatformConfig(enabled=True))
+
+
+def _a2a_reply_meta(context_id: str, peer: str = "", agent_slug: str = "") -> dict:
+    return {
+        "notify": True,
+        "a2a_peer": peer,
+        "a2a_agent_slug": agent_slug,
+        "a2a_context_id": context_id,
+    }
 
 
 class TestReplyCapture:
@@ -631,7 +791,7 @@ class TestReplyCapture:
             final = await adapter.send(
                 "ctx-final",
                 "FINAL_PROOF_PAYLOAD",
-                metadata={"notify": True},
+                metadata=_a2a_reply_meta("ctx-final"),
             )
             assert final.success is True
             assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "FINAL_PROOF_PAYLOAD")
@@ -649,10 +809,14 @@ class TestReplyCapture:
         fut2 = adapter._add_pending("task-2", "ctx-shared")
 
         async def run():
-            await adapter.send("ctx-shared", "reply one", metadata={"notify": True})
+            await adapter.send(
+                "ctx-shared", "reply one", metadata=_a2a_reply_meta("ctx-shared"),
+            )
             assert fut1.done() and not fut2.done()
             assert fut1.result(timeout=0)[1] == "reply one"
-            await adapter.send("ctx-shared", "reply two", metadata={"notify": True})
+            await adapter.send(
+                "ctx-shared", "reply two", metadata=_a2a_reply_meta("ctx-shared"),
+            )
             assert fut2.result(timeout=0)[1] == "reply two"
 
         try:
@@ -660,6 +824,38 @@ class TestReplyCapture:
         finally:
             adapter._pop_pending("task-1")
             adapter._pop_pending("task-2")
+
+    def test_same_context_on_different_routes_resolves_exact_scope(self):
+        adapter = _bare_adapter()
+        research = adapter._add_pending(
+            "task-research", "ctx-shared", peer="alice", agent_slug="research",
+        )
+        dev = adapter._add_pending(
+            "task-dev", "ctx-shared", peer="bob", agent_slug="dev",
+        )
+
+        async def run():
+            await adapter.send("ctx-shared", "dev reply", metadata={
+                "notify": True,
+                "a2a_peer": "bob",
+                "a2a_agent_slug": "dev",
+                "a2a_context_id": "ctx-shared",
+            })
+            assert dev.result(timeout=0)[1] == "dev reply"
+            assert research.done() is False
+            await adapter.send("ctx-shared", "research reply", metadata={
+                "notify": True,
+                "a2a_peer": "alice",
+                "a2a_agent_slug": "research",
+                "a2a_context_id": "ctx-shared",
+            })
+            assert research.result(timeout=0)[1] == "research reply"
+
+        try:
+            asyncio.run(run())
+        finally:
+            adapter._pop_pending("task-research")
+            adapter._pop_pending("task-dev")
 
     def test_on_processing_complete_resolves_failure(self):
         """A failed run must resolve the future promptly (no reply timeout wait)."""
@@ -687,7 +883,9 @@ class TestReplyCapture:
         event = SimpleNamespace(message_id="task-ok")
 
         async def run():
-            await adapter.send("ctx-ok", "real reply", metadata={"notify": True})
+            await adapter.send(
+                "ctx-ok", "real reply", metadata=_a2a_reply_meta("ctx-ok"),
+            )
             await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
         try:
@@ -926,7 +1124,15 @@ def _make_live_adapter(monkeypatch, reply_fn=None):
         else:
             reply = reply_fn(event)
         if reply is not None:
-            await adapter.send(event.source.chat_id, reply, metadata={"notify": True})
+            await adapter.send(
+                event.source.chat_id,
+                reply,
+                metadata=_a2a_reply_meta(
+                    event.source.a2a_context_id,
+                    peer=event.source.a2a_peer,
+                    agent_slug=event.source.a2a_agent_slug,
+                ),
+            )
 
     adapter.handle_message = fake_handle_message  # type: ignore
     adapter._message_handler = object()  # non-None so dispatch proceeds
@@ -1414,10 +1620,15 @@ class TestMultiAgentRouting:
         }))
         agent = adapter._agents["dev"]
 
-        def fake_forward(agent_arg, peer, context_id, framed_text, task_id=""):
+        def fake_forward(
+            agent_arg, peer, context_id, framed_text, task_id="", posture_policy=None,
+        ):
             assert agent_arg["slug"] == "dev"
             assert peer == "peer-x"
             assert "hello" in framed_text
+            assert posture_policy is not None
+            assert posture_policy["mutation_enabled"] is False
+            assert posture_policy["binding"]["peer"] == "peer-x"
             return "dev reply", protocol.STATE_COMPLETED
 
         adapter._forward_to_profile = fake_forward  # type: ignore
@@ -1604,6 +1815,115 @@ class TestV1SpecRegressionFixes:
 
         asyncio.run(run())
 
+    def test_served_route_rejects_a_different_globally_trusted_peer(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        port = _free_port()
+        monkeypatch.setenv("A2A_PORT", str(port))
+        monkeypatch.setenv("A2A_PEER_TOKENS", "alice:alice-token,bob:bob-token")
+        monkeypatch.setenv("A2A_TRUSTED_PEERS", "alice,bob")
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "dev": {
+                    "profile": "dev",
+                    "tenant": "dev",
+                    "allowed_peers": ["bob"],
+                },
+            },
+        }))
+        adapter._message_handler = object()
+        base = f"http://127.0.0.1:{port}"
+
+        async def run():
+            assert await adapter.connect() is True
+            try:
+                card = await asyncio.to_thread(
+                    _get_json, base + "/dev/.well-known/agent-card.json",
+                )
+                assert card["name"]
+                with pytest.raises(urllib.error.HTTPError) as exc_info:
+                    await asyncio.to_thread(
+                        _post_json,
+                        base + "/dev/",
+                        _send_body("cross-route", "ctx-cross-route"),
+                        {"Authorization": "Bearer alice-token"},
+                    )
+                assert exc_info.value.code == 403
+            finally:
+                await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_prepare_task_rejects_disallowed_route_peer_before_bookkeeping(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "dev": {
+                    "profile": "dev",
+                    "tenant": "dev",
+                    "allowed_peers": ["bob"],
+                },
+            },
+        }))
+        monkeypatch.setattr(
+            adapter.tasks,
+            "create",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("unauthorized route must not create a task")
+            ),
+        )
+        monkeypatch.setattr(
+            protocol,
+            "persist_message",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("unauthorized route must not persist")
+            ),
+        )
+
+        terminal, pending = adapter._prepare_task(
+            _send_body("cross-route", "ctx-cross-route")["params"],
+            "alice",
+            agent=adapter._agents["dev"],
+            credential_authenticated=True,
+        )
+
+        assert pending is None
+        assert terminal["status"]["state"] == protocol.STATE_REJECTED
+
+    def test_prepare_task_rejects_globally_untrusted_peer_before_bookkeeping(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a import adapter as adapter_module
+
+        adapter = adapter_module.A2AAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter_module.security, "is_trusted_peer", lambda peer: False)
+        monkeypatch.setattr(
+            adapter.tasks,
+            "create",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("untrusted peer must not create a task")
+            ),
+        )
+        monkeypatch.setattr(
+            protocol,
+            "persist_message",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("untrusted peer must not persist")
+            ),
+        )
+
+        terminal, pending = adapter._prepare_task(
+            _send_body("untrusted", "ctx-untrusted")["params"],
+            "mallory",
+            agent=adapter._agents[""],
+            credential_authenticated=True,
+        )
+
+        assert pending is None
+        assert terminal["status"]["state"] == protocol.STATE_REJECTED
+
     def test_reserved_paths_and_duplicate_tenants_are_ignored(self):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
@@ -1618,6 +1938,32 @@ class TestV1SpecRegressionFixes:
         assert "bad" not in adapter._agents
         assert "one" in adapter._agents
         assert "two" not in adapter._agents
+
+    def test_registry_failure_does_not_advertise_mutable_fallback(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from tools.registry import registry
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "dev": {
+                    "profile": "dev",
+                    "tenant": "dev",
+                    "advertised_toolsets": ["terminal", "read_file"],
+                },
+            },
+        }))
+        monkeypatch.setattr(
+            registry,
+            "get_registered_toolset_names",
+            lambda: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+        )
+
+        skills = adapter._advertised_skills(adapter._agents["dev"])
+        names = {skill["name"] for skill in skills}
+
+        assert "terminal" not in names
+        assert "read_file" in names
 
     def test_served_agent_model_pin_warns_and_keeps_tool_capable(self, caplog):
         import logging
@@ -1745,7 +2091,9 @@ print('fake reply')
         con = sqlite3.connect(db)
         title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
         con.close()
-        assert title == "a2a-dev-ctx-unsafe-value"
+        from plugins.platforms.a2a.adapter import _safe_context_slug
+        assert title == f"a2a-dev-{_safe_context_slug('ctx/unsafe value')}"
+        assert _safe_context_slug("ctx/a") != _safe_context_slug("ctx-a")
 
     def test_forward_to_profile_applies_route_model_and_provider(
         self, monkeypatch, tmp_path
@@ -2360,30 +2708,25 @@ print('fake reply')
         profile_home = tmp_path / "profile"
         profile_home.mkdir()
         state_path = profile_home / "state.db"
-        SessionDB(state_path).close()
+        store = SessionDB(state_path)
+        store.create_session("sess-timeout", "a2a", model="test-model")
+        store.close()
         child_pid_path = tmp_path / "child.pid"
         fakebin = tmp_path / "bin"
         fakebin.mkdir()
         hermes = fakebin / "hermes"
-        hermes.write_text("""#!/usr/bin/env python3
-import os, sqlite3, subprocess, sys, time
-home = os.environ['HERMES_HOME']
-con = sqlite3.connect(os.path.join(home, 'state.db'))
-con.execute(
-    'INSERT INTO sessions (id, source, started_at, model) VALUES (?, ?, ?, ?)',
-    ('sess-timeout', 'a2a', time.time(), 'test-model'),
-)
-con.commit()
-con.close()
-child = subprocess.Popen(
-    [sys.executable, '-c', 'import time; time.sleep(60)'],
-    stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
-with open(os.environ['FAKE_CHILD_PID'], 'w') as f:
-    f.write(str(child.pid))
-time.sleep(60)
+        # Keep process startup much shorter than the route timeout. A Python +
+        # sqlite bootstrap made this containment test race its own watchdog;
+        # five seconds also leaves enough scheduling margin under the
+        # repository's highly parallel canonical runner for the shell to write
+        # child.pid before containment begins.
+        # Session discovery is independently stubbed below; this fixture only
+        # needs to prove that a real descendant is terminated and reaped.
+        hermes.write_text("""#!/bin/sh
+sleep 60 &
+child_pid=$!
+printf '%s' "$child_pid" > "$FAKE_CHILD_PID"
+sleep 60
 """, encoding="utf-8")
         hermes.chmod(0o755)
         monkeypatch.setenv("PATH", str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
@@ -2393,8 +2736,9 @@ time.sleep(60)
             lambda profile: str(profile_home),
         )
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
-            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 1}}
+            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
         }))
+        monkeypatch.setattr(adapter, "_latest_a2a_session", lambda *_args: "sess-timeout")
 
         reply, state = adapter._forward_to_profile(
             adapter._agents["dev"], "peer", "ctx-timeout", "hello"

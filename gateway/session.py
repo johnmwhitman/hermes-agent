@@ -28,6 +28,11 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _platform_value(platform: Any) -> str:
+    """Normalize enum and raw-string platform identities for persistence."""
+    return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
 # Default auto-continue freshness window in seconds (1 hour).  A session
 # interrupted by a restart is only auto-resumed — and only returned by
 # ``get_or_create_session`` — while it stays within this window of when
@@ -182,6 +187,25 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+    # A2A posture binding.  These fields are persisted with the session origin
+    # so a resumed A2A context cannot silently regain a wider tool surface.
+    # They are transport-local metadata and are omitted for ordinary sources.
+    a2a_mutation_requested: bool = False
+    a2a_mutation_enabled: bool = False
+    a2a_credential_authenticated: bool = False
+    a2a_peer_trusted: bool = False
+    a2a_peer: Optional[str] = None
+    a2a_agent_slug: Optional[str] = None
+    a2a_context_id: Optional[str] = None
+    a2a_mutable_toolsets: tuple[str, ...] = ()
+    a2a_allowed_tool_names: tuple[str, ...] = ()
+    a2a_toolset_fingerprint: Optional[str] = None
+    a2a_binding: Optional[Dict[str, Any]] = None
+    # Live in-process A2A transport provenance. These capabilities are never
+    # serialized or restored; every inbound turn must come from a currently
+    # registered adapter and be stamped anew.
+    _transport_adapter_ref: Any = field(default=None, repr=False, compare=False)
+    _a2a_ingress_capability: Any = field(default=None, repr=False, compare=False)
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
@@ -251,8 +275,9 @@ class SessionSource:
         return ", ".join(parts)
     
     def to_dict(self) -> Dict[str, Any]:
+        platform_value = _platform_value(self.platform)
         d = {
-            "platform": self.platform.value,
+            "platform": platform_value,
             "chat_id": self.chat_id,
             "chat_name": self.chat_name,
             "chat_type": self.chat_type,
@@ -285,6 +310,25 @@ class SessionSource:
             d["auto_thread_initial_name"] = self.auto_thread_initial_name
         if self.prospective_thread_id:
             d["prospective_thread_id"] = self.prospective_thread_id
+        if platform_value == "a2a":
+            d["a2a_mutation_requested"] = bool(self.a2a_mutation_requested)
+            d["a2a_mutation_enabled"] = bool(self.a2a_mutation_enabled)
+            d["a2a_credential_authenticated"] = bool(self.a2a_credential_authenticated)
+            d["a2a_peer_trusted"] = bool(self.a2a_peer_trusted)
+            if self.a2a_peer:
+                d["a2a_peer"] = self.a2a_peer
+            if self.a2a_agent_slug:
+                d["a2a_agent_slug"] = self.a2a_agent_slug
+            if self.a2a_context_id:
+                d["a2a_context_id"] = self.a2a_context_id
+            if self.a2a_mutable_toolsets:
+                d["a2a_mutable_toolsets"] = list(self.a2a_mutable_toolsets)
+            if self.a2a_allowed_tool_names:
+                d["a2a_allowed_tool_names"] = list(self.a2a_allowed_tool_names)
+            if self.a2a_toolset_fingerprint:
+                d["a2a_toolset_fingerprint"] = self.a2a_toolset_fingerprint
+            if self.a2a_binding:
+                d["a2a_binding"] = dict(self.a2a_binding)
         return d
 
     @classmethod
@@ -309,6 +353,17 @@ class SessionSource:
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
+            a2a_mutation_requested=(data.get("a2a_mutation_requested") if type(data.get("a2a_mutation_requested")) is bool else False),
+            a2a_mutation_enabled=(data.get("a2a_mutation_enabled") if type(data.get("a2a_mutation_enabled")) is bool else False),
+            a2a_credential_authenticated=(data.get("a2a_credential_authenticated") if type(data.get("a2a_credential_authenticated")) is bool else False),
+            a2a_peer_trusted=(data.get("a2a_peer_trusted") if type(data.get("a2a_peer_trusted")) is bool else False),
+            a2a_peer=data.get("a2a_peer"),
+            a2a_agent_slug=data.get("a2a_agent_slug"),
+            a2a_context_id=data.get("a2a_context_id"),
+            a2a_mutable_toolsets=tuple(str(v) for v in (data.get("a2a_mutable_toolsets") or ()) if str(v).strip()),
+            a2a_allowed_tool_names=tuple(str(v) for v in (data.get("a2a_allowed_tool_names") or ()) if str(v).strip()),
+            a2a_toolset_fingerprint=data.get("a2a_toolset_fingerprint"),
+            a2a_binding=dict(data["a2a_binding"]) if isinstance(data.get("a2a_binding"), dict) else None,
         )
     
 

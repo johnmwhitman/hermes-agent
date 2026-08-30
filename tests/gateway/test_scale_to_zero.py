@@ -109,6 +109,7 @@ def test_idle_exactly_at_threshold():
 
 import os
 import socket as _socket
+import tempfile
 import threading
 
 
@@ -124,26 +125,36 @@ _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891
 
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
+    # Darwin limits AF_UNIX paths to roughly 104 bytes; pytest's nested
+    # tmp_path can exceed that before the filename is appended.
+    socket_dir = tempfile.mkdtemp(prefix="hermes-flaps-")
+    sock_path = os.path.join(socket_dir, "api.sock")
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)
 
     def serve():
-        conn, _ = server.accept()
-        with conn:
-            conn.settimeout(5)
-            data = b""
-            while b"\r\n\r\n" not in data:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-            capture.append(data)
-            conn.sendall(
-                f"HTTP/1.1 {status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}".encode()
-            )
-        server.close()
+        try:
+            conn, _ = server.accept()
+            with conn:
+                conn.settimeout(5)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                capture.append(data)
+                conn.sendall(
+                    f"HTTP/1.1 {status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}".encode()
+                )
+        finally:
+            server.close()
+            try:
+                os.unlink(sock_path)
+            except FileNotFoundError:
+                pass
+            os.rmdir(socket_dir)
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()

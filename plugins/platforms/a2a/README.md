@@ -69,6 +69,49 @@ via `tasks/get`.
 - Conversations persist to `~/.hermes/a2a_conversations/` — they survive context
   compaction and restarts (`a2a_history` recalls them).
 
+### Inbound tool posture
+
+Inbound A2A turns are read-only by default. The closed default surface is
+`read_file`, `search_files`, `skills_list`, `skill_view`, `web_search`,
+`web_extract`, `kanban_show`, `kanban_list`, `a2a_history`, and `a2a_list`.
+A missing mutation marker means read-only; malformed or conflicting markers
+are rejected.
+
+Mutable access requires every gate below:
+
+1. The request metadata contains the JSON boolean
+   `"hermes.ai/mutationAllowed": true`.
+2. The caller used an authenticated peer credential and is globally trusted.
+3. The served route lists that identity in `mutation_allowed_peers`.
+4. The route declares non-empty `mutable_toolsets`.
+
+`execute_code` and `delegate_task` are not admitted by A2A, even when a route
+names their toolsets. They create nested execution authorities; enabling them
+requires a future design that propagates and revalidates the signed posture at
+every sandbox RPC and delegated-child boundary.
+
+```yaml
+gateway:
+  platforms:
+    a2a:
+      enabled: true
+      extra:
+        agents:
+          builder:
+            profile: builder
+            allowed_peers: [conductor]
+            mutation_allowed_peers: [conductor]
+            mutable_toolsets: [terminal]
+            advertised_toolsets: [web]
+            # Publicly advertise mutable capability only when intentional.
+            advertise_mutable_capability: false
+```
+
+`allowed_peers` narrows all access to a named route. An omitted list retains
+the global trusted-peer policy. Mutation posture is bound to the authenticated
+peer, served route, context, and final tool-schema fingerprint; a mismatch or
+missing/corrupt resume binding fails closed or is quarantined read-only.
+
 ## Env vars
 
 | Var | Default | Meaning |

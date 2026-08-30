@@ -26,11 +26,12 @@ from __future__ import annotations
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, TypedDict
 
-from . import protocol, security
+from . import posture, protocol, security
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +69,21 @@ def _resolve_peer(agent: str) -> Optional[dict]:
     }
 
 
-def _auth_header(auth: dict) -> dict:
-    if auth and auth.get("type") == "bearer" and auth.get("token"):
+def _auth_header(auth: dict, agent_label: str = "") -> dict:
+    auth_type = str(auth.get("type") or "").strip().lower() if auth else ""
+    if auth_type == "bearer" and auth.get("token"):
         return {"Authorization": f"Bearer {auth['token']}"}
+    if auth_type == "peer-token":
+        matches = [
+            token
+            for token, peer_name in security.get_peer_tokens().items()
+            if peer_name == agent_label
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Error: peer-token auth unavailable for peer '{agent_label}'."
+            )
+        return {"Authorization": f"Bearer {matches[0]}"}
     return {}
 
 
@@ -130,6 +143,25 @@ def _rpc_url(base_url: str, card: Optional[dict]) -> str:
     return base_url.rstrip("/")
 
 
+def _same_origin(left: str, right: str) -> bool:
+    """Return whether two absolute HTTP(S) URLs share scheme, host, and port."""
+    try:
+        origins = []
+        for raw in (left, right):
+            parsed = urllib.parse.urlsplit(raw)
+            scheme = parsed.scheme.lower()
+            hostname = (parsed.hostname or "").lower()
+            if scheme not in {"http", "https"} or not hostname:
+                return False
+            port = parsed.port
+            if port is None:
+                port = 443 if scheme == "https" else 80
+            origins.append((scheme, hostname, port))
+        return origins[0] == origins[1]
+    except ValueError:
+        return False
+
+
 def _interface_tenant(card: Optional[dict], peer: dict) -> str:
     iface = _select_jsonrpc_interface(card)
     if iface and iface.get("tenant"):
@@ -153,7 +185,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     outbound redaction, audit, persistence, and metrics.
     """
     base_url = peer.get("url", "")
-    headers = _auth_header(peer.get("auth", {}) or {})
+    headers = _auth_header(peer.get("auth", {}) or {}, agent_label)
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
 
     # Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
@@ -163,15 +195,19 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     except Exception:
         pass
 
-    ctx = context_id or protocol.new_context_id()
+    requested_ctx = str(context_id or "").strip()
+    ctx = requested_ctx or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
     # v1.0: contextId lives inside the Message, not at the params top level.
+    outbound_message = protocol.text_message(
+        protocol.ROLE_USER, safe_message, context_id=ctx,
+    )
     rpc_body = {
         "jsonrpc": "2.0",
         "id": protocol.new_task_id(),
         "method": "SendMessage",
         "params": {
-            "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx),
+            "message": outbound_message,
         },
     }
 
@@ -180,10 +216,11 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
         rpc_body["params"]["tenant"] = tenant
 
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
-    protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    rpc_url = _rpc_url(base_url, card)
+    rpc_headers = headers if _same_origin(base_url, rpc_url) else {}
+    resp = _http_post_json(rpc_url, rpc_body, rpc_headers, timeout)
     if "error" in resp:
         err = resp["error"]
         raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
@@ -195,9 +232,20 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     if isinstance(payload, dict):
         reply_ctx = payload.get("contextId", ctx)
         state = (payload.get("status") or {}).get("state", "")
-    protocol.persist_message(reply_ctx, "agent", reply, rpc_body["id"])
+    if not isinstance(reply_ctx, str) or reply_ctx != ctx:
+        raise ValueError(
+            f"Peer '{agent_label}' returned a mismatched contextId"
+        )
+    protocol.persist_message(
+        ctx, "user", safe_message, rpc_body["id"],
+        peer=agent_label, agent_slug="outbound",
+    )
+    protocol.persist_message(
+        ctx, "agent", reply, rpc_body["id"],
+        peer=agent_label, agent_slug="outbound",
+    )
     protocol.metrics.inbound_total += 1
-    return reply, reply_ctx, state
+    return reply, ctx, state
 
 
 def _reply_text_from_result(result: Any) -> str:
@@ -302,7 +350,17 @@ def a2a_call(args: dict, **_: Any) -> str:
     return f"{header}\n{body}"
 
 
-def a2a_list(args: dict | None = None, **_: Any) -> str:
+def _restricted_context(
+    kwargs: dict[str, Any],
+) -> tuple[bool, posture.PostureBinding | None]:
+    """Return whether this is an A2A-restricted call and its exact binding."""
+    if "a2a_binding" not in kwargs:
+        return False, None
+    binding = posture.PostureBinding.from_value(kwargs.get("a2a_binding"))
+    return True, binding
+
+
+def a2a_list(args: dict | None = None, **kwargs: Any) -> str:
     """List configured A2A peers and any persisted conversations."""
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
@@ -317,7 +375,18 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
     else:
         lines.append("No peers configured. Add them under 'a2a_agents' in config.yaml.")
 
-    convos = protocol.list_conversations()
+    restricted, binding = _restricted_context(kwargs)
+    convos = protocol.list_conversations(
+        peer=binding.peer if restricted and binding is not None else None,
+        agent_slug=binding.agent_slug if restricted and binding is not None else None,
+    )
+    if restricted:
+        # A remote read-only peer may inspect only the conversation bound to
+        # its exact peer + served route + context scope.
+        convos = [
+            c for c in convos
+            if binding is not None and c == binding.context_id
+        ]
     if convos:
         lines.append("")
         lines.append(f"Persisted conversations ({len(convos)}) — recall with a2a_history:")
@@ -336,7 +405,7 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
     return "\n".join(lines)
 
 
-def a2a_history(args: dict, **_: Any) -> str:
+def a2a_history(args: dict, **kwargs: Any) -> str:
     """Recall a persisted A2A conversation by context_id.
 
     This is how prior A2A exchanges survive compaction/restarts: every turn is
@@ -346,17 +415,27 @@ def a2a_history(args: dict, **_: Any) -> str:
     context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
     if not context_id:
         return "Error: 'context_id' is required (see a2a_list for known conversations)."
+    restricted, binding = _restricted_context(kwargs)
+    if restricted and (binding is None or context_id != binding.context_id):
+        return "Error: A2A history is limited to the authenticated bound context."
     try:
         limit = max(1, min(int(args.get("limit") or 50), 200))
     except (ValueError, TypeError):
         limit = 50
-    messages = protocol.load_conversation(context_id, limit=limit)
+    messages = protocol.load_conversation(
+        context_id,
+        limit=limit,
+        peer=binding.peer if restricted and binding is not None else None,
+        agent_slug=binding.agent_slug if restricted and binding is not None else None,
+    )
     if not messages:
         return f"No persisted conversation for context '{context_id}'."
     lines = [f"Conversation {context_id} (last {len(messages)} messages):"]
     for m in messages:
         role = m.get("role", "?")
-        text = (m.get("text") or "").strip()
+        # Redact before truncation so secrets cannot be selected into the
+        # retained preview by placing them beyond the cutoff boundary.
+        text = security.redact_outbound(m.get("text") or "").strip()
         if len(text) > 1000:
             text = text[:1000] + " …[truncated]"
         lines.append(f"[{role}] {text}")

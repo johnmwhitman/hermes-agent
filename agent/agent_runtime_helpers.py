@@ -3449,6 +3449,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # Defense in depth for direct/concurrent callers: posture enforcement must
+    # happen before request middleware, plugin hooks, checkpoints, or any
+    # branch-specific tool implementation.
+    _a2a_posture = getattr(agent, "_a2a_posture", None)
+    if _a2a_posture is not None and function_name not in set(_a2a_posture.get("allowed_tool_names", ())):
+        return json.dumps({
+            "error": f"'{function_name}' is not available under the A2A mutation posture"
+        })
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -3715,6 +3724,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                a2a_posture=getattr(agent, "_a2a_posture", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
             if skip_tool_execution_middleware:

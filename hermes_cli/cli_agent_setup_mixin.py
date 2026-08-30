@@ -15,6 +15,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 from __future__ import annotations
 
 import sys
+import os
 
 from rich.markup import escape as _escape
 
@@ -376,6 +377,29 @@ class CLIAgentSetupMixin:
         if self.agent is not None:
             return True
 
+        # A forwarded A2A source is privileged transport state. Validate its
+        # signed policy before credential setup, MCP/plugin startup, session
+        # restoration, or any durable session reopen.
+        _a2a_policy = None
+        _a2a_policy_present = bool(os.environ.get("HERMES_A2A_POSTURE"))
+        _a2a_source = (
+            os.environ.get("HERMES_SESSION_SOURCE", "").strip().lower() == "a2a"
+        )
+        if _a2a_source or _a2a_policy_present:
+            if not (_a2a_source and _a2a_policy_present):
+                logger.warning("Rejecting forwarded A2A child without a signed posture policy")
+                return False
+            try:
+                from plugins.platforms.a2a import posture as _a2a_posture
+
+                _a2a_policy = _a2a_posture.load_child_policy()
+            except Exception:
+                logger.warning("Rejecting forwarded A2A posture after policy load failure", exc_info=True)
+                return False
+            if not _a2a_policy or _a2a_policy.get("error"):
+                logger.warning("Rejecting invalid or unsigned forwarded A2A posture policy")
+                return False
+
         # Join the background preloaded-skills load (cli.py cmd_chat starts
         # it when --skills/-s is passed) BEFORE the agent snapshots
         # self.system_prompt below. No-op when nothing was requested.
@@ -402,6 +426,58 @@ class CLIAgentSetupMixin:
                 self._session_db = SessionDB()
             except Exception as e:
                 logger.warning("SQLite session store not available — session will NOT be indexed: %s", e)
+
+        # Validate the durable resume binding before loading/restoring history
+        # or reopening the session row. Missing/corrupt legacy binding narrows
+        # to a newly signed read-only policy; a mismatch rejects.
+        if _a2a_policy is not None and self._resumed and self._session_db and self.session_id:
+            try:
+                resolved_id = self._session_db.resolve_resume_session_id(self.session_id)
+                if resolved_id:
+                    self.session_id = resolved_id
+                prior = self._session_db.get_session(self.session_id)
+                prior_cfg = prior.get("model_config") if isinstance(prior, dict) else None
+                if isinstance(prior_cfg, str):
+                    try:
+                        import json as _json
+                        prior_cfg = _json.loads(prior_cfg)
+                    except Exception:
+                        prior_cfg = None
+                prior_binding = prior_cfg.get("a2a_posture_binding") if isinstance(prior_cfg, dict) else None
+                status = _a2a_posture.resume_binding_status(
+                    prior_binding, _a2a_policy.get("binding")
+                ) if prior_binding is not None else "corrupt"
+                if prior_binding is not None and status == "mismatch":
+                    logger.warning("Rejecting forwarded A2A resume with posture mismatch")
+                    return False
+                if status == "corrupt":
+                    prior_decision = _a2a_posture.PostureBinding.from_value(
+                        _a2a_policy.get("binding")
+                    )
+                    if prior_decision is None:
+                        return False
+                    readonly_names = sorted(
+                        set(_a2a_policy.get("allowed_tool_names", ()))
+                        & _a2a_posture.READONLY_TOOL_NAMES
+                    )
+                    narrowed = dict(_a2a_policy)
+                    narrowed["mutation_enabled"] = False
+                    narrowed["allowed_tool_names"] = readonly_names
+                    narrowed["binding"] = _a2a_posture.make_binding(
+                        prior_decision.peer,
+                        prior_decision.agent_slug,
+                        prior_decision.context_id,
+                        readonly_names,
+                        mutation_enabled=False,
+                    )
+                    _a2a_policy = _a2a_posture.load_child_policy(
+                        _a2a_posture.sign_child_policy(narrowed)
+                    )
+                    if not _a2a_policy or _a2a_policy.get("error"):
+                        return False
+            except Exception:
+                logger.warning("Rejecting forwarded A2A resume after binding validation failure", exc_info=True)
+                return False
         
         # If resuming, validate the session exists and load its history.
         # _preload_resumed_session() may have already loaded it (called from
@@ -547,7 +623,8 @@ class CLIAgentSetupMixin:
                 provider_data_collection=self._provider_data_collection,
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id,
-                platform="cli",
+                platform="a2a" if _a2a_policy is not None else "cli",
+                a2a_policy=_a2a_policy,
                 session_db=self._session_db,
                 # A -q turn never builds the prompt_toolkit application, so
                 # the interactive modal can never be painted or answered —

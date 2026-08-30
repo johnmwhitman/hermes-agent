@@ -260,7 +260,7 @@ def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
 # - subagent — a delegated child's session is hidden from every picker, so its
 #   title is never read. A batch at `max_concurrent_children` would pay N title
 #   calls for N names nobody sees.
-_UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})
+_UNTITLED_PLATFORMS = frozenset({"cron", "subagent", "a2a"})
 
 
 def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:

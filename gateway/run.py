@@ -6133,7 +6133,29 @@ class TurnRunner:
                             # mirrors _evict_cached_agent / idle-sweep.
                             _xproc_evicted_agent = _ev_agent
                     else:
-                        agent = cached[0]
+                        _cached_agent = cached[0]
+                        _a2a_cache_mismatch = False
+                        if _gateway_platform_value(getattr(ctx.source, "platform", None)) == "a2a":
+                            try:
+                                from plugins.platforms.a2a import posture as _a2a_posture
+                                _a2a_cache_mismatch = (
+                                    getattr(_cached_agent, "_a2a_posture_request_key", None)
+                                    != _a2a_posture.request_key(ctx.source)
+                                )
+                            except Exception:
+                                _a2a_cache_mismatch = True
+                        if _a2a_cache_mismatch:
+                            # A cached agent may have a narrower or wider
+                            # schema than this context. Rebuild so a context
+                            # cannot inherit another peer's posture.
+                            agent = None
+                            logger.info("Invalidating cached agent for changed A2A posture")
+                            evicted = self._runner._agent_cache.pop(ctx.session_key, None)
+                            _ev_agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
+                            if _ev_agent and _ev_agent is not _AGENT_PENDING_SENTINEL:
+                                _xproc_evicted_agent = _ev_agent
+                        else:
+                            agent = _cached_agent
                         # Refresh LRU order so the cap enforcement evicts
                         # truly-oldest entries, not the one we just used.
                         if hasattr(_cache, "move_to_end"):
@@ -6141,12 +6163,13 @@ class TurnRunner:
                                 _cache.move_to_end(ctx.session_key)
                             except KeyError:
                                 pass
-                        self._runner._init_cached_agent_for_turn(agent, ctx._interrupt_depth)
-                        # Refresh agent max_iterations from current config
-                        # (cached agent may have been created with old config)
-                        agent.max_iterations = max_iterations
-                        logger.debug("Reusing cached agent for session %s", ctx.session_key)
-                        reused_cached_agent = True
+                        if agent is not None:
+                            self._runner._init_cached_agent_for_turn(agent, ctx._interrupt_depth)
+                            # Refresh agent max_iterations from current config
+                            # (cached agent may have been created with old config)
+                            agent.max_iterations = max_iterations
+                            logger.debug("Reusing cached agent for session %s", ctx.session_key)
+                            reused_cached_agent = True
 
         # Lock released — refresh the fallback chain from disk for the
         # reused agent OUTSIDE the cache lock (config.yaml read is disk
@@ -6232,6 +6255,25 @@ class TurnRunner:
                     )
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+
+        # Apply the closed A2A tool surface after all dynamic/plugin/MCP/Tool
+        # Search schema assembly, and re-apply on cached agents to narrow stale
+        # objects before any model call or executor path.
+        if _gateway_platform_value(getattr(ctx.source, "platform", None)) == "a2a":
+            from plugins.platforms.a2a import posture as _a2a_posture
+            if not self._runner._validate_a2a_ingress_source(ctx.source):
+                logger.warning("Rejecting A2A turn without live adapter ingress capability")
+                return {
+                    "final_response": "A2A ingress capability is missing or invalid.",
+                    "completed": False,
+                }
+            _a2a_posture.apply_to_agent(agent, ctx.source)
+            if not bool(getattr(agent, "_a2a_posture_binding_matches", False)):
+                logger.warning("Rejecting A2A turn because the post-assembly toolset changed after binding")
+                return {
+                    "final_response": "A2A posture binding no longer matches the assembled toolset.",
+                    "completed": False,
+                }
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -18046,6 +18088,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = event.source
 
+        # A2A metadata is a security decision, not ordinary model input.  Do
+        # the strict parse before hooks, session lookup, anti-loop state, or
+        # persistence so direct/internal MessageEvent callers cannot bypass
+        # the transport adapter's ingress validation.
+        if _gateway_platform_value(getattr(source, "platform", None)) == "a2a":
+            try:
+                from plugins.platforms.a2a import posture as _a2a_posture
+                if not self._validate_a2a_ingress_source(source):
+                    logger.warning("Dropping A2A event without live adapter ingress capability")
+                    return None
+                _posture_request = _a2a_posture.parse_mutation_request(
+                    {"message": {"metadata": getattr(event, "metadata", None) or {}}}
+                )
+                if _posture_request.error:
+                    logger.warning("Dropping A2A event with invalid mutation posture: %s", _posture_request.error)
+                    return None
+                _source_requested = getattr(source, "a2a_mutation_requested", False)
+                if type(_source_requested) is not bool or _source_requested != _posture_request.requested:
+                    logger.warning("Dropping A2A event with source/metadata posture disagreement")
+                    return None
+                _source_enabled = getattr(source, "a2a_mutation_enabled", False)
+                if type(_source_enabled) is not bool and _posture_request.requested:
+                    logger.warning("Dropping A2A event with malformed effective posture")
+                    return None
+                if _source_enabled and not _posture_request.requested:
+                    logger.warning("Dropping A2A event with effective mutation absent a request")
+                    return None
+                if _posture_request.requested and not _source_enabled:
+                    logger.warning("Dropping unauthorized A2A mutable event before session side effects")
+                    return None
+                if _posture_request.requested and not (
+                    getattr(source, "a2a_credential_authenticated", False) is True
+                    and getattr(source, "a2a_peer_trusted", False) is True
+                ):
+                    logger.warning("Dropping A2A event without authenticated peer posture")
+                    return None
+                if not _a2a_posture.source_binding_valid(source):
+                    logger.warning("Dropping A2A event with missing or inconsistent posture binding")
+                    return None
+            except Exception:
+                logger.warning("Dropping A2A event because posture validation failed", exc_info=True)
+                return None
+
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
         # context with copy_context(). If a *concurrent* message had already
@@ -20487,6 +20572,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source,
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
+        if _gateway_platform_value(getattr(source, "platform", None)) == "a2a":
+            # SessionSource is the durable resume boundary. A missing or
+            # malformed persisted binding can only narrow posture; a changed
+            # peer/route/context/toolset identity is a hard resume rejection.
+            try:
+                from plugins.platforms.a2a import posture as _a2a_posture
+                _a2a_adapter = self._registered_transport_adapter(source)
+                if _a2a_adapter is None:
+                    return None
+                stored_origin = getattr(session_entry, "origin", None)
+                stored_binding = getattr(stored_origin, "a2a_binding", None)
+                current_binding = getattr(source, "a2a_binding", None)
+                if stored_binding is None:
+                    narrowed = _a2a_adapter._rebind_readonly_source(source)
+                    if narrowed is None:
+                        return None
+                    source = narrowed
+                    event.source = source
+                else:
+                    status = _a2a_posture.resume_binding_status(stored_binding, current_binding)
+                    if status == "mismatch":
+                        logger.warning("Dropping A2A resume with mismatched posture binding")
+                        return None
+                    if status == "corrupt":
+                        narrowed = _a2a_adapter._rebind_readonly_source(source)
+                        if narrowed is None:
+                            return None
+                        source = narrowed
+                        event.source = source
+            except Exception:
+                logger.warning("Dropping A2A event because durable posture validation failed", exc_info=True)
+                return None
         session_key = session_entry.session_key
         if not strict_session and pinned_session_id:
             resolved_entry = await self._resolve_async_delegation_session(
@@ -25710,6 +25827,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+        source_platform = getattr(source, "platform", None)
+        if _gateway_platform_value(source_platform) == "a2a":
+            metadata = dict(metadata or {})
+            metadata.update({
+                "a2a_peer": str(getattr(source, "a2a_peer", "") or ""),
+                "a2a_agent_slug": str(getattr(source, "a2a_agent_slug", "") or ""),
+                "a2a_context_id": str(getattr(source, "a2a_context_id", "") or ""),
+            })
         return metadata
 
     def _thread_metadata_for_target(

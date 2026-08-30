@@ -1131,6 +1131,8 @@ class ToolRegistry:
         args: dict,
         *,
         scope: Optional[str] = None,
+        a2a_allowed_tool_names: Optional[set[str] | frozenset[str]] = None,
+        a2a_binding: Optional[dict] = None,
         **kwargs,
     ) -> str | dict:
         """Execute a tool handler by name.
@@ -1141,6 +1143,19 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        # Final registry backstop: this runs before lookup and before any
+        # handler (including inline/plugin/MCP handlers) can be invoked.
+        # Consume the policy kwarg here so it can never leak into handlers.
+        if a2a_allowed_tool_names is not None:
+            try:
+                from plugins.platforms.a2a import posture as _a2a_posture_policy
+                _a2a_non_transitive = _a2a_posture_policy.NON_TRANSITIVE_TOOL_NAMES
+            except Exception:
+                _a2a_non_transitive = frozenset({"execute_code", "delegate_task"})
+            if name in _a2a_non_transitive or name not in a2a_allowed_tool_names:
+                return tool_error(f"'{name}' is not available under the A2A mutation posture")
+        if a2a_allowed_tool_names is not None and name in {"a2a_history", "a2a_list"}:
+            kwargs["a2a_binding"] = a2a_binding
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")

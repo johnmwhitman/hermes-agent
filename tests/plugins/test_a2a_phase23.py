@@ -528,7 +528,7 @@ class TestTaskStore:
 
 class TestDynamicAgentCards:
     def test_skills_reflect_live_tool_registry(self, monkeypatch):
-        """The Agent Card is built from the real tool registry at serve time."""
+        """The default card publishes only concrete read-only capabilities."""
         from tools.registry import registry
         from gateway.config import PlatformConfig
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -541,7 +541,7 @@ class TestDynamicAgentCards:
         adapter = A2AAdapter(PlatformConfig(enabled=True))
         card = adapter._build_card()
         by_name = {s["name"]: s for s in card["skills"]}
-        assert set(by_name) == {"webz", "termz"}
+        assert set(by_name) == {"webz"}
         assert "web_search" in by_name["webz"]["tags"]
 
     def test_advertised_toolsets_restrict_card(self, monkeypatch):
@@ -556,7 +556,26 @@ class TestDynamicAgentCards:
 
         adapter = A2AAdapter(PlatformConfig(enabled=True))
         card = adapter._build_card()
-        assert [s["name"] for s in card["skills"]] == ["webz"]
+        assert card["skills"] == []
+
+    def test_mutable_registry_capability_requires_explicit_card_opt_in(self, monkeypatch):
+        from tools.registry import registry
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setattr(registry, "get_registered_toolset_names", lambda: ["termz"])
+        monkeypatch.setattr(
+            registry, "get_tool_names_for_toolset", lambda ts: ["terminal"]
+        )
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "advertised_toolsets": ["termz"],
+            "advertise_mutable_capability": True,
+        }))
+        card = adapter._build_card()
+
+        assert [skill["name"] for skill in card["skills"]] == ["termz"]
+        assert "terminal" in card["skills"][0]["tags"]
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -1253,6 +1253,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    a2a_posture: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1282,6 +1283,24 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    # Direct callers and inline branches must observe the same closed A2A
+    # surface as schema-driven execution.  This gate intentionally precedes
+    # Tool Search unwrapping and every registered/inline dispatch branch.
+    if a2a_posture is not None:
+        try:
+            from plugins.platforms.a2a import posture as _a2a_posture_policy
+            _a2a_non_transitive = _a2a_posture_policy.NON_TRANSITIVE_TOOL_NAMES
+        except Exception:
+            # A present A2A restriction must remain fail-closed even if its
+            # policy module cannot be imported at this final direct-call seam.
+            _a2a_non_transitive = frozenset({"execute_code", "delegate_task"})
+        if (
+            function_name in _a2a_non_transitive
+            or function_name not in set(a2a_posture.get("allowed_tool_names", ()))
+        ):
+            return tool_error(
+                f"'{function_name}' is not available under the A2A mutation posture"
+            )
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
@@ -1392,6 +1411,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                a2a_posture=a2a_posture,
             )
 
     _tool_original_args = dict(function_args)
@@ -1548,6 +1568,11 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        a2a_allowed_tool_names=(
+                            set(a2a_posture.get("allowed_tool_names", ()))
+                            if a2a_posture is not None else None
+                        ),
+                        a2a_binding=(a2a_posture or {}).get("binding"),
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1556,6 +1581,11 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        a2a_allowed_tool_names=(
+                            set(a2a_posture.get("allowed_tool_names", ()))
+                            if a2a_posture is not None else None
+                        ),
+                        a2a_binding=(a2a_posture or {}).get("binding"),
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

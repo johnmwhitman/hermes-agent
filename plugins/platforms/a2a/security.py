@@ -32,7 +32,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +168,23 @@ def is_trusted_peer(identity: str) -> bool:
     if not trusted:
         return True
     return identity in trusted
+
+
+def is_authorized_for_agent(identity: str, agent: Any) -> bool:
+    """Bind an authenticated peer to a served route's explicit allowlist.
+
+    An omitted/empty ``allowed_peers`` list preserves the existing trusted-
+    peer policy. A malformed served route fails closed. This deliberately
+    does not assume caller identity must equal the served slug: Conductor may
+    legitimately call a MeshFleet owner route under its own identity.
+    """
+    if not isinstance(agent, dict) or not isinstance(agent.get("slug"), str):
+        return False
+    allowed = agent.get("allowed_peers") or ()
+    if not isinstance(allowed, (list, tuple, set)):
+        return False
+    normalized = {str(value).strip() for value in allowed if str(value).strip()}
+    return not normalized or str(identity) in normalized
 
 
 # --------------------------------------------------------------------------
@@ -362,7 +379,10 @@ def audit(direction: str, peer: str, task_id: str, summary: str) -> None:
             "direction": direction,  # "inbound" | "outbound" | "push"
             "peer": peer,
             "task_id": task_id,
-            "summary": (summary or "")[:500],
+            # Redact before truncating so a credential at the boundary cannot
+            # be preserved as raw audit data (or split into a misleading
+            # partial token).
+            "summary": redact_outbound(str(summary or ""))[:500],
         }
         path = _audit_path()
         path.parent.mkdir(parents=True, exist_ok=True)

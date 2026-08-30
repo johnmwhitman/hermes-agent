@@ -4443,15 +4443,12 @@ class PluginManager:
                 continue
 
             # Bundled platform plugins (gateway adapters: telegram, discord,
-            # feishu, teams, ...) are registered LAZILY unless they also expose
-            # client tools for ordinary chat. Tool-providing platforms must load
-            # eagerly or those tools never reach the runtime registry and cannot
-            # be enabled through `hermes tools`.
+            # feishu, teams, ...) stay lazy. Platforms that also expose client
+            # tools pre-register only their dedicated tools module inside
+            # _register_deferred_platform(); their inbound adapter must not be
+            # materialized in ordinary CLI/TUI processes.
             if manifest.source == "bundled" and manifest.kind == "platform":
-                if manifest.provides_tools:
-                    self._load_plugin(manifest)
-                else:
-                    self._register_deferred_platform(manifest)
+                self._register_deferred_platform(manifest)
                 continue
 
             # Everything else (standalone, user-installed backends,

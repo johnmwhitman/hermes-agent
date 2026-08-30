@@ -614,6 +614,7 @@ def init_agent(
     pass_session_id: bool = False,
     requested_provider: str = None,
     capabilities: Optional[Dict[str, bool]] = None,
+    a2a_policy: Dict[str, Any] = None,
 ):
     """
     Initialize the AI Agent.
@@ -1615,6 +1616,27 @@ def init_agent(
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+
+    # Forwarded A2A children receive a serialized authenticated policy from
+    # the adapter. Consume it during initialization, before the agent can
+    # expose or execute any model-selected tool call.
+    if a2a_policy is not None:
+        from plugins.platforms.a2a import posture as _a2a_posture
+
+        _validated_a2a_policy = _a2a_posture.load_child_policy(a2a_policy)
+        if not _validated_a2a_policy or _validated_a2a_policy.get("error"):
+            raise ValueError("invalid forwarded A2A posture policy")
+        a2a_policy = _validated_a2a_policy
+        agent._a2a_posture = {
+            "mutation_enabled": a2a_policy["mutation_enabled"],
+            "allowed_tool_names": frozenset(a2a_policy.get("allowed_tool_names", ())),
+            "binding": a2a_policy.get("binding"),
+        }
+        agent._a2a_posture_request_key = ("forwarded", str(a2a_policy.get("binding")))
+        agent.tools = [
+            tool for tool in (agent.tools or [])
+            if tool.get("function", {}).get("name") in agent._a2a_posture["allowed_tool_names"]
+        ]
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1783,6 +1805,10 @@ def init_agent(
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
+    if a2a_policy is not None:
+        agent._session_init_model_config["a2a_posture_binding"] = dict(
+            a2a_policy.get("binding") or {}
+        )
     # Persist a process-scoped --yolo launch into the session row so a later
     # `hermes --resume <id>` can restore the bypass (CLI resume paths read
     # model_config.yolo_mode back via SessionDB.session_yolo_enabled).
@@ -2972,6 +2998,14 @@ def init_agent(
             agent.valid_tool_names.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
+
+    # This must remain after every schema producer above. Forwarded A2A child
+    # policy binds the exact final surface, including late context-engine
+    # additions, rather than only the base registry snapshot.
+    if a2a_policy is not None and not _a2a_posture.child_policy_matches_tools(
+        a2a_policy, agent.valid_tool_names,
+    ):
+        raise ValueError("forwarded A2A post-assembly toolset fingerprint mismatch")
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:

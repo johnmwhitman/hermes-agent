@@ -47,7 +47,7 @@ def test_portable_skill_namespace_is_ascii_safe():
     assert is_valid_namespace(namespace)
 
 
-def test_bundled_platform_with_client_tools_loads_eagerly(monkeypatch):
+def test_bundled_platform_with_client_tools_keeps_adapter_deferred(monkeypatch):
     manifest = PluginManifest(
         name="peer-platform",
         source="bundled",
@@ -73,8 +73,8 @@ def test_bundled_platform_with_client_tools_loads_eagerly(monkeypatch):
 
     manager._discover_and_load_inner()
 
-    assert eager == [manifest]
-    assert deferred == []
+    assert eager == []
+    assert deferred == [manifest]
 
 
 def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
@@ -415,6 +415,10 @@ class TestPluginDiscovery:
         # A later call (with discovery healthy again) must do the real scan.
         monkeypatch.undo()
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        # This test owns one filesystem fixture. Installed third-party Python
+        # entry points are host state, not part of the retry contract, and can
+        # otherwise add unrelated plugins (for example mnemosyne) to the count.
+        monkeypatch.setattr(mgr, "_scan_entry_points", lambda: [])
         mgr.discover_and_load()
         assert mgr._discovered is True
         non_bundled = {

@@ -73,7 +73,7 @@ With the platform enabled, Hermes serves:
 - **SSE streaming** for `SendStreamingMessage`, with spec-correct JSON-RPC-enveloped frames.
 - **Push notifications** (webhooks) for long-running tasks, HMAC-SHA256 signed.
 
-Inbound tasks are injected into a **live gateway session** — the same agent, memory, and tools that serve your other channels — and the final reply is returned to the caller as the task result. Conversations are keyed by the A2A `contextId`, so a peer can hold a multi-turn exchange.
+Inbound tasks are injected into a **live gateway session** — the same agent, memory, and tools that serve your other channels — and the final reply is returned to the caller as the task result. Conversations are scoped by authenticated peer, served route, and A2A `contextId`, so a peer can hold a multi-turn exchange without sharing history across routes or peers.
 
 Interoperability is verified against the official Python `a2a-sdk` (card resolution, `SendMessage`, streaming).
 
@@ -87,6 +87,48 @@ Secure by default; every widening step is explicit:
 - **Outbound redaction** — credential-shaped strings (API keys, JWTs, tokens) are scrubbed from replies.
 - **Audit log** — every exchange appends to `~/.hermes/a2a_audit.jsonl`.
 - **Anti-loop** — per-context turn caps stop two agents ping-ponging forever.
+
+### Read-only by default
+
+An inbound A2A turn receives only the closed read-only surface by default:
+`read_file`, `search_files`, `skills_list`, `skill_view`, `web_search`,
+`web_extract`, `kanban_show`, `kanban_list`, `a2a_history`, and `a2a_list`.
+This posture is enforced again at schema assembly and tool dispatch, including
+forwarded profile subprocesses and dynamically discovered tools.
+
+Mutable access is opt-in per request and per served route. The request must set
+the metadata field `hermes.ai/mutationAllowed` to the JSON boolean `true`; the
+caller must be credential-authenticated and globally trusted; the route must
+include the caller in `mutation_allowed_peers`; and `mutable_toolsets` must be
+non-empty. A missing marker is read-only, while malformed or conflicting
+markers are rejected before task persistence or dispatch.
+
+`execute_code` and `delegate_task` remain unavailable to A2A even when their
+toolsets are configured. Both create nested execution authorities and require
+signed posture propagation through their sandbox or child-agent boundary
+before they can be enabled safely.
+
+```yaml
+gateway:
+  platforms:
+    a2a:
+      enabled: true
+      extra:
+        agents:
+          builder:
+            profile: builder
+            allowed_peers: [conductor]
+            mutation_allowed_peers: [conductor]
+            mutable_toolsets: [terminal]
+            advertised_toolsets: [web]
+            advertise_mutable_capability: false
+```
+
+`allowed_peers` narrows all operations on a named route. If omitted, the
+global trusted-peer policy still applies. `advertise_mutable_capability` only
+controls the public Agent Card claim; it does not grant execution authority.
+Posture is bound to peer, route, context, and the final tool-schema fingerprint,
+so copied, stale, or mismatched session state cannot widen access.
 
 ## Configuration reference
 

@@ -61,6 +61,14 @@ def _pairing_tool_call_id(tool_call: Any) -> str:
     return coalesce_tool_call_id(tool_call)
 
 
+def _a2a_scope_block(agent: Any, function_name: str) -> Optional[str]:
+    """Return a deterministic denial before any inline/bridge dispatch."""
+    posture = getattr(agent, "_a2a_posture", None)
+    if posture is not None and function_name not in set(posture.get("allowed_tool_names", ())):
+        return f"'{function_name}' is not available under the A2A mutation posture"
+    return None
+
+
 def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
     """Tell the stall guards where a persisted result's full content lives.
 
@@ -1169,6 +1177,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             continue
 
+        # This must precede Tool Search unwrapping and all inline branches.
+        # Schema filtering is only advisory; model-emitted calls still reach
+        # this executor directly.
+        _a2a_block = _a2a_scope_block(agent, function_name)
+        if _a2a_block is not None:
+            parsed_calls.append(
+                (tool_call, function_name, function_args, [], _a2a_block, None)
+            )
+            continue
+
         # ── Tool Search unwrap ────────────────────────────────────────
         # When the model invokes the tool_call bridge, peel it open so
         # every downstream check (checkpointing, guardrails, plugin
@@ -2038,6 +2056,28 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return
             continue
 
+        # Central early gate for sequential execution, before selecting any
+        # of the many legacy inline branches below.
+        _a2a_block = _a2a_scope_block(agent, function_name)
+        if _a2a_block is not None:
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=_a2a_block,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="a2a_read_only",
+                error_message=_a2a_block,
+            )
+            messages.append(make_tool_result_message(function_name, _a2a_block, tool_call.id))
+            if not _flush_session_db_after_tool_progress(
+                agent, messages, stage=f"A2A posture block {function_name}"
+            ):
+                return
+            continue
+
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
@@ -2534,6 +2574,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            a2a_posture=getattr(agent, "_a2a_posture", None),
                         )
 
                 (
@@ -2616,6 +2657,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            a2a_posture=getattr(agent, "_a2a_posture", None),
                         )
 
                 (

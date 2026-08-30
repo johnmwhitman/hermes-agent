@@ -30,6 +30,7 @@ Bind safety: with no token configured, the server binds 127.0.0.1 only.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ import urllib.request
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
@@ -55,7 +57,7 @@ from gateway.platforms.base import (
 )
 from gateway.config import Platform
 
-from . import protocol, security
+from . import posture, protocol, security
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,12 @@ _ORPHAN_GRACE = 60  # slack added on top of a served agent's configured route ti
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
+
+
+@dataclass(frozen=True)
+class _IngressCapability:
+    nonce: object
+    snapshot: tuple[Any, ...]
 
 
 def _reply_timeout() -> float:
@@ -81,6 +89,15 @@ def _truthy(value, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _string_list(value: Any) -> list[str]:
+    """Normalize list-or-comma-string route policy values without coercion."""
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _default_agent_name() -> str:
@@ -132,9 +149,12 @@ def _profile_home(profile: str) -> Optional[str]:
         return os.path.expanduser(f"~/.hermes/profiles/{profile}")
 
 def _safe_context_slug(value: str, max_len: int = 96) -> str:
-    """Sanitize attacker-provided context ids before using in session titles."""
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "")).strip("-._")
-    return (slug or "ctx")[:max_len]
+    """Create a bounded title slug with collision-resistant context identity."""
+    raw = str(value or "")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-._") or "ctx"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    prefix_len = max(1, max_len - len(digest) - 1)
+    return f"{slug[:prefix_len]}-{digest}"[:max_len]
 
 
 def _method_info(method: str) -> tuple[str, bool]:
@@ -296,6 +316,13 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return
         agent = route["agent"]
 
+        if not security.is_authorized_for_agent(identity, agent):
+            self._json(403, protocol.jsonrpc_error(
+                req_id, protocol.ERR_UNTRUSTED_PEER,
+                f"peer '{identity}' is not authorized for this served agent",
+            ))
+            return
+
         if not adapter._rate_limiter.allow(identity):
             protocol.metrics.rate_limit_triggers += 1
             self._json(429, protocol.jsonrpc_error(req_id, protocol.ERR_RATE_LIMITED, "rate limit exceeded"))
@@ -312,34 +339,40 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return
 
         if operation == "send":
-            self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1))
+            self._json(200, adapter._rpc_message_send(
+                req_id, params, identity, agent=agent, v1_response=is_v1,
+                credential_authenticated=not security.localhost_only(),
+            ))
             return
         if operation == "stream":
-            adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
+            adapter._rpc_message_stream(
+                self, req_id, params, identity, agent=agent,
+                credential_authenticated=not security.localhost_only(),
+            )
             return
         if operation == "get":
-            self._json(200, adapter._rpc_tasks_get(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_tasks_get(req_id, params, agent=agent, peer=identity))
             return
         if operation == "list":
-            self._json(200, adapter._rpc_tasks_list(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_tasks_list(req_id, params, agent=agent, peer=identity))
             return
         if operation == "cancel":
-            self._json(200, adapter._rpc_tasks_cancel(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_tasks_cancel(req_id, params, agent=agent, peer=identity))
             return
         if operation == "subscribe":
-            adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent)
+            adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent, peer=identity)
             return
         if operation == "push_create":
-            self._json(200, adapter._rpc_push_config_create(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_push_config_create(req_id, params, agent=agent, peer=identity))
             return
         if operation == "push_get":
-            self._json(200, adapter._rpc_push_config_get(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_push_config_get(req_id, params, agent=agent, peer=identity))
             return
         if operation == "push_list":
-            self._json(200, adapter._rpc_push_config_list(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_push_config_list(req_id, params, agent=agent, peer=identity))
             return
         if operation == "push_delete":
-            self._json(200, adapter._rpc_push_config_delete(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_push_config_delete(req_id, params, agent=agent, peer=identity))
             return
 
 
@@ -386,19 +419,79 @@ class A2AAdapter(BasePlatformAdapter):
         # contexts cannot claim each other's newly created session.
         self._profile_session_locks: Dict[str, threading.Lock] = {}
         self._profile_session_locks_guard = threading.Lock()
+        # Durable-in-process posture bindings for A2A context resumes.  The
+        # receiving gateway also persists the same binding on SessionSource;
+        # this map covers the adapter's direct task path.
+        self._posture_bindings: Dict[tuple[str, str], dict] = posture.load_persisted_bindings()
+        self._posture_lock = threading.Lock()
+        self._a2a_ingress_nonce = object()
 
         # Pending reply futures, keyed by task_id. Each future resolves to a
         # (state, text) tuple. _pending_order keeps per-context FIFO order so
         # adapter.send() — which only knows the context — resolves the oldest
         # outstanding task for that context (no cross-talk between concurrent
         # requests sharing a context).
-        self._pending: Dict[str, tuple[str, Future]] = {}
-        self._pending_order: Dict[str, deque[str]] = {}
+        self._pending: Dict[str, tuple[tuple[str, str, str], Future]] = {}
+        self._pending_order: Dict[tuple[str, str, str], deque[str]] = {}
         self._pending_lock = threading.Lock()
 
         # Orphaned task watchdog
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
+
+    @staticmethod
+    def _ingress_snapshot(source: Any) -> tuple[Any, ...] | None:
+        """Snapshot every field that contributes to an A2A posture decision."""
+        binding = posture.PostureBinding.from_value(
+            getattr(source, "a2a_binding", None)
+        )
+        if binding is None:
+            return None
+        return (
+            getattr(source, "a2a_mutation_requested", None),
+            getattr(source, "a2a_mutation_enabled", None),
+            getattr(source, "a2a_credential_authenticated", None),
+            getattr(source, "a2a_peer_trusted", None),
+            str(getattr(source, "a2a_peer", "")),
+            str(getattr(source, "a2a_agent_slug", "")),
+            str(getattr(source, "a2a_context_id", "")),
+            str(getattr(source, "chat_id", "")),
+            str(getattr(source, "profile", "")),
+            tuple(sorted(str(v) for v in (getattr(source, "a2a_mutable_toolsets", ()) or ()))),
+            tuple(sorted(str(v) for v in (getattr(source, "a2a_allowed_tool_names", ()) or ()))),
+            str(getattr(source, "a2a_toolset_fingerprint", "")),
+            tuple(sorted(binding.to_dict().items())),
+        )
+
+    def _stamp_ingress_source(self, source: Any):
+        """Mint one adapter-private, nonserializable ingress capability."""
+        snapshot = self._ingress_snapshot(source)
+        if snapshot is None:
+            raise ValueError("cannot stamp malformed A2A posture binding")
+        capability = _IngressCapability(self._a2a_ingress_nonce, snapshot)
+        return replace(source, _a2a_ingress_capability=capability)
+
+    def _validate_ingress_source(self, source: Any) -> bool:
+        """Validate source ownership and its immutable adapter snapshot."""
+        adapter_ref = getattr(source, "_transport_adapter_ref", None)
+        owner = adapter_ref() if callable(adapter_ref) else None
+        capability = getattr(source, "_a2a_ingress_capability", None)
+        snapshot = self._ingress_snapshot(source)
+        return bool(
+            owner is self
+            and isinstance(capability, _IngressCapability)
+            and capability.nonce is self._a2a_ingress_nonce
+            and snapshot is not None
+            and capability.snapshot == snapshot
+            and posture.source_binding_valid(source)
+        )
+
+    def _rebind_readonly_source(self, source: Any):
+        """Narrow a valid live source and mint a replacement capability."""
+        updates = posture.readonly_source_updates(source)
+        if updates is None:
+            return None
+        return self._stamp_ingress_source(replace(source, **updates))
 
     @property
     def name(self) -> str:
@@ -549,6 +642,17 @@ class A2AAdapter(BasePlatformAdapter):
             "name": self.agent_name,
             "description": default_desc,
             "advertised_toolsets": self._advertised_toolsets,
+            "advertise_mutable_capability": extra.get("advertise_mutable_capability") is True,
+            "mutable_toolsets": [
+                str(t).strip() for t in (extra.get("mutable_toolsets") or [])
+                if str(t).strip()
+            ],
+            "mutation_allowed_peers": _string_list(extra.get("mutation_allowed_peers")),
+            "allowed_peers": _string_list(extra.get("allowed_peers")),
+            "mutable_tool_names": [
+                str(t).strip() for t in (extra.get("mutable_tool_names") or [])
+                if str(t).strip()
+            ],
         }
 
         reserved = {"health", "metrics", ".well-known"}
@@ -566,9 +670,12 @@ class A2AAdapter(BasePlatformAdapter):
                 continue
             profile = str(val.get("profile") or slug).strip()
             path = "/" + path_segment
-            toolsets = val.get("advertised_toolsets") or val.get("toolsets") or val.get("capabilities") or []
+            toolsets = val.get("advertised_toolsets") or val.get("toolsets") or []
             if isinstance(toolsets, str):
                 toolsets = [t.strip() for t in toolsets.split(",") if t.strip()]
+            capabilities = val.get("capabilities") or []
+            if isinstance(capabilities, str):
+                capabilities = [t.strip() for t in capabilities.split(",") if t.strip()]
             if isinstance(val.get("local"), bool):
                 local = val["local"]
             else:
@@ -608,6 +715,30 @@ class A2AAdapter(BasePlatformAdapter):
                 "name": str(val.get("name") or f"Hermes {slug}"),
                 "description": str(val.get("description") or f"Hermes profile '{profile or slug}' exposed over A2A."),
                 "advertised_toolsets": list(toolsets or []),
+                # Descriptive product capabilities are not executable toolset
+                # claims. Keep them separate so registry failure can preserve
+                # labels such as "research" without fail-opening a concrete
+                # mutable toolset such as "terminal".
+                "advertised_capabilities": list(capabilities or []),
+                "advertise_mutable_capability": val.get("advertise_mutable_capability") is True,
+                "mutable_toolsets": [
+                    str(t).strip() for t in (
+                        val.get("mutable_toolsets")
+                        or val.get("mutable_toolsets_for_a2a")
+                        or []
+                    ) if str(t).strip()
+                ],
+                "mutation_allowed_peers": _string_list(
+                    val.get("mutation_allowed_peers")
+                    or val.get("allowed_mutation_peers")
+                ),
+                "allowed_peers": _string_list(
+                    val.get("allowed_peers") or val.get("authorized_peers")
+                ),
+                "mutable_tool_names": [
+                    str(t).strip() for t in (val.get("mutable_tool_names") or [])
+                    if str(t).strip()
+                ],
                 "timeout": int(val.get("timeout") or _reply_timeout()),
                 "model": model,
                 "provider": provider,
@@ -659,7 +790,14 @@ class A2AAdapter(BasePlatformAdapter):
         # Prefer per-request public URL (from X-Forwarded-Host / Host /
         # A2A_PUBLIC_URL) over bind host, so peers can call back when we're
         # behind a reverse proxy.
-        agent = agent or self._agents[""]
+        if agent is None:
+            agent = self._agents[""]
+        if (
+            not isinstance(agent, dict)
+            or "slug" not in agent
+            or not isinstance(agent.get("slug"), str)
+        ):
+            raise ValueError("invalid served A2A agent route")
         base = (public_url or "").strip() or f"http://{self.host}:{self.port}/"
         url = _join_url(base, agent.get("path", ""))
         return protocol.build_agent_card(
@@ -685,26 +823,86 @@ class A2AAdapter(BasePlatformAdapter):
             from tools.registry import registry as tool_registry
             names = tool_registry.get_registered_toolset_names()
             configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-            allowed = set(configured or []) or None
+            descriptive = (agent or {}).get("advertised_capabilities") or []
+            # A route that declares only descriptive capabilities is still a
+            # restricted card. Do not interpret its empty executable-toolset
+            # list as permission to inherit every registry capability.
+            allowed = set(configured or descriptive or []) or None
             mapping = {
                 n: tool_registry.get_tool_names_for_toolset(n)
                 for n in names
                 if allowed is None or n in allowed
             }
+            # Agent Cards are public capability declarations.  Keep the
+            # default surface closed; mutable capabilities require a route
+            # explicitly opting into their authenticated advertisement.
+            if not bool((agent or {}).get("advertise_mutable_capability")):
+                mapping = {
+                    key: readonly_values
+                    for key, values in mapping.items()
+                    if (readonly_values := [
+                        name for name in values
+                        if name in posture.READONLY_TOOL_NAMES
+                    ])
+                }
             if mapping:
-                return protocol.skills_from_toolsets(mapping)
+                skills = protocol.skills_from_toolsets(mapping)
+                existing = {skill.get("name") for skill in skills}
+                remaining = [
+                    name for name in descriptive if str(name) not in existing
+                ]
+                if remaining:
+                    skills.extend(protocol.skills_from_toolsets(remaining))
+                return skills
+            if descriptive:
+                return protocol.skills_from_toolsets(descriptive)
+            # Registry discovery succeeded, but every selected concrete
+            # capability was filtered out. An empty public card is more honest
+            # than inventing the helper's generic fallback skill.
+            return []
         except Exception:
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
         configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-        return protocol.skills_from_toolsets(configured or [])
+        # A route's static ``advertised_toolsets`` are an explicit capability
+        # declaration. Without the registry we cannot expand and classify
+        # grouped toolsets, so the default card may advertise only names in
+        # the closed read-only surface. Mutable fallback advertising requires
+        # the same explicit route opt-in as the normal registry path.
+        if not bool((agent or {}).get("advertise_mutable_capability")):
+            safe_configured = []
+            try:
+                from toolsets import get_toolset, resolve_toolset
+
+                for name in configured or []:
+                    label = str(name)
+                    if label in posture.READONLY_TOOL_NAMES:
+                        safe_configured.append(label)
+                        continue
+                    definition = get_toolset(label, include_registry=False)
+                    if definition is None:
+                        continue
+                    resolved = set(resolve_toolset(label, include_registry=False))
+                    if resolved and resolved.issubset(posture.READONLY_TOOL_NAMES):
+                        safe_configured.append(label)
+            except Exception:
+                safe_configured = [
+                    name for name in (configured or [])
+                    if str(name) in posture.READONLY_TOOL_NAMES
+                ]
+            configured = safe_configured
+        descriptive = (agent or {}).get("advertised_capabilities") or []
+        return protocol.skills_from_toolsets(list(configured or []) + list(descriptive))
 
     # ── Pending reply plumbing ────────────────────────────────────────────
 
-    def _add_pending(self, task_id: str, context_id: str) -> Future:
+    def _add_pending(
+        self, task_id: str, context_id: str, *, peer: str = "", agent_slug: str = "",
+    ) -> Future:
         fut: Future = Future()
+        scope = (str(peer), str(agent_slug), str(context_id))
         with self._pending_lock:
-            self._pending[task_id] = (context_id, fut)
-            self._pending_order.setdefault(context_id, deque()).append(task_id)
+            self._pending[task_id] = (scope, fut)
+            self._pending_order.setdefault(scope, deque()).append(task_id)
         return fut
 
     def _pop_pending(self, task_id: str) -> None:
@@ -728,9 +926,12 @@ class A2AAdapter(BasePlatformAdapter):
                 return True
         return False
 
-    def _resolve_oldest_for_context(self, context_id: str, state: str, text: str) -> bool:
+    def _resolve_oldest_for_scope(
+        self, peer: str, agent_slug: str, context_id: str, state: str, text: str,
+    ) -> bool:
+        scope = (str(peer), str(agent_slug), str(context_id))
         with self._pending_lock:
-            for task_id in self._pending_order.get(context_id, ()):
+            for task_id in self._pending_order.get(scope, ()):
                 entry = self._pending.get(task_id)
                 if entry and not entry[1].done():
                     entry[1].set_result((state, text))
@@ -738,7 +939,14 @@ class A2AAdapter(BasePlatformAdapter):
         return False
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
-        agent = agent or self._agents[""]
+        if agent is None:
+            agent = self._agents[""]
+        if (
+            not isinstance(agent, dict)
+            or "slug" not in agent
+            or not isinstance(agent.get("slug"), str)
+        ):
+            raise ValueError("invalid served A2A agent route")
         return str(agent.get("slug") or ""), str(agent.get("tenant") or "")
 
     def _forward_lock(self, profile: str) -> threading.Lock:
@@ -751,17 +959,180 @@ class A2AAdapter(BasePlatformAdapter):
 
     # ── Inbound task handling ─────────────────────────────────────────────
 
-    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
+    def _prepare_task(
+        self,
+        params: dict,
+        peer: str,
+        agent: Optional[dict] = None,
+        *,
+        credential_authenticated: bool = False,
+    ) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message.
 
         Returns (terminal_task, None) when the task ends immediately
         (rejected / not ready), else (None, pending) where pending carries
         the future the caller must wait on. Runs on an HTTP worker thread.
         """
-        agent = agent or self._agents[""]
-        text = protocol.extract_text(params)
-        context_id = protocol.extract_context_id(params) or protocol.new_context_id()
+        if agent is None:
+            agent = self._agents[""]
+        if (
+            not isinstance(agent, dict)
+            or "slug" not in agent
+            or not isinstance(agent.get("slug"), str)
+        ):
+            return protocol.build_task(
+                task_id=protocol.new_task_id(),
+                context_id=protocol.extract_context_id(params) or protocol.new_context_id(),
+                state=protocol.STATE_REJECTED,
+                agent_text="invalid served A2A agent route",
+            ), None
+        if not security.is_trusted_peer(peer):
+            return protocol.build_task(
+                task_id=protocol.new_task_id(),
+                context_id=protocol.extract_context_id(params) or protocol.new_context_id(),
+                state=protocol.STATE_REJECTED,
+                agent_text=f"peer '{peer}' is not globally trusted",
+            ), None
+        # Keep the route boundary inside the task primitive as well as the
+        # HTTP handler. Direct/internal callers must not bypass a served
+        # agent's peer allowlist or create any task/audit/session side effect.
+        if not security.is_authorized_for_agent(peer, agent):
+            return protocol.build_task(
+                task_id=protocol.new_task_id(),
+                context_id=protocol.extract_context_id(params) or protocol.new_context_id(),
+                state=protocol.STATE_REJECTED,
+                agent_text=f"peer '{peer}' is not authorized for this served agent",
+            ), None
+        request = posture.parse_mutation_request(params)
+        context_from_peer = protocol.extract_context_id(params)
+        context_id = context_from_peer or protocol.new_context_id()
         task_id = protocol.new_task_id()
+
+        # This is intentionally before anti-loop tracking, audit, persistence,
+        # and TaskStore.create: malformed/conflicting posture is rejected with
+        # no observable bookkeeping side effect.
+        if request.error:
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_REJECTED, request.error,
+            ), None
+
+        mutable_toolsets = tuple(agent.get("mutable_toolsets") or ())
+        slug = str(agent.get("slug") or "")
+        allowed_peers = {
+            str(value).strip()
+            for value in (agent.get("mutation_allowed_peers") or ())
+            if str(value).strip()
+        }
+        trusted = str(peer) in allowed_peers
+        mutable = posture.effective_mutation(
+            requested=request.requested,
+            credential_authenticated=credential_authenticated,
+            trusted_peer=trusted,
+            mutable_toolsets=mutable_toolsets,
+        )
+        if request.requested and not mutable:
+            # A mutation marker is an explicit request, so do not silently
+            # downgrade an unauthorized caller into an apparently successful
+            # read-only task.  Reject before anti-loop/audit/persistence.
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_REJECTED,
+                "mutation posture requires credential authentication, served-agent peer authorization, and explicit mutable toolsets.",
+            ), None
+        # A genuinely new context may establish a mutable binding. A context
+        # with prior durable conversation/task evidence but no binding is a
+        # restart/corruption case and must fall back read-only.
+        # Resolve route toolsets against the same pre-Tool-Search catalog used
+        # by agent construction, so the binding fingerprints concrete tool
+        # names rather than policy labels such as ``filesystem``.
+        available_names = set(agent.get("mutable_tool_names") or ())
+        catalog_loaded = False
+        try:
+            from model_tools import get_tool_definitions
+            catalog = get_tool_definitions(
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            ) or []
+            catalog_loaded = True
+            available_names.update(
+                td.get("function", {}).get("name")
+                for td in catalog
+                if isinstance(td, dict) and isinstance(td.get("function"), dict)
+            )
+        except Exception:
+            pass
+        # If schema assembly was unavailable, retain the closed policy names;
+        # otherwise bind only the concrete names that actually assembled.
+        if not catalog_loaded:
+            available_names.update(posture.READONLY_TOOL_NAMES)
+            available_names.update(mutable_toolsets)
+        mutable_names = posture.resolve_mutable_names(mutable_toolsets, available_names)
+        requested_allowed = posture.allowed_tool_names(mutable, mutable_names)
+        allowed = frozenset(requested_allowed & available_names)
+        binding = posture.make_binding(
+            peer, slug, context_id, allowed, mutation_enabled=mutable,
+        )
+        # Peer is part of the immutable binding value, not the lookup key;
+        # otherwise a second peer could establish a parallel binding for the
+        # same served context instead of triggering a mismatch rejection.
+        binding_key = (slug, context_id)
+        context_preexisted = False
+        if context_from_peer:
+            try:
+                context_preexisted = bool(protocol.load_conversation(
+                    context_id, limit=1, peer=peer, agent_slug=slug,
+                ))
+            except Exception:
+                context_preexisted = True
+            if not context_preexisted:
+                try:
+                    prior_tasks, _ = self.tasks.list(
+                        context_id=context_id,
+                        page_size=1,
+                        agent_slug=self._scope_for_agent(agent)[0],
+                        tenant=self._scope_for_agent(agent)[1],
+                    )
+                    context_preexisted = bool(prior_tasks)
+                except Exception:
+                    context_preexisted = True
+        status, persisted_binding = posture.claim_persisted_binding(
+            slug,
+            context_id,
+            binding,
+            create_if_missing=not context_preexisted,
+        )
+        if status == "mismatch":
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_REJECTED,
+                "A2A context posture binding mismatch; start a new context.",
+            ), None
+        if status == "missing":
+            mutable = False
+            # A pre-existing transcript without an ownership binding cannot
+            # safely expose history to whichever peer arrives next.
+            allowed = frozenset(
+                available_names
+                & (posture.READONLY_TOOL_NAMES - {"a2a_history", "a2a_list"})
+            )
+            binding = posture.make_binding(
+                peer, slug, context_id, allowed, mutation_enabled=False,
+            )
+        elif status in {"corrupt", "error"}:
+            # Storage uncertainty never preserves mutable authority. Continue
+            # only on the closed read-only surface; do not overwrite corrupt
+            # evidence or pretend the binding became durable.
+            mutable = False
+            allowed = frozenset(
+                available_names
+                & (posture.READONLY_TOOL_NAMES - {"a2a_history", "a2a_list"})
+            )
+            binding = posture.make_binding(
+                peer, slug, context_id, allowed, mutation_enabled=False,
+            )
+        elif persisted_binding is not None:
+            binding = persisted_binding
+        with self._posture_lock:
+            self._posture_bindings[binding_key] = binding
+        text = protocol.extract_text(params)
 
         # Anti-loop ping-pong protection
         turn = self._turns.track(context_id)
@@ -789,16 +1160,30 @@ class A2AAdapter(BasePlatformAdapter):
 
         framed = security.wrap_inbound(peer, text)
         security.audit("inbound", peer, task_id, text)
-        protocol.persist_message(context_id, "user", text, task_id)
+        protocol.persist_message(
+            context_id, "user", text, task_id, peer=peer, agent_slug=slug,
+        )
         protocol.metrics.inbound_total += 1
 
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-        self._register_inline_push(task_id, params, agent=agent)
+        self._register_inline_push(task_id, params, agent=agent, peer=peer)
 
         if not agent.get("local", True):
-            reply, state = self._forward_to_profile(agent, peer, context_id, framed, task_id=task_id)
+            reply, state = self._forward_to_profile(
+                agent, peer, context_id, framed, task_id=task_id,
+                posture_policy={
+                    "authenticated": True,
+                    "served_agent_slug": slug,
+                    "context_id": context_id,
+                    "mutation_enabled": mutable,
+                    "allowed_tool_names": sorted(allowed),
+                    "binding": binding,
+                },
+            )
             self.tasks.complete(task_id, state, reply)
-            protocol.persist_message(context_id, "agent", reply, task_id)
+            protocol.persist_message(
+                context_id, "agent", reply, task_id, peer=peer, agent_slug=slug,
+            )
             security.audit("outbound", peer, task_id, reply)
             if state == protocol.STATE_COMPLETED:
                 protocol.metrics.outbound_total += 1
@@ -817,19 +1202,45 @@ class A2AAdapter(BasePlatformAdapter):
                 created_at=rec["created_iso"],
             ), None
 
-        fut = self._add_pending(task_id, context_id)
+        fut = self._add_pending(
+            task_id, context_id, peer=peer, agent_slug=slug,
+        )
 
+        source = self.build_source(
+            chat_id=context_id,
+            chat_name=f"a2a:{peer}",
+            chat_type="dm",
+            user_id=peer,
+            user_name=peer,
+        )
+        source = replace(
+            source,
+            a2a_mutation_requested=request.requested,
+            a2a_mutation_enabled=mutable,
+            a2a_credential_authenticated=credential_authenticated,
+            a2a_peer_trusted=trusted,
+            a2a_peer=str(peer),
+            a2a_agent_slug=slug,
+            a2a_context_id=context_id,
+            a2a_mutable_toolsets=mutable_toolsets,
+            a2a_allowed_tool_names=tuple(sorted(allowed)),
+            a2a_binding=binding,
+            a2a_toolset_fingerprint=binding["toolset_fingerprint"],
+        )
+        source = self._stamp_ingress_source(source)
         event = MessageEvent(
             text=framed,
             message_type=MessageType.TEXT,
-            source=self.build_source(
-                chat_id=context_id,
-                chat_name=f"a2a:{peer}",
-                chat_type="dm",
-                user_id=peer,
-                user_name=peer,
-            ),
+            source=source,
             message_id=task_id,
+            metadata={
+                "hermes.ai/mutationAllowed": request.requested,
+                "a2a_posture": {
+                    "mutation_enabled": mutable,
+                    "allowed_tool_names": sorted(allowed),
+                    "binding": binding,
+                },
+            },
         )
 
         try:
@@ -849,6 +1260,7 @@ class A2AAdapter(BasePlatformAdapter):
             "task_id": task_id,
             "context_id": context_id,
             "peer": peer,
+            "agent_slug": slug,
             "future": fut,
             "created_iso": rec["created_iso"],
             "started": time.time(),
@@ -1086,7 +1498,8 @@ class A2AAdapter(BasePlatformAdapter):
         return f"[profile {slug} failed rc={returncode}{detail}]"
 
     def _forward_to_profile(
-        self, agent: dict, peer: str, context_id: str, framed_text: str, task_id: str = ""
+        self, agent: dict, peer: str, context_id: str, framed_text: str, task_id: str = "",
+        posture_policy: Optional[dict] = None,
     ) -> tuple[str, str]:
         """Forward a routed A2A task to another local Hermes profile.
 
@@ -1099,7 +1512,9 @@ class A2AAdapter(BasePlatformAdapter):
         slug = str(agent.get("slug") or profile or "agent")
         safe_ctx = _safe_context_slug(context_id)
         session_title = f"a2a-{slug}-{safe_ctx}"
-        key = (profile or "default", slug, safe_ctx)
+        # Cache identity uses the raw context id; the sanitized title is only
+        # presentation and may never merge distinct remote contexts.
+        key = (profile or "default", slug, str(context_id))
         timeout = int(agent.get("timeout") or _reply_timeout())
 
         lock = self._forward_lock(profile or "default")
@@ -1127,10 +1542,23 @@ class A2AAdapter(BasePlatformAdapter):
                 cmd.extend(["--resume", session_id])
 
             env = os.environ.copy()
+            # A forwarded child must not inherit dispatcher/task injection
+            # capability from the parent process.
+            for key in list(env):
+                if key.startswith("HERMES_KANBAN_"):
+                    env.pop(key, None)
             home = _profile_home(profile)
             if home:
                 env["HERMES_HOME"] = home
-            env["HERMES_A2A_PEER"] = peer
+            env["HERMES_SESSION_SOURCE"] = "a2a"
+            env.pop(posture.CHILD_POLICY_ENV, None)
+            if posture_policy is not None:
+                # Dedicated structured policy channel; unlike the historical
+                # peer hint this carries an issuer-authenticated bound surface.
+                signed_policy = posture.sign_child_policy(posture_policy)
+                env[posture.CHILD_POLICY_ENV] = json.dumps(
+                    signed_policy, sort_keys=True, separators=(",", ":")
+                )
             start = time.time()
             try:
                 returncode, stdout, stderr = self._run_profile_command(cmd, timeout, env)
@@ -1200,6 +1628,7 @@ class A2AAdapter(BasePlatformAdapter):
         task_id = pending["task_id"]
         context_id = pending["context_id"]
         peer = pending["peer"]
+        agent_slug = pending.get("agent_slug", "")
         self._pop_pending(task_id)
 
         reply = security.redact_outbound(reply or "")
@@ -1212,7 +1641,10 @@ class A2AAdapter(BasePlatformAdapter):
                 state = protocol.STATE_INPUT_REQUIRED
                 reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
 
-        protocol.persist_message(context_id, "agent", reply, task_id)
+        protocol.persist_message(
+            context_id, "agent", reply, task_id,
+            peer=peer, agent_slug=agent_slug,
+        )
         security.audit("outbound", peer, task_id, reply)
 
         if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
@@ -1249,8 +1681,14 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 return (protocol.STATE_FAILED, "[agent did not reply in time]")
 
-    def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
-        terminal, pending = self._prepare_task(params, peer, agent=agent)
+    def _rpc_message_send(
+        self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None,
+        v1_response: bool = False, *, credential_authenticated: bool = False,
+    ) -> dict:
+        terminal, pending = self._prepare_task(
+            params, peer, agent=agent,
+            credential_authenticated=credential_authenticated,
+        )
         if terminal is not None:
             result = protocol.send_message_response(terminal) if v1_response else terminal
             return protocol.jsonrpc_result(req_id, result)
@@ -1296,14 +1734,20 @@ class A2AAdapter(BasePlatformAdapter):
                 protocol.status_update(task_id, context_id, state, reply), req_id))
         self._sse_write(handler, protocol.sse_done())
 
-    def _rpc_message_stream(self, handler, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None) -> None:
+    def _rpc_message_stream(
+        self, handler, req_id: Any, params: dict, peer: str,
+        agent: Optional[dict] = None, *, credential_authenticated: bool = False,
+    ) -> None:
         """Handle message/stream as an SSE response of JSON-RPC-wrapped
         StreamResponse events (A2A v1.0 §9.4)."""
         protocol.metrics.streams_started += 1
         self._sse_headers(handler)
 
         try:
-            terminal, pending = self._prepare_task(params, peer, agent=agent)
+            terminal, pending = self._prepare_task(
+                params, peer, agent=agent,
+                credential_authenticated=credential_authenticated,
+            )
             if terminal is not None:
                 self._emit_terminal(
                     handler, terminal["id"], terminal["contextId"],
@@ -1327,10 +1771,11 @@ class A2AAdapter(BasePlatformAdapter):
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: stream client disconnected")
 
-    def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
+    def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> None:
         """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
         task_id = str(params.get("taskId") or params.get("id") or "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+        scope = self._scope_for_agent(agent)
+        rec = self.tasks.get(task_id, *scope, peer)
         if not rec:
             handler._json(200, protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}"))
@@ -1338,7 +1783,7 @@ class A2AAdapter(BasePlatformAdapter):
 
         self._sse_headers(handler)
         try:
-            fut = self.tasks.watch(task_id, *self._scope_for_agent(agent))
+            fut = self.tasks.watch(task_id, *scope, peer)
             if fut is None:
                 self._sse_write(handler, protocol.sse_done())
                 return
@@ -1358,9 +1803,9 @@ class A2AAdapter(BasePlatformAdapter):
 
     # ── Task queries ──────────────────────────────────────────────────────
 
-    def _rpc_tasks_get(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_tasks_get(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
         task_id = str(params.get("taskId") or params.get("id") or "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+        rec = self.tasks.get(task_id, *self._scope_for_agent(agent), peer)
         if not rec:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
@@ -1371,7 +1816,7 @@ class A2AAdapter(BasePlatformAdapter):
             history_len = None
         return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec, history_length=history_len))
 
-    def _rpc_tasks_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_tasks_list(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
         try:
             offset = int(params.get("pageToken") or 0)
         except (ValueError, TypeError):
@@ -1387,6 +1832,7 @@ class A2AAdapter(BasePlatformAdapter):
             offset=max(0, offset),
             agent_slug=self._scope_for_agent(agent)[0],
             tenant=self._scope_for_agent(agent)[1],
+            peer=peer,
             with_total=True,
         )
         include_artifacts = bool(params.get("includeArtifacts", False))
@@ -1402,9 +1848,9 @@ class A2AAdapter(BasePlatformAdapter):
             "totalSize": total,
         })
 
-    def _rpc_tasks_cancel(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_tasks_cancel(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
         task_id = str(params.get("taskId") or params.get("id") or "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+        rec = self.tasks.get(task_id, *self._scope_for_agent(agent), peer)
         if not rec:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
@@ -1415,21 +1861,21 @@ class A2AAdapter(BasePlatformAdapter):
         self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
         self._turns.reset(rec["context_id"])
         self._resolve_task(task_id, protocol.STATE_CANCELED, "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
+        rec = self.tasks.get(task_id, *self._scope_for_agent(agent), peer) or rec
         return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec))
 
     # ── Push notifications ────────────────────────────────────────────────
 
-    def _register_inline_push(self, task_id: str, params: dict, agent: Optional[dict] = None) -> None:
+    def _register_inline_push(self, task_id: str, params: dict, agent: Optional[dict] = None, peer: str = "") -> None:
         """v1.0: message/send can carry configuration.taskPushNotificationConfig."""
         cfg = (params.get("configuration") or {}).get("taskPushNotificationConfig") or {}
         if not isinstance(cfg, dict):
             return
         url = cfg.get("url") or (cfg.get("pushNotificationConfig") or {}).get("url") or ""
         if url:
-            self.tasks.set_push_config(task_id, str(url), *self._scope_for_agent(agent))
+            self.tasks.set_push_config(task_id, str(url), *self._scope_for_agent(agent), peer)
 
-    def _rpc_push_config_create(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_create(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
         task_id = str(params.get("taskId") or "")
         cfg = params.get("pushNotificationConfig") or params.get("config") or {}
         url = str((cfg or {}).get("url") or "")
@@ -1437,43 +1883,43 @@ class A2AAdapter(BasePlatformAdapter):
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_INVALID_PARAMS,
                 "taskId and pushNotificationConfig.url required")
-        stored = self.tasks.set_push_config(task_id, url, *self._scope_for_agent(agent))
+        stored = self.tasks.set_push_config(task_id, url, *self._scope_for_agent(agent), peer)
         if stored is None:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
         return protocol.jsonrpc_result(req_id, stored)
 
-    def _rpc_push_config_get(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_get(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
         """GetTaskPushNotificationConfig — retrieve a push config by task id."""
         task_id = str(params.get("taskId") or "")
         config_id = str(params.get("id") or params.get("configId") or "")
         if not task_id:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_INVALID_PARAMS, "taskId required")
-        cfg = self.tasks.get_push_config(task_id, config_id, *self._scope_for_agent(agent))
+        cfg = self.tasks.get_push_config(task_id, config_id, *self._scope_for_agent(agent), peer)
         if cfg is None:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND,
                 f"push config not found for task: {task_id}")
         return protocol.jsonrpc_result(req_id, cfg)
 
-    def _rpc_push_config_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_list(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
         """ListTaskPushNotificationConfigs — list push configs for a task."""
         task_id = str(params.get("taskId") or "")
         if not task_id:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_INVALID_PARAMS, "taskId required")
-        configs = self.tasks.list_push_configs(task_id, *self._scope_for_agent(agent))
+        configs = self.tasks.list_push_configs(task_id, *self._scope_for_agent(agent), peer)
         return protocol.jsonrpc_result(req_id, {"configs": configs, "nextPageToken": ""})
 
-    def _rpc_push_config_delete(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_delete(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
         """DeleteTaskPushNotificationConfig — remove a push config."""
         task_id = str(params.get("taskId") or "")
         config_id = str(params.get("id") or params.get("configId") or "")
         if not task_id:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_INVALID_PARAMS, "taskId required")
-        deleted = self.tasks.delete_push_config(task_id, config_id, *self._scope_for_agent(agent))
+        deleted = self.tasks.delete_push_config(task_id, config_id, *self._scope_for_agent(agent), peer)
         if not deleted:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND,
@@ -1498,7 +1944,9 @@ class A2AAdapter(BasePlatformAdapter):
             return
 
         # Push payload uses the StreamResponse format (same as streaming).
-        payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
+        payload = protocol.status_update(
+            task_id, context_id, state, security.redact_outbound(reply or "")[:2000],
+        )
 
         signature = security.sign_push_payload(payload)
         headers = {"Content-Type": "application/json"}
@@ -1530,9 +1978,9 @@ class A2AAdapter(BasePlatformAdapter):
     ):
         """Fulfil the pending reply Future for this context.
 
-        ``chat_id`` is the A2A context id we set as the source chat_id; the
-        oldest outstanding task for that context receives the reply (the
-        gateway session processes messages in order).
+        ``chat_id`` is the A2A context id we set as the source chat_id. Reply
+        metadata must also carry the immutable peer + served-route scope; the
+        oldest outstanding task in that exact scope receives the reply.
 
         The gateway marks final user-visible replies with ``metadata['notify']``
         (see ``_mark_notify_metadata`` in gateway.platforms.base — this is the
@@ -1544,9 +1992,24 @@ class A2AAdapter(BasePlatformAdapter):
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
             return SendResult(success=True, message_id=message_id)
-        if not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
+        meta = metadata or {}
+        peer = meta.get("a2a_peer")
+        agent_slug = meta.get("a2a_agent_slug")
+        bound_context = meta.get("a2a_context_id")
+        if (
+            not isinstance(peer, str)
+            or not isinstance(agent_slug, str)
+            or not isinstance(bound_context, str)
+            or bound_context != str(chat_id)
+        ):
+            logger.warning("A2A: dropping final send without exact reply scope")
+            return SendResult(success=False, error="missing or mismatched A2A reply scope")
+        if not self._resolve_oldest_for_scope(
+            peer, agent_slug, bound_context,
+            protocol.STATE_COMPLETED, content or "",
+        ):
             # No waiter (e.g. a late chunk or out-of-band send) — drop it.
-            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+            logger.debug("A2A: send() for scope %r had no pending waiter", (peer, agent_slug, bound_context))
         return SendResult(success=True, message_id=message_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:

@@ -279,6 +279,17 @@ class GatewayAuthorizationMixin:
                 return adapter
         return None
 
+    def _validate_a2a_ingress_source(self, source: SessionSource) -> bool:
+        """Require a capability minted by the live registered A2A adapter."""
+        adapter = self._registered_transport_adapter(source)
+        validator = getattr(adapter, "_validate_ingress_source", None)
+        if not callable(validator):
+            return False
+        try:
+            return bool(validator(source))
+        except Exception:
+            return False
+
     def _adapter_profile_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the transport-owning profile for adapter policy lookups."""
         adapter = self._registered_transport_adapter(source)

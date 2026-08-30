@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import copy
+import hashlib
 import os
 import threading
 import time
@@ -590,7 +591,9 @@ class TaskStore:
         self._lock = threading.Lock()
 
     @staticmethod
-    def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "") -> bool:
+    def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "", peer: str = "") -> bool:
+        if peer and rec.get("peer", "") != peer:
+            return False
         if agent_slug and rec.get("agent_slug", "") != agent_slug:
             return False
         if tenant and rec.get("tenant", "") != tenant:
@@ -623,11 +626,11 @@ class TaskStore:
                 rec["state"] = state
 
     def set_push_config(self, task_id: str, url: str,
-                        agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+                        agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant):
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer):
                 return None
             rec["push_url"] = url
             rec["push_config_id"] = "cfg-" + uuid.uuid4().hex[:12]
@@ -644,27 +647,27 @@ class TaskStore:
         }
 
     def get_push_config(self, task_id: str, config_id: str = "",
-                        agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+                        agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant) or not rec.get("push_url"):
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
                 return None
             if config_id and rec.get("push_config_id") != config_id:
                 return None
             return self._push_config_view(rec)
 
-    def list_push_configs(self, task_id: str, agent_slug: str = "", tenant: str = "") -> list[dict]:
+    def list_push_configs(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> list[dict]:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant) or not rec.get("push_url"):
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
                 return []
             return [self._push_config_view(rec)]
 
     def delete_push_config(self, task_id: str, config_id: str = "",
-                           agent_slug: str = "", tenant: str = "") -> bool:
+                           agent_slug: str = "", tenant: str = "", peer: str = "") -> bool:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant) or not rec.get("push_url"):
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
                 return False
             if config_id and rec.get("push_config_id") != config_id:
                 return False
@@ -680,10 +683,10 @@ class TaskStore:
             url, rec["push_url"] = rec["push_url"], ""
             return url
 
-    def get(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def get(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant):
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer):
                 return None
             return dict(rec)
 
@@ -705,10 +708,10 @@ class TaskStore:
                 fut.set_result((state, reply))
         return out
 
-    def watch(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[Future]:
+    def watch(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[Future]:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant):
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer):
                 return None
             fut: Future = Future()
             if rec["state"] in TERMINAL_STATES:
@@ -725,6 +728,7 @@ class TaskStore:
         offset: int = 0,
         agent_slug: str = "",
         tenant: str = "",
+        peer: str = "",
         with_total: bool = False,
     ):
         """Filtered task page (newest first).
@@ -735,8 +739,8 @@ class TaskStore:
         page_size = max(1, min(int(page_size or 50), 100))
         with self._lock:
             recs = [dict(r) for r in reversed(self._tasks.values())]
-        if agent_slug or tenant:
-            recs = [r for r in recs if self._in_scope(r, agent_slug, tenant)]
+        if agent_slug or tenant or peer:
+            recs = [r for r in recs if self._in_scope(r, agent_slug, tenant, peer)]
         if context_id:
             recs = [r for r in recs if r["context_id"] == context_id]
         if state:
@@ -788,11 +792,16 @@ class TaskStore:
     @staticmethod
     def to_task(rec: dict, history_length: Optional[int] = None, include_artifacts: bool = True) -> dict:
         """Render a stored record as an A2A v1.0 Task object."""
+        try:
+            from .security import redact_outbound
+            safe_reply = redact_outbound(rec.get("reply", ""))
+        except Exception:
+            safe_reply = "[redacted]"
         task = build_task(
             rec["task_id"],
             rec["context_id"],
             rec["state"],
-            rec.get("reply", ""),
+            safe_reply,
             created_at=rec.get("created_iso", ""),
         )
         if not include_artifacts:
@@ -818,42 +827,172 @@ def _safe_name(context_id: str) -> str:
     return "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
 
 
-def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
+def _conversation_path(context_id: str, peer: str = "", agent_slug: str = "") -> Path:
+    """Return the collision-resistant v2 path for one exact scoped context."""
+    identity = json.dumps(
+        {
+            "agent_slug": str(agent_slug),
+            "context_id": str(context_id),
+            "peer": str(peer),
+            "version": 2,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return _conv_dir() / f"v2-{digest}.jsonl"
+
+
+def persist_message(
+    context_id: str,
+    role: str,
+    text: str,
+    task_id: str = "",
+    *,
+    peer: str = "",
+    agent_slug: str = "",
+) -> None:
     """Append one message to the context's on-disk conversation log."""
     try:
         d = _conv_dir()
         d.mkdir(parents=True, exist_ok=True)
-        rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
-        with (d / f"{_safe_name(context_id)}.jsonl").open("a", encoding="utf-8") as fh:
+        rec = {
+            "version": 2,
+            "context_id": str(context_id),
+            "peer": str(peer),
+            "agent_slug": str(agent_slug),
+            "ts": time.time(),
+            "role": role,
+            "text": text,
+            "task_id": task_id,
+        }
+        with _conversation_path(context_id, peer, agent_slug).open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
 
-def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
-    """Load the last *limit* messages for a context (empty list if none)."""
-    path = _conv_dir() / f"{_safe_name(context_id)}.jsonl"
-    if not path.exists():
-        return []
+def _load_v2_file(path: Path, context_id: str, peer: str, agent_slug: str) -> list[dict]:
     out: list[dict] = []
     try:
         with path.open("r", encoding="utf-8") as fh:
             for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
                 try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
                     continue
+                if (
+                    isinstance(rec, dict)
+                    and rec.get("version") == 2
+                    and rec.get("context_id") == context_id
+                    and rec.get("peer", "") == peer
+                    and rec.get("agent_slug", "") == agent_slug
+                ):
+                    out.append(rec)
+    except Exception:
+        return []
+    return out
+
+
+def load_conversation(
+    context_id: str,
+    limit: int = 50,
+    *,
+    peer: str | None = None,
+    agent_slug: str | None = None,
+) -> list[dict]:
+    """Load the last *limit* messages for a context (empty list if none)."""
+    context_id = str(context_id)
+    if peer is not None or agent_slug is not None:
+        peer_value = str(peer or "")
+        slug_value = str(agent_slug or "")
+        return _load_v2_file(
+            _conversation_path(context_id, peer_value, slug_value),
+            context_id,
+            peer_value,
+            slug_value,
+        )[-limit:]
+
+    # Local/operator callers may resolve a context only when it maps to one
+    # unambiguous v2 scope. Never merge same-ID conversations across peers or
+    # served routes.
+    matches: list[list[dict]] = []
+    d = _conv_dir()
+    if d.exists():
+        for path in d.glob("v2-*.jsonl"):
+            try:
+                first = next(
+                    (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()),
+                    None,
+                )
+            except Exception:
+                first = None
+            if not isinstance(first, dict) or first.get("context_id") != context_id:
+                continue
+            rows = _load_v2_file(
+                path,
+                context_id,
+                str(first.get("peer", "")),
+                str(first.get("agent_slug", "")),
+            )
+            if rows:
+                matches.append(rows)
+    if len(matches) == 1:
+        return matches[0][-limit:]
+    if len(matches) > 1:
+        return []
+
+    # Legacy files did not record the original context ID. Only an unchanged,
+    # already-safe ID can be mapped without guessing; scoped remote reads never
+    # use this fallback.
+    if _safe_name(context_id) != context_id:
+        return []
+    legacy = d / f"{context_id}.jsonl"
+    if not legacy.exists():
+        return []
+    out: list[dict] = []
+    try:
+        with legacy.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
     except Exception:
         return []
     return out[-limit:]
 
 
-def list_conversations() -> list[str]:
+def list_conversations(
+    *, peer: str | None = None, agent_slug: str | None = None,
+) -> list[str]:
     """Return known context-ids that have persisted conversations."""
     d = _conv_dir()
     if not d.exists():
         return []
-    return sorted(p.stem for p in d.glob("*.jsonl"))
+    contexts: set[str] = set()
+    for path in d.glob("v2-*.jsonl"):
+        try:
+            first = next(
+                (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()),
+                None,
+            )
+        except Exception:
+            continue
+        if not isinstance(first, dict) or first.get("version") != 2:
+            continue
+        if peer is not None and first.get("peer", "") != str(peer):
+            continue
+        if agent_slug is not None and first.get("agent_slug", "") != str(agent_slug):
+            continue
+        context_id = first.get("context_id")
+        if isinstance(context_id, str) and context_id:
+            contexts.add(context_id)
+    if peer is None and agent_slug is None:
+        contexts.update(
+            p.stem for p in d.glob("*.jsonl")
+            if not p.name.startswith("v2-") and _safe_name(p.stem) == p.stem
+        )
+    return sorted(contexts)
