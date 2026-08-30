@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -270,6 +271,12 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
     TUI/desktop, ACP) gets identical behavior without each one re-implementing
     the call. Fully defensive: titling is cosmetic and must never break a turn.
     """
+    # Routed A2A work runs through a CLI subprocess, but the adapter already
+    # assigns its stable ``a2a-<slug>-<context>`` title after the run. Avoid a
+    # cosmetic side-LLM call that can contend with the owner's actual reply.
+    if os.getenv("HERMES_A2A_PEER", "").strip():
+        return
+
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if not session_db or not session_id:

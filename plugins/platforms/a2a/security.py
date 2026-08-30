@@ -83,6 +83,12 @@ def authenticate(auth_header: Optional[str], client_ip: str = "") -> Optional[st
     - Token matches the shared A2A_BEARER_TOKEN: identity is ``ip:<addr>``.
     - Otherwise: None (reject with 401).
 
+    NOTE: this only proves the caller holds *some* valid peer credential. It
+    does NOT bind the identity to the URL path being addressed — that is the
+    job of ``authorize_for_agent``. Callers that route to a non-default
+    served agent MUST invoke ``authorize_for_agent`` instead, otherwise any
+    peer can impersonate any other peer by hitting a different path.
+
     Comparisons are constant-time (hmac.compare_digest).
     """
     peer_tokens = get_peer_tokens()
@@ -98,6 +104,50 @@ def authenticate(auth_header: Optional[str], client_ip: str = "") -> Optional[st
     if shared and hmac.compare_digest(presented, shared):
         return f"ip:{client_ip or 'unknown'}"
     return None
+
+
+def authorize_for_agent(
+    auth_header: Optional[str],
+    client_ip: str,
+    agent: dict,
+) -> Optional[str]:
+    """Authenticate AND bind the identity to the addressed served agent.
+
+    Returns the authenticated identity on success, ``None`` to reject.
+
+    Binding rules (closes the "any valid peer token works on ANY slug" gap
+    found in 2026-08):
+
+    - **Default agent** (``agent['slug'] == ''``): any authenticated caller is
+      allowed. The default agent is the gateway's own profile — every peer
+      legitimately talks to it.
+    - **Named agent** (e.g. ``/meshfleet``): the authenticated identity MUST
+      equal ``agent['slug']``. A peer presenting meshfleet's token to
+      ``/theshadowlake`` is an impersonation attempt and is rejected.
+    - **Shared bearer (no per-peer map match)**: identity is ``ip:<addr>``
+      and never equals a named slug, so shared-token callers can only reach
+      the default agent.
+
+    The ``agent`` dict shape is the served-agent dict produced by
+    ``A2AAdapter._load_served_agents``: ``{"slug": str, "path": str,
+    "tenant": str, "profile": str, ...}``. Missing or empty ``slug`` is
+    treated as default.
+    """
+    identity = authenticate(auth_header, client_ip)
+    if identity is None:
+        return None
+    if not isinstance(agent, dict):
+        # Defensive: a malformed agent dict should not bypass auth binding.
+        return identity if not agent else None
+    addressed_slug = str(agent.get("slug") or "").strip()
+    if not addressed_slug:
+        # Default agent — any authenticated peer is allowed.
+        return identity
+    # Named agent: identity MUST equal the slug. The only exception is
+    # the gateway itself speaking to its own served path via the default
+    # agent (handled above). Shared-token callers (identity = "ip:...")
+    # also cannot impersonate a named peer.
+    return identity if identity == addressed_slug else None
 
 
 def localhost_only() -> bool:
