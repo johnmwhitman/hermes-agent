@@ -70,6 +70,8 @@ class UpdatePlan:
     expected_version: Optional[str] = None
     profiles: list = field(default_factory=list)
     runtimes: list = field(default_factory=list)  # list[RuntimeRecord]
+    inventory_complete: bool = True
+    inventory_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -78,6 +80,36 @@ class UpdatePlan:
             for r in self.runtimes
         ]
         return payload
+
+
+@dataclass(frozen=True)
+class ParsedBackendCommand:
+    """Non-secret command shape for a Hermes HTTP backend process."""
+
+    kind: str
+    profile: Optional[str]
+    port: int
+    source_hint: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ProcessMetadata:
+    """Sanitized process metadata retained by the inventory probe."""
+
+    pid: int
+    argv: list[str]
+    hermes_desktop: bool = False
+    hermes_home: Optional[str] = None
+    pythonpath: Optional[str] = None
+
+
+@dataclass
+class ProcessScanResult:
+    """Process rows plus whether the OS process table was fully readable."""
+
+    rows: list[ProcessMetadata] = field(default_factory=list)
+    complete: bool = True
+    warnings: list[str] = field(default_factory=list)
 
 
 def _detect_supervisor_for_pid(
@@ -138,19 +170,42 @@ def describe_restart_mechanism(mechanism: str, profile: str) -> str:
         return "sc.exe stop before venv mutation, sc.exe start after update"
     if mechanism == "respawn-argv":
         return "stop before code swap, relaunch with recorded launch args"
+    if mechanism == "manual-process":
+        return "restart the Hermes HTTP backend process manually"
     if profile != "default":
         return f"hermes -p {profile} gateway restart"
     return "hermes gateway restart"
 
 
-def _parse_desktop_serve_argv(argv: list[str]) -> Optional[tuple[str, str]]:
-    """Return ``(profile, executable)`` for Desktop's tokenized serve argv."""
-    if len(argv) < 4:
+def _parse_desktop_serve_argv(argv: list[str]) -> Optional[ParsedBackendCommand]:
+    """Parse a supported ephemeral Hermes backend command.
+
+    Parsing identifies command shape only.  It deliberately does *not* infer
+    Desktop ownership from ``--port 0``; the collector requires independent
+    process ownership evidence before assigning the Desktop supervisor.
+    """
+    if len(argv) < 2:
         return None
 
-    executable = argv[0]
+    source_hint: Optional[str] = None
     if len(argv) >= 3 and argv[1:3] == ["-m", "hermes_cli.main"]:
         cli_argv = argv[3:]
+    elif (
+        len(argv) >= 3
+        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", Path(argv[0]).name, re.I)
+        and (
+            Path(argv[1]).name.lower() in {"hermes", "hermes.py"}
+            or Path(argv[1]).as_posix().lower().endswith("/hermes_cli/main.py")
+        )
+    ):
+        cli_argv = argv[2:]
+        script = Path(argv[1]).expanduser()
+        if script.is_absolute():
+            source_hint = str(
+                script.parent.parent
+                if script.as_posix().lower().endswith("/hermes_cli/main.py")
+                else script.parent
+            )
     elif Path(argv[0]).name.lower() in {
         "hermes",
         "hermes.exe",
@@ -161,49 +216,59 @@ def _parse_desktop_serve_argv(argv: list[str]) -> Optional[tuple[str, str]]:
     else:
         return None
 
-    try:
-        serve_index = cli_argv.index("serve")
-    except ValueError:
-        return None
-
-    profile = "default"
-    prefix = cli_argv[:serve_index]
+    profile: Optional[str] = None
+    command_index: Optional[int] = None
     index = 0
-    while index < len(prefix):
-        token = prefix[index]
+    while index < len(cli_argv):
+        token = cli_argv[index]
+        if token in {"serve", "dashboard"}:
+            command_index = index
+            break
         if token in {"--profile", "-p"}:
-            if index + 1 >= len(prefix):
+            if index + 1 >= len(cli_argv):
                 return None
-            profile = prefix[index + 1]
+            profile = cli_argv[index + 1]
             index += 2
             continue
         if token.startswith("--profile="):
             profile = token.split("=", 1)[1]
             index += 1
             continue
-        # Desktop only places its optional profile selector before ``serve``.
+        # Desktop only places its optional profile selector before the command.
         # Reject every other token so an option value named ``serve`` cannot
         # masquerade as the subcommand.
         return None
 
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", profile or ""):
+    if command_index is None:
+        return None
+    if profile is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]*", profile
+    ):
         return None
 
     port: Optional[str] = None
-    tail = cli_argv[serve_index + 1 :]
+    tail = cli_argv[command_index + 1 :]
     for index, token in enumerate(tail):
-        if token == "--port" and index + 1 < len(tail):
+        if token == "--port":
+            if index + 1 >= len(tail):
+                return None
             port = tail[index + 1]
-            break
-        if token.startswith("--port="):
+        elif token.startswith("--port="):
             port = token.split("=", 1)[1]
-            break
     if port != "0":
         return None
-    return profile, executable
+    kind = cli_argv[command_index]
+    if kind == "dashboard" and "--no-open" not in tail:
+        return None
+    return ParsedBackendCommand(
+        kind=kind,
+        profile=profile,
+        port=0,
+        source_hint=source_hint,
+    )
 
 
-def _parse_desktop_serve_command(command: str) -> Optional[tuple[str, str]]:
+def _parse_desktop_serve_command(command: str) -> Optional[ParsedBackendCommand]:
     """Parse a display command without retaining credential-bearing argv.
 
     Desktop owns ephemeral ``serve --port 0`` workers.  Match argv structure,
@@ -219,44 +284,105 @@ def _parse_desktop_serve_command(command: str) -> Optional[tuple[str, str]]:
     return _parse_desktop_serve_argv(argv)
 
 
-def _iter_process_cmdlines() -> list[tuple[int, list[str]]]:
-    """Read live process argv through psutil; return no sensitive fields."""
-    rows: list[tuple[int, list[str]]] = []
+def _iter_process_cmdlines() -> ProcessScanResult:
+    """Read process metadata without retaining arbitrary environment values.
+
+    Any denied or failed process-table read makes the result explicitly
+    incomplete.  An update cannot claim convergence from a partial scan.
+    """
+    result = ProcessScanResult()
     try:
         import psutil
 
-        for process in psutil.process_iter(["pid", "cmdline"]):
+        for process in psutil.process_iter(["pid", "name"]):
             try:
                 info = process.info
                 pid = int(info.get("pid"))
                 if pid == os.getpid():
                     continue
-                raw_argv = info.get("cmdline") or []
+                process_name = str(info.get("name") or "")
+                if not process_name:
+                    raise RuntimeError("process name unreadable")
+                # Scope privileged argv/environment reads to executable names
+                # that can actually host a supported Hermes backend. Denial on
+                # one of these candidates is inventory uncertainty; an
+                # unrelated kernel/service process is outside this inventory.
+                if not (
+                    re.fullmatch(
+                        r"python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+                        process_name,
+                        re.I,
+                    )
+                    or process_name.lower()
+                    in {"hermes", "hermes.exe", "hermes-agent", "hermes-agent.exe"}
+                ):
+                    continue
+                # Call the accessors directly: process_iter(...).info replaces
+                # AccessDenied with None, which would turn an uncertain scan
+                # into a false "none detected" result.
+                raw_argv = process.cmdline() or []
                 if not isinstance(raw_argv, (list, tuple)):
                     continue
                 argv = [str(token) for token in raw_argv if token is not None]
-                if argv:
-                    rows.append((pid, argv))
+                if not argv or _parse_desktop_serve_argv(argv) is None:
+                    continue
+                raw_env = process.environ() or {}
+                if not isinstance(raw_env, dict):
+                    raw_env = {}
+                result.rows.append(
+                    ProcessMetadata(
+                        pid=pid,
+                        argv=argv,
+                        hermes_desktop=str(raw_env.get("HERMES_DESKTOP", "")) == "1",
+                        hermes_home=(
+                            str(raw_env["HERMES_HOME"])
+                            if raw_env.get("HERMES_HOME")
+                            else None
+                        ),
+                        pythonpath=(
+                            str(raw_env["PYTHONPATH"])
+                            if raw_env.get("PYTHONPATH")
+                            else None
+                        ),
+                    )
+                )
             except Exception:
+                result.complete = False
+                if "one or more process records were unreadable" not in result.warnings:
+                    result.warnings.append("one or more process records were unreadable")
                 continue
     except Exception as exc:
         logger.debug("Desktop serve process enumeration failed: %s", exc)
-    return rows
+        result.complete = False
+        result.warnings.append("process inventory unavailable")
+    return result
 
 
-def _runtime_root_from_executable(executable: str) -> Optional[Path]:
-    """Infer a Hermes source/install root from an absolute entrypoint path."""
+def _hermes_root(path_text: str) -> Optional[Path]:
+    """Validate an explicitly process-declared Hermes source root."""
     try:
-        path = Path(executable).expanduser()
+        path = Path(path_text).expanduser()
         if not path.is_absolute():
             return None
-        for candidate in path.parents:
-            if (candidate / "pyproject.toml").is_file() and (
-                candidate / "hermes_cli"
-            ).is_dir():
-                return candidate
+        candidate = path.resolve(strict=False)
+        if (candidate / "pyproject.toml").is_file() and (
+            candidate / "hermes_cli"
+        ).is_dir():
+            return candidate
     except (OSError, RuntimeError, ValueError):
         pass
+    return None
+
+
+def _declared_runtime_root(
+    process: ProcessMetadata, parsed: ParsedBackendCommand
+) -> Optional[Path]:
+    """Resolve identity only from a source location declared by the process."""
+    for entry in (process.pythonpath or "").split(os.pathsep):
+        if entry and (root := _hermes_root(entry)) is not None:
+            return root
+    if parsed.source_hint:
+        return _hermes_root(parsed.source_hint)
     return None
 
 
@@ -298,54 +424,81 @@ def _code_identity_for_root(root: Optional[Path]) -> dict[str, Optional[str]]:
     return identity
 
 
-def _collect_desktop_serve_runtimes(seen_pids: set[int]) -> list[RuntimeRecord]:
-    """Discover Desktop-owned serve workers through read-only process argv."""
+def _profile_from_trusted_home(
+    hermes_home: Optional[str], profile_homes: list[tuple[str, Path]]
+) -> Optional[str]:
+    if not hermes_home:
+        return None
+    try:
+        declared = Path(hermes_home).expanduser().resolve(strict=False)
+        for profile, home in profile_homes:
+            if declared == home.expanduser().resolve(strict=False):
+                return profile
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
+def _collect_desktop_serve_runtimes(
+    seen_pids: set[int], profile_homes: list[tuple[str, Path]]
+) -> tuple[list[RuntimeRecord], ProcessScanResult]:
+    """Discover ephemeral Hermes backends and their proven supervisor."""
     runtimes: list[RuntimeRecord] = []
     try:
         scanned = _iter_process_cmdlines()
     except Exception as exc:
         logger.debug("Desktop serve process scan failed: %s", exc)
-        return runtimes
+        return runtimes, ProcessScanResult(
+            complete=False, warnings=["process inventory unavailable"]
+        )
 
-    for raw_pid, argv in scanned:
+    for process in scanned.rows:
         try:
-            pid = int(raw_pid)
+            pid = int(process.pid)
             if pid in seen_pids:
                 continue
-            parsed = _parse_desktop_serve_argv(argv)
+            parsed = _parse_desktop_serve_argv(process.argv)
             if parsed is None:
                 continue
-            profile, executable = parsed
-            identity = _code_identity_for_root(
-                _runtime_root_from_executable(executable)
-            )
-            detail = {}
+            profile = parsed.profile or _profile_from_trusted_home(
+                process.hermes_home, profile_homes
+            ) or "unknown"
+            supervisor = "desktop" if process.hermes_desktop else "manual"
+            identity = _code_identity_for_root(_declared_runtime_root(process, parsed))
+            detail: dict[str, str] = {}
             if identity["source"]:
                 detail["code_identity_source"] = identity["source"]
+            if process.hermes_desktop:
+                detail["ownership_evidence"] = "desktop-env"
             runtimes.append(
                 RuntimeRecord(
-                    kind="serve",
+                    kind=parsed.kind,
                     profile=profile,
                     pid=pid,
-                    supervisor="desktop",
+                    supervisor=supervisor,
                     code_sha=identity["sha"],
                     code_version=identity["version"],
-                    restart_via=_restart_mechanism("desktop", profile),
+                    restart_via=(
+                        _restart_mechanism("desktop", profile)
+                        if supervisor == "desktop"
+                        else "manual-process"
+                    ),
                     detail=detail,
                 )
             )
             seen_pids.add(pid)
         except Exception as exc:
             logger.debug("Desktop serve inventory row failed: %s", exc)
-    return runtimes
+    return runtimes, scanned
 
 
 def collect_runtime_inventory() -> UpdatePlan:
     """Build the pre-update plan. Read-only; never raises.
 
-    Every collector degrades independently — a probe failure yields fewer
-    rows, not an exception. The result is embeddable in the update receipt
-    and printable via :func:`print_update_plan`.
+    Every collector degrades independently. Process-table uncertainty is
+    preserved explicitly rather than being mistaken for an empty inventory.
+    The result is embeddable in the update receipt and printable via
+    :func:`print_update_plan`.
     """
     plan = UpdatePlan()
 
@@ -585,11 +738,18 @@ def collect_runtime_inventory() -> UpdatePlan:
     except Exception as exc:
         logger.debug("Serve/dashboard ledger inventory failed: %s", exc)
 
-    # Desktop-supervised ``serve --port 0`` workers have no gateway PID file
-    # or gateway_state.json in older/custom launch paths. The process scan is
-    # a fallback for rows absent from the verified ledger; ``seen_pids`` keeps
-    # the two inventory sources from double-counting a runtime.
-    plan.runtimes.extend(_collect_desktop_serve_runtimes(seen_pids))
+    # Desktop-supervised ephemeral HTTP workers have no gateway PID file or
+    # gateway_state.json in older/custom launch paths. Manual lookalikes are
+    # recorded, but never promoted to Desktop ownership merely because they
+    # use port zero. The verified ledger runs first and ``seen_pids`` prevents
+    # this process-table fallback from double-counting those rows.
+    http_runtimes, process_scan = _collect_desktop_serve_runtimes(
+        seen_pids, profile_homes
+    )
+    plan.runtimes.extend(http_runtimes)
+    if not process_scan.complete:
+        plan.inventory_complete = False
+        plan.inventory_warnings.extend(process_scan.warnings)
 
     return plan
 
@@ -609,8 +769,15 @@ def print_update_plan(plan: UpdatePlan) -> None:
         print(f"    Update via: {plan.update_mechanism}")
     profiles = ", ".join(plan.profiles) if plan.profiles else "(none found)"
     print(f"  Profiles: {profiles}")
+    if not plan.inventory_complete:
+        print("  ⚠ Runtime inventory INCOMPLETE; update convergence cannot be proven.")
+        for warning in plan.inventory_warnings:
+            print(f"    • {warning}")
     if not plan.runtimes:
-        print("  Running Hermes services: none detected — code swap only.")
+        if plan.inventory_complete:
+            print("  Running Hermes services: none detected — code swap only.")
+        else:
+            print("  Running Hermes services: no readable runtimes found (scan incomplete).")
         return
     print(f"  Running services to restart ({len(plan.runtimes)}):")
     for runtime in plan.runtimes:
@@ -623,6 +790,18 @@ def print_update_plan(plan: UpdatePlan) -> None:
             "      restart: "
             f"{describe_restart_mechanism(runtime.restart_via, runtime.profile)}"
         )
+
+
+def require_complete_inventory(plan: UpdatePlan) -> None:
+    """Abort an applying update when runtime convergence cannot be proven."""
+    if plan.inventory_complete:
+        return
+    print()
+    print("  ✗ Runtime inventory incomplete; update aborted before mutation.")
+    for warning in plan.inventory_warnings:
+        print(f"    • {warning}")
+    print("    Rerun with process-table visibility, then retry the update.")
+    raise SystemExit(1)
 
 
 def match_runtime_outcomes(
@@ -664,16 +843,21 @@ def match_runtime_outcomes(
             if r is None:
                 continue
             outcome = "unaccounted"
-            if r.profile in relaunched or r.profile in external:
+            # Current restart bookkeeping names gateway profiles/services.
+            # Do not let a same-profile gateway event satisfy a distinct
+            # Desktop/manual HTTP backend process.
+            if r.kind == "gateway" and (
+                r.profile in relaunched or r.profile in external
+            ):
                 outcome = "restarted"
             elif r.pid is not None and r.pid in killed:
                 outcome = "stopped"
-            elif any(
+            elif r.kind == "gateway" and any(
                 r.profile in unit or (r.profile == "default" and "hermes-gateway" in unit)
                 for unit in failed_set
             ):
                 outcome = "failed"
-            elif any(
+            elif r.kind == "gateway" and any(
                 r.profile in svc or (r.profile == "default" and "hermes-gateway" in svc)
                 for svc in restarted_set
             ):
@@ -685,6 +869,16 @@ def match_runtime_outcomes(
                     "pid": r.pid,
                     "mechanism": r.restart_via,
                     "outcome": outcome,
+                }
+            )
+        if not getattr(plan, "inventory_complete", True):
+            outcomes.append(
+                {
+                    "kind": "inventory",
+                    "profile": "unknown",
+                    "pid": None,
+                    "mechanism": "process-scan",
+                    "outcome": "unaccounted",
                 }
             )
     except Exception as exc:
@@ -711,8 +905,13 @@ def report_unaccounted_runtimes(outcomes: list[dict[str, Any]]) -> bool:
             f" — planned mechanism: {o['mechanism']}"
         )
     print("    Restart them manually, then verify:")
-    print("      hermes gateway restart                # active profile")
-    print("      hermes -p <profile> gateway restart   # named profile")
+    if any(o.get("kind") == "inventory" for o in missed):
+        print("      rerun the inventory with process-table visibility")
+    if any(o.get("kind") in {"serve", "dashboard"} for o in missed):
+        print("      restart the Desktop/manual HTTP backend shown above")
+    if any(o.get("kind") == "gateway" for o in missed):
+        print("      hermes gateway restart                # active profile")
+        print("      hermes -p <profile> gateway restart   # named profile")
     return True
 
 

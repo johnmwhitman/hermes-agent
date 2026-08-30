@@ -37,7 +37,12 @@ def fleet(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda all_profiles=False: {100})
     monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: True)
     monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda exclude_pids=None: [])
-    monkeypatch.setattr(ui, "_iter_process_cmdlines", lambda: [], raising=False)
+    monkeypatch.setattr(
+        ui,
+        "_iter_process_cmdlines",
+        lambda: ui.ProcessScanResult(),
+        raising=False,
+    )
     monkeypatch.setattr(
         "hermes_cli.build_info.get_code_identity",
         lambda refresh=False: {"sha": "a" * 40, "short_sha": "a" * 8, "version": "1.0", "source": "git"},
@@ -134,10 +139,11 @@ class TestCollectInventory:
         self, fleet, monkeypatch, tmp_path
     ):
         """A Desktop-owned ``serve`` has no gateway_state.json but is live code."""
-        runtime_root = tmp_path / "desktop-runtime"
-        python = runtime_root / "venv" / "bin" / "python"
+        runtime_root = tmp_path / "desktop-worktree"
+        main_runtime = tmp_path / "main-runtime"
+        python = main_runtime / "venv" / "bin" / "python"
         python.parent.mkdir(parents=True)
-        (runtime_root / "hermes_cli").mkdir()
+        (runtime_root / "hermes_cli").mkdir(parents=True)
         (runtime_root / "pyproject.toml").write_text(
             '[project]\nname = "hermes-agent"\nversion = "9.8.7"\n',
             encoding="utf-8",
@@ -149,10 +155,11 @@ class TestCollectInventory:
         monkeypatch.setattr(
             ui,
             "_iter_process_cmdlines",
-            lambda: [
-                (
-                    303,
-                    [
+            lambda: ui.ProcessScanResult(
+                rows=[
+                    ui.ProcessMetadata(
+                        pid=303,
+                        argv=[
                         str(python),
                         "-m",
                         "hermes_cli.main",
@@ -165,9 +172,13 @@ class TestCollectInventory:
                         "0",
                         "--ssh-session-token-file",
                         secret_path,
-                    ],
-                )
-            ],
+                        ],
+                        hermes_desktop=True,
+                        hermes_home=str(tmp_path / "home" / "profiles" / "work"),
+                        pythonpath=str(runtime_root),
+                    )
+                ]
+            ),
             raising=False,
         )
 
@@ -180,6 +191,8 @@ class TestCollectInventory:
         assert serve.restart_via == "desktop"
         assert serve.code_sha == sha
         assert serve.code_version == "9.8.7"
+        assert serve.detail["code_identity_source"] == "git"
+        assert "desktop-env" in serve.detail["ownership_evidence"]
         serialized = json.dumps(serve.to_dict())
         assert secret_path not in serialized
         assert "ssh-session-token-file" not in serialized
@@ -190,13 +203,15 @@ class TestCollectInventory:
         monkeypatch.setattr(
             ui,
             "_iter_process_cmdlines",
-            lambda: [
-                (100, ["python", "-m", "hermes_cli.main", "serve", "--port", "0"]),
-                (301, ["python", "-m", "hermes_cli.main", "dashboard", "--port", "0"]),
-                (302, ["python", "-m", "hermes_cli.main", "serve", "--port", "9119"]),
-                (303, ["notes", "about", "hermes_cli.main", "serve", "--port", "0"]),
-                (304, ["python", "-m", "unrelated.module", "serve", "--port", "0"]),
-            ],
+            lambda: ui.ProcessScanResult(
+                rows=[
+                    ui.ProcessMetadata(100, ["python", "-m", "hermes_cli.main", "serve", "--port", "0"], True),
+                    ui.ProcessMetadata(301, ["python", "-m", "hermes_cli.main", "dashboard", "--port", "0"], True),
+                    ui.ProcessMetadata(302, ["python", "-m", "hermes_cli.main", "serve", "--port", "9119"], True),
+                    ui.ProcessMetadata(303, ["notes", "about", "hermes_cli.main", "serve", "--port", "0"], True),
+                    ui.ProcessMetadata(304, ["python", "-m", "unrelated.module", "serve", "--port", "0"], True),
+                ]
+            ),
             raising=False,
         )
 
@@ -205,17 +220,154 @@ class TestCollectInventory:
         assert [r.pid for r in plan.runtimes].count(100) == 1
         assert not ({301, 302, 303, 304} & {r.pid for r in plan.runtimes})
 
+    def test_bare_profile_comes_only_from_trusted_hermes_home(self, fleet, monkeypatch):
+        monkeypatch.setattr(
+            ui,
+            "_iter_process_cmdlines",
+            lambda: ui.ProcessScanResult(
+                rows=[
+                    ui.ProcessMetadata(
+                        601,
+                        ["python", "-m", "hermes_cli.main", "serve", "--port", "0"],
+                        True,
+                        hermes_home=str(fleet / "home" / "profiles" / "work"),
+                    ),
+                    ui.ProcessMetadata(
+                        602,
+                        ["python", "-m", "hermes_cli.main", "serve", "--port", "0"],
+                        True,
+                        hermes_home=str(fleet / "untrusted-home"),
+                    ),
+                ]
+            ),
+        )
+        plan = ui.collect_runtime_inventory()
+        by_pid = {runtime.pid: runtime for runtime in plan.runtimes}
+        assert by_pid[601].profile == "work"
+        assert by_pid[602].profile == "unknown"
+
+    def test_port_zero_without_desktop_ownership_stays_manual(self, fleet, monkeypatch):
+        monkeypatch.setattr(
+            ui,
+            "_iter_process_cmdlines",
+            lambda: ui.ProcessScanResult(
+                rows=[
+                    ui.ProcessMetadata(
+                        603,
+                        [
+                            "python",
+                            "-m",
+                            "hermes_cli.main",
+                            "--profile",
+                            "work",
+                            "serve",
+                            "--host",
+                            "0.0.0.0",
+                            "--port",
+                            "0",
+                        ],
+                    )
+                ]
+            ),
+        )
+        runtime = next(r for r in ui.collect_runtime_inventory().runtimes if r.pid == 603)
+        assert runtime.supervisor == "manual"
+        assert runtime.restart_via == "manual-process"
+
+    def test_legacy_dashboard_and_python_script_launch_are_discovered(
+        self, fleet, monkeypatch, tmp_path
+    ):
+        runtime_root = tmp_path / "remote-runtime"
+        (runtime_root / "hermes_cli").mkdir(parents=True)
+        (runtime_root / "pyproject.toml").write_text(
+            '[project]\nversion="6.5.4"\n', encoding="utf-8"
+        )
+        (runtime_root / ".hermes_build_sha").write_text(
+            "f" * 40, encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            ui,
+            "_iter_process_cmdlines",
+            lambda: ui.ProcessScanResult(
+                rows=[
+                    ui.ProcessMetadata(
+                        604,
+                        [
+                            "python",
+                            str(runtime_root / "hermes"),
+                            "--profile",
+                            "work",
+                            "dashboard",
+                            "--no-open",
+                            "--port",
+                            "0",
+                        ],
+                        True,
+                    )
+                ]
+            ),
+        )
+        runtime = next(r for r in ui.collect_runtime_inventory().runtimes if r.pid == 604)
+        assert runtime.kind == "dashboard"
+        assert runtime.supervisor == "desktop"
+        assert runtime.code_sha == "f" * 40
+        assert runtime.code_version == "6.5.4"
+        assert runtime.detail["code_identity_source"] == "build-file"
+
+    def test_unknown_source_provenance_does_not_use_python_venv(self, fleet, monkeypatch, tmp_path):
+        runtime_root = tmp_path / "runtime"
+        python = runtime_root / "venv" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        (runtime_root / "hermes_cli").mkdir()
+        (runtime_root / "pyproject.toml").write_text('[project]\nversion="7.7.7"\n')
+        (runtime_root / ".hermes_build_sha").write_text("e" * 40)
+        monkeypatch.setattr(
+            ui,
+            "_iter_process_cmdlines",
+            lambda: ui.ProcessScanResult(
+                rows=[ui.ProcessMetadata(605, [str(python), "-m", "hermes_cli.main", "serve", "--port", "0"], True)]
+            ),
+        )
+        runtime = next(r for r in ui.collect_runtime_inventory().runtimes if r.pid == 605)
+        assert runtime.code_sha is None
+        assert runtime.code_version is None
+
 
 class TestDesktopServeCommandParser:
     def test_accepts_module_entrypoint_and_profile_flag_forms(self):
         assert ui._parse_desktop_serve_command(
             "/runtime/venv/bin/python -m hermes_cli.main --profile work "
             "serve --host 127.0.0.1 --port 0"
-        ) == ("work", "/runtime/venv/bin/python")
+        ).profile == "work"
         assert ui._parse_desktop_serve_command(
             "/runtime/venv/bin/python -m hermes_cli.main -p coder "
             "serve --port=0"
-        ) == ("coder", "/runtime/venv/bin/python")
+        ).profile == "coder"
+
+    def test_bare_profile_is_unknown_and_duplicate_flags_use_last_value(self):
+        bare = ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main serve --port 0"
+        )
+        assert bare.profile is None
+        parsed = ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main --profile first -p second serve "
+            "--port 9119 --port=0"
+        )
+        assert parsed.profile == "second"
+        assert parsed.port == 0
+
+    def test_accepts_legacy_dashboard_and_remote_python_script_family(self):
+        parsed = ui._parse_desktop_serve_command(
+            "python /opt/hermes/hermes --profile remote dashboard --no-open --port 0"
+        )
+        assert parsed.kind == "dashboard"
+        assert parsed.profile == "remote"
+        assert parsed.source_hint == "/opt/hermes"
+
+    def test_rejects_trailing_duplicate_port_without_value(self):
+        assert ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main serve --port 0 --port"
+        ) is None
 
     @pytest.mark.parametrize(
         "command",
@@ -233,7 +385,7 @@ class TestDesktopServeCommandParser:
 
 
 class TestProcessEnumeration:
-    def test_returns_tokenized_rows_and_skips_unreadable_processes(self, monkeypatch):
+    def test_returns_sanitized_rows_and_marks_denial_incomplete(self, monkeypatch):
         class Process:
             def __init__(self, info=None, error=None):
                 self._info = info
@@ -241,9 +393,19 @@ class TestProcessEnumeration:
 
             @property
             def info(self):
+                if not self._info:
+                    return {}
+                argv = self._info.get("cmdline")
+                name = Path(argv[0]).name if isinstance(argv, list) and argv else "other"
+                return {"pid": self._info.get("pid"), "name": name}
+
+            def cmdline(self):
                 if self._error:
                     raise self._error
-                return self._info
+                return self._info.get("cmdline")
+
+            def environ(self):
+                return self._info.get("environ") or {}
 
         expected_argv = [
             "/runtime/venv/bin/python",
@@ -254,7 +416,12 @@ class TestProcessEnumeration:
             "0",
         ]
         rows = [
-            Process({"pid": 501, "cmdline": expected_argv}),
+            Process({"pid": 501, "cmdline": expected_argv, "environ": {
+                "HERMES_DESKTOP": "1",
+                "HERMES_HOME": "/profiles/work",
+                "PYTHONPATH": "/worktree",
+                "HERMES_DASHBOARD_SESSION_TOKEN": "never-return-me",
+            }}),
             Process(error=PermissionError("not inspectable")),
             Process({"pid": 502, "cmdline": "not-tokenized"}),
             Process({"pid": os.getpid(), "cmdline": expected_argv}),
@@ -271,8 +438,30 @@ class TestProcessEnumeration:
             SimpleNamespace(process_iter=process_iter),
         )
 
-        assert ui._iter_process_cmdlines() == [(501, expected_argv)]
-        assert observed_attrs == [["pid", "cmdline"]]
+        result = ui._iter_process_cmdlines()
+        assert result.complete is False
+        assert len(result.warnings) == 1
+        assert result.rows == [
+            ui.ProcessMetadata(
+                501,
+                expected_argv,
+                True,
+                hermes_home="/profiles/work",
+                pythonpath="/worktree",
+            )
+        ]
+        assert "never-return-me" not in repr(result)
+        assert observed_attrs == [["pid", "name"]]
+
+    def test_iterator_failure_is_explicitly_incomplete(self, monkeypatch):
+        def fail(_attrs):
+            raise PermissionError("process table denied")
+
+        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(process_iter=fail))
+        result = ui._iter_process_cmdlines()
+        assert result.rows == []
+        assert result.complete is False
+        assert result.warnings == ["process inventory unavailable"]
 
 
 class TestPrintPlan:
@@ -300,6 +489,88 @@ class TestPrintPlan:
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         ui.print_update_plan(ui.collect_runtime_inventory())
         assert "none detected" in capsys.readouterr().out
+
+    def test_incomplete_empty_scan_never_claims_none_detected(self, fleet, monkeypatch, capsys):
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        monkeypatch.setattr(
+            ui,
+            "_iter_process_cmdlines",
+            lambda: ui.ProcessScanResult(complete=False, warnings=["process inventory unavailable"]),
+        )
+        plan = ui.collect_runtime_inventory()
+        ui.print_update_plan(plan)
+        out = capsys.readouterr().out
+        assert "INCOMPLETE" in out
+        assert "convergence cannot be proven" in out
+        assert "none detected" not in out
+
+    def test_incomplete_inventory_gate_is_loud_and_aborts_before_mutation(
+        self, capsys
+    ):
+        plan = ui.UpdatePlan(
+            inventory_complete=False,
+            inventory_warnings=["process inventory unavailable"],
+        )
+        with pytest.raises(SystemExit) as raised:
+            ui.require_complete_inventory(plan)
+        assert raised.value.code == 1
+        out = capsys.readouterr().out
+        assert "aborted before mutation" in out
+        assert "process inventory unavailable" in out
+
+    def test_complete_inventory_gate_is_noop(self, capsys):
+        ui.require_complete_inventory(ui.UpdatePlan())
+        assert capsys.readouterr().out == ""
+
+
+class TestRuntimeOutcomeIsolation:
+    @staticmethod
+    def _outcomes(plan, **overrides):
+        args = {
+            "restarted_services": [],
+            "relaunched_profiles": [],
+            "externally_supervised_profiles": [],
+            "killed_pids": set(),
+            "failed_units": [],
+        }
+        args.update(overrides)
+        return ui.match_runtime_outcomes(plan, **args)
+
+    def test_gateway_restart_cannot_satisfy_same_profile_serve(self):
+        plan = ui.UpdatePlan(
+            runtimes=[
+                ui.RuntimeRecord(
+                    kind="serve",
+                    profile="default",
+                    pid=701,
+                    supervisor="desktop",
+                    restart_via="desktop",
+                )
+            ]
+        )
+        for evidence in (
+            {"restarted_services": ["hermes-gateway.service"]},
+            {"relaunched_profiles": ["default"]},
+            {"externally_supervised_profiles": ["default"]},
+        ):
+            assert self._outcomes(plan, **evidence)[0]["outcome"] == "unaccounted"
+
+    def test_incomplete_scan_adds_unaccounted_inventory_tripwire(self):
+        plan = ui.UpdatePlan(
+            inventory_complete=False,
+            inventory_warnings=["process inventory unavailable"],
+        )
+        outcomes = self._outcomes(plan)
+        assert outcomes == [
+            {
+                "kind": "inventory",
+                "profile": "unknown",
+                "pid": None,
+                "mechanism": "process-scan",
+                "outcome": "unaccounted",
+            }
+        ]
+        assert ui.report_unaccounted_runtimes(outcomes) is True
 
 
 class TestReceiptIntegration:

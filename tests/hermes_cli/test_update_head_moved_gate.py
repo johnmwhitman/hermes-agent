@@ -73,6 +73,13 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     tests/hermes_cli/test_cmd_update.py).
     """
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
+    import hermes_cli.update_inventory as update_inventory
+
+    monkeypatch.setattr(
+        update_inventory,
+        "_iter_process_cmdlines",
+        lambda: update_inventory.ProcessScanResult(),
+    )
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate
     monkeypatch.setattr(

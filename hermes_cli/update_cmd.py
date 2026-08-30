@@ -7892,15 +7892,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # ``_pre_update_plan`` is read again AFTER the restart phase to reconcile
     # every planned runtime against the phase's bookkeeping (restart via
     # declared mechanism — the plan is the worklist, not just a printout).
+    # An incomplete process scan fails closed before backup/download/apply:
+    # otherwise unreadable Desktop workers could remain on pre-update code
+    # while the updater falsely reports convergence.
     _pre_update_plan = None
     try:
         from hermes_cli.update_inventory import (
             collect_runtime_inventory,
             record_plan_in_receipt,
+            require_complete_inventory,
         )
 
         _pre_update_plan = collect_runtime_inventory()
         record_plan_in_receipt(_pre_update_plan)
+        require_complete_inventory(_pre_update_plan)
         if _pre_update_plan.runtimes:
             _n = len(_pre_update_plan.runtimes)
             _profiles = ", ".join(
@@ -10545,7 +10550,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # exactly like a STALE/DOWN fleet row.
         _runtime_outcomes: list = []
         try:
-            if _pre_update_plan is not None and _pre_update_plan.runtimes:
+            if _pre_update_plan is not None and (
+                _pre_update_plan.runtimes
+                or not _pre_update_plan.inventory_complete
+            ):
                 from hermes_cli.update_inventory import (
                     match_runtime_outcomes,
                     report_unaccounted_runtimes,
