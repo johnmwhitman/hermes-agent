@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shlex
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -139,6 +141,203 @@ def describe_restart_mechanism(mechanism: str, profile: str) -> str:
     if profile != "default":
         return f"hermes -p {profile} gateway restart"
     return "hermes gateway restart"
+
+
+def _parse_desktop_serve_argv(argv: list[str]) -> Optional[tuple[str, str]]:
+    """Return ``(profile, executable)`` for Desktop's tokenized serve argv."""
+    if len(argv) < 4:
+        return None
+
+    executable = argv[0]
+    if len(argv) >= 3 and argv[1:3] == ["-m", "hermes_cli.main"]:
+        cli_argv = argv[3:]
+    elif Path(argv[0]).name.lower() in {
+        "hermes",
+        "hermes.exe",
+        "hermes-agent",
+        "hermes-agent.exe",
+    }:
+        cli_argv = argv[1:]
+    else:
+        return None
+
+    try:
+        serve_index = cli_argv.index("serve")
+    except ValueError:
+        return None
+
+    profile = "default"
+    prefix = cli_argv[:serve_index]
+    index = 0
+    while index < len(prefix):
+        token = prefix[index]
+        if token in {"--profile", "-p"}:
+            if index + 1 >= len(prefix):
+                return None
+            profile = prefix[index + 1]
+            index += 2
+            continue
+        if token.startswith("--profile="):
+            profile = token.split("=", 1)[1]
+            index += 1
+            continue
+        # Desktop only places its optional profile selector before ``serve``.
+        # Reject every other token so an option value named ``serve`` cannot
+        # masquerade as the subcommand.
+        return None
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", profile or ""):
+        return None
+
+    port: Optional[str] = None
+    tail = cli_argv[serve_index + 1 :]
+    for index, token in enumerate(tail):
+        if token == "--port" and index + 1 < len(tail):
+            port = tail[index + 1]
+            break
+        if token.startswith("--port="):
+            port = token.split("=", 1)[1]
+            break
+    if port != "0":
+        return None
+    return profile, executable
+
+
+def _parse_desktop_serve_command(command: str) -> Optional[tuple[str, str]]:
+    """Parse a display command without retaining credential-bearing argv.
+
+    Desktop owns ephemeral ``serve --port 0`` workers.  Match argv structure,
+    not substrings, so an unrelated command that merely mentions Hermes is
+    never promoted into the update plan.  The return value deliberately omits
+    the rest of argv: serve commands can carry credential-file arguments and
+    runtime inventory must never persist them in receipts.
+    """
+    try:
+        argv = shlex.split(command)
+    except (TypeError, ValueError):
+        return None
+    return _parse_desktop_serve_argv(argv)
+
+
+def _iter_process_cmdlines() -> list[tuple[int, list[str]]]:
+    """Read live process argv through psutil; return no sensitive fields."""
+    rows: list[tuple[int, list[str]]] = []
+    try:
+        import psutil
+
+        for process in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                info = process.info
+                pid = int(info.get("pid"))
+                if pid == os.getpid():
+                    continue
+                raw_argv = info.get("cmdline") or []
+                if not isinstance(raw_argv, (list, tuple)):
+                    continue
+                argv = [str(token) for token in raw_argv if token is not None]
+                if argv:
+                    rows.append((pid, argv))
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("Desktop serve process enumeration failed: %s", exc)
+    return rows
+
+
+def _runtime_root_from_executable(executable: str) -> Optional[Path]:
+    """Infer a Hermes source/install root from an absolute entrypoint path."""
+    try:
+        path = Path(executable).expanduser()
+        if not path.is_absolute():
+            return None
+        for candidate in path.parents:
+            if (candidate / "pyproject.toml").is_file() and (
+                candidate / "hermes_cli"
+            ).is_dir():
+                return candidate
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
+def _code_identity_for_root(root: Optional[Path]) -> dict[str, Optional[str]]:
+    """Read non-secret code identity for a discovered runtime root."""
+    identity: dict[str, Optional[str]] = {
+        "sha": None,
+        "version": None,
+        "source": None,
+    }
+    if root is None:
+        return identity
+    try:
+        from hermes_cli.build_info import _resolve_git_head_sha
+
+        identity["sha"] = _resolve_git_head_sha(root)
+        if identity["sha"]:
+            identity["source"] = "git"
+    except Exception:
+        pass
+    if identity["sha"] is None:
+        try:
+            baked = (root / ".hermes_build_sha").read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+            if baked:
+                identity["sha"] = baked
+                identity["source"] = "build-file"
+        except (OSError, PermissionError):
+            pass
+    try:
+        import tomllib
+
+        with (root / "pyproject.toml").open("rb") as handle:
+            raw = tomllib.load(handle).get("project", {}).get("version")
+        identity["version"] = str(raw) if raw else None
+    except Exception:
+        pass
+    return identity
+
+
+def _collect_desktop_serve_runtimes(seen_pids: set[int]) -> list[RuntimeRecord]:
+    """Discover Desktop-owned serve workers through read-only process argv."""
+    runtimes: list[RuntimeRecord] = []
+    try:
+        scanned = _iter_process_cmdlines()
+    except Exception as exc:
+        logger.debug("Desktop serve process scan failed: %s", exc)
+        return runtimes
+
+    for raw_pid, argv in scanned:
+        try:
+            pid = int(raw_pid)
+            if pid in seen_pids:
+                continue
+            parsed = _parse_desktop_serve_argv(argv)
+            if parsed is None:
+                continue
+            profile, executable = parsed
+            identity = _code_identity_for_root(
+                _runtime_root_from_executable(executable)
+            )
+            detail = {}
+            if identity["source"]:
+                detail["code_identity_source"] = identity["source"]
+            runtimes.append(
+                RuntimeRecord(
+                    kind="serve",
+                    profile=profile,
+                    pid=pid,
+                    supervisor="desktop",
+                    code_sha=identity["sha"],
+                    code_version=identity["version"],
+                    restart_via=_restart_mechanism("desktop", profile),
+                    detail=detail,
+                )
+            )
+            seen_pids.add(pid)
+        except Exception as exc:
+            logger.debug("Desktop serve inventory row failed: %s", exc)
+    return runtimes
 
 
 def collect_runtime_inventory() -> UpdatePlan:
@@ -385,6 +584,12 @@ def collect_runtime_inventory() -> UpdatePlan:
             )
     except Exception as exc:
         logger.debug("Serve/dashboard ledger inventory failed: %s", exc)
+
+    # Desktop-supervised ``serve --port 0`` workers have no gateway PID file
+    # or gateway_state.json in older/custom launch paths. The process scan is
+    # a fallback for rows absent from the verified ledger; ``seen_pids`` keeps
+    # the two inventory sources from double-counting a runtime.
+    plan.runtimes.extend(_collect_desktop_serve_runtimes(seen_pids))
 
     return plan
 

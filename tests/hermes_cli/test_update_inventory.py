@@ -1,7 +1,10 @@
 """Tests for hermes_cli.update_inventory — the plan phase (#91277 Phase 2)."""
 
 import json
+import os
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,6 +37,7 @@ def fleet(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda all_profiles=False: {100})
     monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: True)
     monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda exclude_pids=None: [])
+    monkeypatch.setattr(ui, "_iter_process_cmdlines", lambda: [], raising=False)
     monkeypatch.setattr(
         "hermes_cli.build_info.get_code_identity",
         lambda refresh=False: {"sha": "a" * 40, "short_sha": "a" * 8, "version": "1.0", "source": "git"},
@@ -111,6 +115,7 @@ class TestCollectInventory:
             "hermes_cli.gateway.find_profile_gateway_processes",
         ):
             monkeypatch.setattr(target, _boom)
+        monkeypatch.setattr(ui, "_iter_process_cmdlines", _boom)
         plan = ui.collect_runtime_inventory()
         assert plan.runtimes == []
         assert plan.install_method == "unknown"
@@ -124,6 +129,150 @@ class TestCollectInventory:
         assert restored["install_method"] == "git"
         assert len(restored["runtimes"]) == 2
         assert restored["runtimes"][0]["kind"] == "gateway"
+
+    def test_desktop_serve_worker_is_inventoried_with_code_identity(
+        self, fleet, monkeypatch, tmp_path
+    ):
+        """A Desktop-owned ``serve`` has no gateway_state.json but is live code."""
+        runtime_root = tmp_path / "desktop-runtime"
+        python = runtime_root / "venv" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        (runtime_root / "hermes_cli").mkdir()
+        (runtime_root / "pyproject.toml").write_text(
+            '[project]\nname = "hermes-agent"\nversion = "9.8.7"\n',
+            encoding="utf-8",
+        )
+        (runtime_root / ".git").mkdir()
+        sha = "d" * 40
+        (runtime_root / ".git" / "HEAD").write_text(sha + "\n", encoding="utf-8")
+        secret_path = "/private/never-report-this-token"
+        monkeypatch.setattr(
+            ui,
+            "_iter_process_cmdlines",
+            lambda: [
+                (
+                    303,
+                    [
+                        str(python),
+                        "-m",
+                        "hermes_cli.main",
+                        "--profile",
+                        "work",
+                        "serve",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        "0",
+                        "--ssh-session-token-file",
+                        secret_path,
+                    ],
+                )
+            ],
+            raising=False,
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        serve = next(r for r in plan.runtimes if r.pid == 303)
+        assert serve.kind == "serve"
+        assert serve.profile == "work"
+        assert serve.supervisor == "desktop"
+        assert serve.restart_via == "desktop"
+        assert serve.code_sha == sha
+        assert serve.code_version == "9.8.7"
+        serialized = json.dumps(serve.to_dict())
+        assert secret_path not in serialized
+        assert "ssh-session-token-file" not in serialized
+
+    def test_desktop_serve_scan_is_strict_and_deduplicates_gateway_pid(
+        self, fleet, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ui,
+            "_iter_process_cmdlines",
+            lambda: [
+                (100, ["python", "-m", "hermes_cli.main", "serve", "--port", "0"]),
+                (301, ["python", "-m", "hermes_cli.main", "dashboard", "--port", "0"]),
+                (302, ["python", "-m", "hermes_cli.main", "serve", "--port", "9119"]),
+                (303, ["notes", "about", "hermes_cli.main", "serve", "--port", "0"]),
+                (304, ["python", "-m", "unrelated.module", "serve", "--port", "0"]),
+            ],
+            raising=False,
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert [r.pid for r in plan.runtimes].count(100) == 1
+        assert not ({301, 302, 303, 304} & {r.pid for r in plan.runtimes})
+
+
+class TestDesktopServeCommandParser:
+    def test_accepts_module_entrypoint_and_profile_flag_forms(self):
+        assert ui._parse_desktop_serve_command(
+            "/runtime/venv/bin/python -m hermes_cli.main --profile work "
+            "serve --host 127.0.0.1 --port 0"
+        ) == ("work", "/runtime/venv/bin/python")
+        assert ui._parse_desktop_serve_command(
+            "/runtime/venv/bin/python -m hermes_cli.main -p coder "
+            "serve --port=0"
+        ) == ("coder", "/runtime/venv/bin/python")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python -m hermes_cli.main dashboard --port 0",
+            "python -m hermes_cli.main serve --port 9119",
+            "python -m unrelated.module serve --port 0",
+            "notes about hermes_cli.main serve --port 0",
+            "python -m hermes_cli.main --profile work chat --port 0",
+            "python -m hermes_cli.main --message serve --port 0",
+        ],
+    )
+    def test_rejects_non_desktop_or_non_hermes_shapes(self, command):
+        assert ui._parse_desktop_serve_command(command) is None
+
+
+class TestProcessEnumeration:
+    def test_returns_tokenized_rows_and_skips_unreadable_processes(self, monkeypatch):
+        class Process:
+            def __init__(self, info=None, error=None):
+                self._info = info
+                self._error = error
+
+            @property
+            def info(self):
+                if self._error:
+                    raise self._error
+                return self._info
+
+        expected_argv = [
+            "/runtime/venv/bin/python",
+            "-m",
+            "hermes_cli.main",
+            "serve",
+            "--port",
+            "0",
+        ]
+        rows = [
+            Process({"pid": 501, "cmdline": expected_argv}),
+            Process(error=PermissionError("not inspectable")),
+            Process({"pid": 502, "cmdline": "not-tokenized"}),
+            Process({"pid": os.getpid(), "cmdline": expected_argv}),
+        ]
+        observed_attrs = []
+
+        def process_iter(attrs):
+            observed_attrs.append(attrs)
+            return iter(rows)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(process_iter=process_iter),
+        )
+
+        assert ui._iter_process_cmdlines() == [(501, expected_argv)]
+        assert observed_attrs == [["pid", "cmdline"]]
 
 
 class TestPrintPlan:
