@@ -44,6 +44,35 @@ class TestProfilePlatformPorts:
         }
         assert _profile_platform_ports(tmp_path, runtime) == {"msgraph_webhook": 8646}
 
+    def test_a2a_inbound_listener_port_is_reported(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n  a2a:\n    role: inbound\n    port: 9911\n",
+            encoding="utf-8",
+        )
+        runtime = {"platforms": {"a2a": {"state": "connected"}}}
+
+        assert _profile_platform_ports(tmp_path, runtime) == {"a2a": 9911}
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            pytest.param(
+                "platforms:\n  a2a:\n    role: remote\n    port: 9911\n",
+                id="remote-role",
+            ),
+            pytest.param(
+                "platforms:\n  a2a:\n    extra:\n      inbound_disabled: true\n"
+                "      port: 9911\n",
+                id="inbound-disabled",
+            ),
+        ],
+    )
+    def test_a2a_client_only_mode_has_no_listener_port(self, tmp_path, config):
+        (tmp_path / "config.yaml").write_text(config, encoding="utf-8")
+        runtime = {"platforms": {"a2a": {"state": "connected"}}}
+
+        assert _profile_platform_ports(tmp_path, runtime) == {}
+
 
 # ---------------------------------------------------------------------------
 # _collect_profile_gateway_topology

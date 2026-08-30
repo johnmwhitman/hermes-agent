@@ -3363,6 +3363,7 @@ _PORT_BINDING_PLATFORM_PORTS: Dict[str, Tuple[str, int]] = {
     "sms": ("webhook_port", 8080),
     "whatsapp_cloud": ("webhook_port", 8090),
     "line": ("port", 8646),
+    "a2a": ("port", 9900),
 }
 
 # Platform states that mean the adapter is NOT serving its port right now.
@@ -3407,11 +3408,19 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
     except Exception:
         blocks = {}
 
+    from gateway.config import platform_binds_port
+
     ports: Dict[str, int] = {}
     for name in active:
         port_key, default_port = _PORT_BINDING_PLATFORM_PORTS[name]
         block = blocks.get(name) or {}
         extra = block.get("extra") if isinstance(block.get("extra"), dict) else {}
+        effective_extra = dict(extra or {})
+        for mode_key in ("role", "inbound_disabled"):
+            if mode_key in block and mode_key not in effective_extra:
+                effective_extra[mode_key] = block[mode_key]
+        if not platform_binds_port(name, effective_extra):
+            continue
         raw = block.get(port_key, (extra or {}).get(port_key, default_port))
         try:
             ports[name] = int(raw)
@@ -10694,7 +10703,11 @@ def _multiplex_port_binding_conflict(
     *enabling* is blocked; disabling/clearing stays allowed so users can
     repair an already-invalid profile.
     """
-    from gateway.config import PORT_BINDING_PLATFORM_VALUES, load_gateway_config
+    from gateway.config import (
+        PORT_BINDING_PLATFORM_VALUES,
+        load_gateway_config,
+        platform_binds_port,
+    )
 
     if platform_id not in PORT_BINDING_PLATFORM_VALUES:
         return None
@@ -10711,6 +10724,22 @@ def _multiplex_port_binding_conflict(
         _resolve_profile_dir(requested)  # same 400/404 as _profile_scope
         target = requested
     if target in ("default", "custom"):
+        return None
+
+    # Resolve the target profile's effective platform config before applying
+    # the shared admission rule so the dashboard and GatewayRunner cannot
+    # disagree about conditional listeners (currently Feishu and A2A).
+    with _config_profile_scope(target):
+        target_config = load_gateway_config()
+    platform_extra = next(
+        (
+            config.extra
+            for platform, config in target_config.platforms.items()
+            if platform.value == platform_id
+        ),
+        None,
+    )
+    if not platform_binds_port(platform_id, platform_extra):
         return None
 
     # The multiplex flag that matters is the one the shared gateway reads at

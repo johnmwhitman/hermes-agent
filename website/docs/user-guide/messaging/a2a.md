@@ -39,6 +39,43 @@ hermes tools enable a2a --platform a2a        # let inbound A2A tasks call peers
 
 The tools are available in every process type — CLI, TUI, gateway, and cron — without the inbound platform needing to be enabled.
 
+### Client-only profiles (no listener)
+
+An enabled A2A platform starts an inbound listener by default. For a profile
+that only calls remote peers, select the `remote` role:
+
+```yaml
+gateway:
+  platforms:
+    a2a:
+      enabled: true
+      role: remote
+      port: 0                    # ignored in client-only mode
+      extra:
+        inbound_disabled: true  # exact YAML boolean; optional defense in depth
+```
+
+This keeps all five outbound tools available but constructs no HTTP server,
+listener thread, or watchdog. It also ignores bind-only settings such as
+`A2A_HOST` and `A2A_PORT`, so inherited server configuration cannot break a
+client-only profile.
+
+Listener selection is deterministic:
+
+| Configuration | Inbound listener |
+|---|---|
+| role omitted, `inbound`, or `local` | Started |
+| `role: remote` | Disabled |
+| exact `inbound_disabled: true` | Disabled regardless of a valid role |
+| `inbound_disabled: false` | Role decides |
+| unknown role or non-boolean flag | Rejected before construction |
+
+`role`, `port`, and `inbound_disabled` may be written beside `enabled` or under
+`extra`. When both forms specify the same key, the explicit nested `extra`
+value wins. In a multiplexed gateway, outbound-only A2A is allowed on a
+secondary profile; listener-capable or malformed A2A configurations remain
+reserved for the default profile and are rejected before startup/config write.
+
 ## Outbound: calling other agents
 
 With the `a2a` toolset enabled, the agent gets:
@@ -66,7 +103,7 @@ Then just ask: *"Ask the researcher agent to summarize today's arXiv postings."*
 
 ## Inbound: being callable
 
-With the platform enabled, Hermes serves:
+With the platform enabled in its default, `inbound`, or `local` mode, Hermes serves:
 
 - **Agent Card** at `GET /.well-known/agent-card.json` (canonical v1.0 path; the legacy `agent.json` also answers) — advertises your agent's name, skills (derived from enabled toolsets), and auth requirements.
 - **JSON-RPC 2.0** at `POST /` — canonical v1.0 methods (`SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, push-notification config CRUD) plus the pre-1.0 path-style aliases (`message/send`, …).

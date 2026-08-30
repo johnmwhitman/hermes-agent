@@ -224,6 +224,13 @@ class TestMultiplexPortBindingGuard:
         _enable_multiplex(isolated_profiles["default"])
         assert PORT_BINDING_PLATFORM_VALUES  # guard set must not be empty
         for platform_id in sorted(PORT_BINDING_PLATFORM_VALUES):
+            platform_config = {}
+            if platform_id == "feishu":
+                platform_config = {"extra": {"connection_mode": "webhook"}}
+            (isolated_profiles["worker_alpha"] / "config.yaml").write_text(
+                yaml.safe_dump({"platforms": {platform_id: platform_config}}),
+                encoding="utf-8",
+            )
             resp = client.put(
                 f"/api/messaging/platforms/{platform_id}",
                 params={"profile": "worker_alpha"},
@@ -231,6 +238,66 @@ class TestMultiplexPortBindingGuard:
             )
             assert resp.status_code == 409, platform_id
             assert "default profile" in resp.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "a2a_config",
+        [
+            pytest.param({"role": "remote"}, id="remote-role"),
+            pytest.param(
+                {"extra": {"inbound_disabled": True}}, id="inbound-disabled"
+            ),
+        ],
+    )
+    def test_allows_outbound_only_a2a_on_secondary(
+        self, client, isolated_profiles, a2a_config
+    ):
+        _enable_multiplex(isolated_profiles["default"])
+        worker_home = isolated_profiles["worker_alpha"]
+        (worker_home / "config.yaml").write_text(
+            yaml.safe_dump({"platforms": {"a2a": a2a_config}}),
+            encoding="utf-8",
+        )
+
+        resp = client.put(
+            "/api/messaging/platforms/a2a",
+            params={"profile": "worker_alpha"},
+            json={"enabled": True},
+        )
+
+        assert resp.status_code == 200
+        cfg = yaml.safe_load((worker_home / "config.yaml").read_text())
+        assert cfg["platforms"]["a2a"]["enabled"] is True
+
+    @pytest.mark.parametrize(
+        "a2a_config",
+        [
+            pytest.param({"role": "sideways"}, id="malformed-role"),
+            pytest.param(
+                {"extra": {"inbound_disabled": "true"}}, id="malformed-flag"
+            ),
+            pytest.param(
+                {"role": "remote", "extra": {"inbound_disabled": "true"}},
+                id="remote-with-malformed-flag",
+            ),
+        ],
+    )
+    def test_rejects_malformed_a2a_mode_on_secondary(
+        self, client, isolated_profiles, a2a_config
+    ):
+        _enable_multiplex(isolated_profiles["default"])
+        worker_home = isolated_profiles["worker_alpha"]
+        (worker_home / "config.yaml").write_text(
+            yaml.safe_dump({"platforms": {"a2a": a2a_config}}),
+            encoding="utf-8",
+        )
+
+        resp = client.put(
+            "/api/messaging/platforms/a2a",
+            params={"profile": "worker_alpha"},
+            json={"enabled": True},
+        )
+
+        assert resp.status_code == 409
 
 
 
@@ -266,4 +333,3 @@ class TestMultiplexPortBindingGuard:
                 json={"clear_env": [api_server["env_vars"][0]["key"]]},
             )
             assert resp.status_code == 200
-

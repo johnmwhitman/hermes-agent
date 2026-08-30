@@ -12,6 +12,7 @@ import asyncio
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.config import platform_binds_port
 from plugins.platforms import a2a as a2a_plugin
 from plugins.platforms.a2a import adapter as adapter_module
 
@@ -55,6 +56,61 @@ def test_outbound_only_modes_connect_without_constructing_listener(
     assert adapter._watchdog_thread is None
 
     asyncio.run(adapter.disconnect())
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param({"role": "remote", "port": "not-a-port"}, id="remote-role"),
+        pytest.param(
+            {"inbound_disabled": True, "port": "not-a-port"},
+            id="inbound-disabled",
+        ),
+    ],
+)
+def test_outbound_only_modes_do_not_resolve_unused_bind_settings(
+    monkeypatch,
+    tmp_path,
+    extra,
+):
+    monkeypatch.setenv("A2A_PORT", "also-not-a-port")
+    monkeypatch.setattr(
+        adapter_module.security,
+        "resolve_bind_host",
+        lambda: (_ for _ in ()).throw(AssertionError("unused bind host resolved")),
+    )
+
+    adapter = adapter_module.A2AAdapter(PlatformConfig(enabled=True, extra=extra))
+    monkeypatch.setattr(adapter_module, "_A2AServer", _ListenerMustNotBeConstructed)
+
+    assert asyncio.run(adapter.connect()) is True
+    assert adapter.is_connected is True
+    assert adapter._httpd is None
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        pytest.param({}, True, id="legacy-default-binds"),
+        pytest.param({"role": "inbound"}, True, id="inbound-binds"),
+        pytest.param({"role": "local"}, True, id="local-binds"),
+        pytest.param({"role": "remote"}, False, id="remote-does-not-bind"),
+        pytest.param(
+            {"inbound_disabled": True}, False, id="disabled-does-not-bind"
+        ),
+        pytest.param({"role": "sideways"}, True, id="unknown-role-conservative"),
+        pytest.param(
+            {"inbound_disabled": "true"}, True, id="string-flag-conservative"
+        ),
+        pytest.param(
+            {"role": "remote", "inbound_disabled": "true"},
+            True,
+            id="remote-with-malformed-flag-conservative",
+        ),
+    ],
+)
+def test_canonical_port_classifier_tracks_a2a_listener_policy(extra, expected):
+    assert platform_binds_port("a2a", extra) is expected
 
 
 def test_top_level_remote_config_is_bridged_into_platform_extra():
@@ -102,6 +158,10 @@ def test_top_level_remote_config_is_bridged_into_platform_extra():
     [
         pytest.param({"role": "sideways"}, id="unknown-role"),
         pytest.param({"inbound_disabled": "true"}, id="string-disabled-flag"),
+        pytest.param(
+            {"role": "remote", "inbound_disabled": "true"},
+            id="remote-with-string-disabled-flag",
+        ),
     ],
 )
 def test_malformed_listener_modes_fail_closed_before_server_construction(

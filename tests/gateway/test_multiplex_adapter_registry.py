@@ -519,6 +519,71 @@ class TestSecondaryProfileConfigHandling:
         assert "telegram" not in message
         assert "reviewer" not in runner._profile_adapters
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            pytest.param({"role": "remote"}, id="remote-role"),
+            pytest.param({"inbound_disabled": True}, id="inbound-disabled"),
+        ],
+    )
+    async def test_secondary_allows_outbound_only_a2a(self, monkeypatch, extra):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+
+        a2a = Platform("a2a")
+        reviewer_cfg = GatewayConfig(
+            multiplex_profiles=True,
+            platforms={a2a: PlatformConfig(enabled=True, extra=extra)},
+        )
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config", lambda: reviewer_cfg
+        )
+        monkeypatch.setattr(runner, "_create_adapter", lambda _p, _c: None)
+
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", "/tmp/x", {}
+        )
+
+        assert connected == 0
+        assert runner._profile_adapters == {"reviewer": {}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            pytest.param({}, id="legacy-default"),
+            pytest.param({"role": "inbound"}, id="inbound-role"),
+            pytest.param({"role": "sideways"}, id="malformed-role"),
+            pytest.param({"inbound_disabled": "true"}, id="malformed-flag"),
+            pytest.param(
+                {"role": "remote", "inbound_disabled": "true"},
+                id="remote-with-malformed-flag",
+            ),
+        ],
+    )
+    async def test_secondary_rejects_a2a_that_may_bind(self, monkeypatch, extra):
+        from gateway.run import SecondaryPortBindingConfigError
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+
+        a2a = Platform("a2a")
+        reviewer_cfg = GatewayConfig(
+            multiplex_profiles=True,
+            platforms={a2a: PlatformConfig(enabled=True, extra=extra)},
+        )
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config", lambda: reviewer_cfg
+        )
+
+        with pytest.raises(SecondaryPortBindingConfigError, match="a2a"):
+            await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
+
+        assert runner._profile_adapters == {}
+
     def test_configured_secondary_adapter_namespaces_runtime_status(self):
         runner = _secondary_recovery_runner()
         adapter = _SecondaryRecoveryAdapter()
@@ -846,5 +911,3 @@ class TestFeishuPortBindingConditional:
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
-
-

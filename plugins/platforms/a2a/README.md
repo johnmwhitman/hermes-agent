@@ -29,6 +29,32 @@ a2a_agents:
     capabilities: [web_search, research]
 ```
 
+### Listener modes
+
+Enabling the platform preserves the historical inbound-listener default. Use
+`role: remote` when this profile should call peers but must not expose a local
+HTTP endpoint:
+
+```yaml
+gateway:
+  platforms:
+    a2a:
+      enabled: true
+      role: remote
+      port: 0                    # ignored because no listener is constructed
+      extra:
+        inbound_disabled: true  # exact YAML boolean; defense in depth
+```
+
+The five outbound tools remain registered in this mode. `role: inbound`,
+`role: local`, or an omitted role starts the inbound listener. An exact
+`inbound_disabled: true` disables inbound regardless of a valid role; `false`
+leaves the role in control. Top-level `role`, `port`, and `inbound_disabled`
+are accepted for operator-friendly YAML, while an explicitly nested `extra`
+value takes precedence. Unknown roles and non-boolean `inbound_disabled`
+values are rejected before listener construction. Bind host and port settings,
+including `A2A_HOST` and `A2A_PORT`, are not parsed in listener-free mode.
+
 ## Outbound — call other agents
 
 The agent gets five tools:
@@ -42,7 +68,8 @@ The agent gets five tools:
 
 ## Inbound — be callable
 
-When the `a2a` platform is enabled, Hermes serves a v1.0 Agent Card at
+When the `a2a` platform is enabled in its default, `inbound`, or `local` mode,
+Hermes serves a v1.0 Agent Card at
 `http://<host>:<port>/.well-known/agent-card.json` (the legacy
 `/.well-known/agent.json` path is also answered for pre-1.0 clients) and
 accepts JSON-RPC

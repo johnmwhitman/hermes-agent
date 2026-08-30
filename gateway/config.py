@@ -444,6 +444,7 @@ PORT_BINDING_PLATFORM_VALUES = frozenset({
     "sms",
     "whatsapp_cloud",
     "line",
+    "a2a",
 })
 
 # Platforms whose port-binding status depends on connection mode. Feishu in
@@ -463,6 +464,22 @@ def platform_binds_port(platform_value: str, extra: Optional[dict] = None) -> bo
     """
     if platform_value not in PORT_BINDING_PLATFORM_VALUES:
         return False
+    if platform_value == "a2a":
+        config = extra if isinstance(extra, dict) else {}
+        raw_disabled = config.get("inbound_disabled", False)
+        raw_role = config.get("role", "inbound")
+
+        # The admission check must be at least as conservative as the adapter:
+        # malformed modes never exempt a secondary profile from the shared-port
+        # guard.  The adapter's own validation will reject them before startup.
+        if type(raw_disabled) is not bool:
+            return True
+        if not isinstance(raw_role, str):
+            return True
+        role = raw_role.strip().lower()
+        if role not in {"inbound", "local", "remote"}:
+            return True
+        return not (raw_disabled or role == "remote")
     expected_mode = PORT_BINDING_CONDITIONAL_MODES.get(platform_value)
     if expected_mode is not None:
         actual = str((extra or {}).get("connection_mode", "websocket")).strip().lower()

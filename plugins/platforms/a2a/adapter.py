@@ -386,8 +386,14 @@ class A2AAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
         self._inbound_enabled, self._listener_mode_error = _listener_policy(extra)
-        self.port = int(os.getenv("A2A_PORT") or extra.get("port", _DEFAULT_PORT))
-        self.host = security.resolve_bind_host()
+        # Outbound-only profiles never consume bind configuration.  In
+        # particular, a stale inherited A2A_PORT must not break a remote client
+        # profile that will not construct a listener.
+        self.port = 0
+        self.host = ""
+        if self._inbound_enabled and self._listener_mode_error is None:
+            self.port = int(os.getenv("A2A_PORT") or extra.get("port", _DEFAULT_PORT))
+            self.host = security.resolve_bind_host()
         self.agent_name = _default_agent_name()
         self._advertised_toolsets = [
             t.strip() for t in (
