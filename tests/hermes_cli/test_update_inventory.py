@@ -571,6 +571,68 @@ class TestProcessEnumeration:
         assert result.complete is False
         assert result.warnings == ["process inventory unavailable"]
 
+    @pytest.mark.parametrize("exception_name", ["NoSuchProcess", "ZombieProcess"])
+    def test_vanished_process_race_is_skipped_without_poisoning_inventory(
+        self, monkeypatch, exception_name
+    ):
+        class NoSuchProcess(Exception):
+            pass
+
+        class ZombieProcess(Exception):
+            pass
+
+        exception_type = {
+            "NoSuchProcess": NoSuchProcess,
+            "ZombieProcess": ZombieProcess,
+        }[exception_name]
+
+        class Process:
+            info = {"pid": 801, "name": "python"}
+
+            def cmdline(self):
+                raise exception_type("process exited")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                process_iter=lambda _attrs: iter([Process()]),
+                NoSuchProcess=NoSuchProcess,
+                ZombieProcess=ZombieProcess,
+            ),
+        )
+        result = ui._iter_process_cmdlines()
+        assert result.rows == []
+        assert result.complete is True
+        assert result.warnings == []
+
+    def test_access_denied_candidate_stays_fail_closed_with_static_warning(
+        self, monkeypatch
+    ):
+        class AccessDenied(Exception):
+            pass
+
+        class Process:
+            info = {"pid": 802, "name": "python"}
+
+            def cmdline(self):
+                raise AccessDenied("private detail")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                process_iter=lambda _attrs: iter([Process()]),
+                NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+                ZombieProcess=type("ZombieProcess", (Exception,), {}),
+                AccessDenied=AccessDenied,
+            ),
+        )
+        result = ui._iter_process_cmdlines()
+        assert result.complete is False
+        assert result.warnings == ["one or more process records were unreadable"]
+        assert "private detail" not in repr(result)
+
 
 class TestPrintPlan:
     def test_git_fleet_output(self, fleet, capsys):

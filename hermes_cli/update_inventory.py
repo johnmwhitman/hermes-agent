@@ -356,6 +356,15 @@ def _iter_process_cmdlines() -> ProcessScanResult:
     try:
         import psutil
 
+        vanished_types = tuple(
+            exception_type
+            for exception_type in (
+                getattr(psutil, "NoSuchProcess", None),
+                getattr(psutil, "ZombieProcess", None),
+            )
+            if isinstance(exception_type, type)
+        )
+
         for process in psutil.process_iter(["pid", "name"]):
             try:
                 info = process.info
@@ -408,7 +417,9 @@ def _iter_process_cmdlines() -> ProcessScanResult:
                         ),
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                if vanished_types and isinstance(exc, vanished_types):
+                    continue
                 result.complete = False
                 if "one or more process records were unreadable" not in result.warnings:
                     result.warnings.append("one or more process records were unreadable")
