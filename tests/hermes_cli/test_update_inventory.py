@@ -441,6 +441,29 @@ class TestDesktopServeCommandParser:
     def test_rejects_missing_or_invalid_tail_profile_value(self, command):
         assert ui._parse_desktop_serve_command(command) is None
 
+    def test_profile_value_semantics_match_preparser(self):
+        assert ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main serve --profile DEFAULT --port 0"
+        ) is None
+
+        equals_default = ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main serve --profile=DEFAULT --port 0"
+        )
+        assert equals_default.profile == "default"
+
+        assert ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main serve --profile root --port 0"
+        ) is None
+        assert ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main serve --profile=ROOT --port 0"
+        ) is None
+        assert ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main serve --profile " + ("a" * 65) + " --port 0"
+        ) is None
+        assert ui._parse_desktop_serve_command(
+            "python -m hermes_cli.main serve --profile=" + ("a" * 65) + " --port 0"
+        ) is None
+
     def test_accepts_legacy_dashboard_and_remote_python_script_family(self):
         parsed = ui._parse_desktop_serve_command(
             "python /opt/hermes/hermes --profile remote dashboard --no-open --port 0"

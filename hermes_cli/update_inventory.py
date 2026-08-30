@@ -181,6 +181,27 @@ def describe_restart_mechanism(mechanism: str, profile: str) -> str:
     return "hermes gateway restart"
 
 
+def _canonical_profile_selector(value: str, *, separated: bool) -> Optional[str]:
+    """Mirror the side-effect-free value law of ``_apply_profile_override``."""
+    try:
+        from hermes_cli.profiles import (
+            _PROFILE_ID_RE,
+            normalize_profile_name,
+            validate_profile_name,
+        )
+
+        # The pre-parser strictly validates the two-token form before profile
+        # normalization, while ``--profile=VALUE`` flows through canonical
+        # normalization first. Preserve that measured historical distinction.
+        if separated and not _PROFILE_ID_RE.match(value):
+            return None
+        canonical = normalize_profile_name(value)
+        validate_profile_name(canonical)
+        return canonical
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_desktop_serve_argv(argv: list[str]) -> Optional[ParsedBackendCommand]:
     """Parse a supported ephemeral Hermes backend command.
 
@@ -234,14 +255,22 @@ def _parse_desktop_serve_argv(argv: list[str]) -> Optional[ParsedBackendCommand]
                 return None
             if index + 1 >= len(cli_argv):
                 return None
-            profile = cli_argv[index + 1]
+            profile = _canonical_profile_selector(
+                cli_argv[index + 1], separated=True
+            )
+            if profile is None:
+                return None
             profile_seen = True
             index += 2
             continue
         if token.startswith("--profile="):
             if profile_seen:
                 return None
-            profile = token.split("=", 1)[1]
+            profile = _canonical_profile_selector(
+                token.split("=", 1)[1], separated=False
+            )
+            if profile is None:
+                return None
             profile_seen = True
             index += 1
             continue
@@ -260,14 +289,22 @@ def _parse_desktop_serve_argv(argv: list[str]) -> Optional[ParsedBackendCommand]
         if token in {"--profile", "-p"}:
             if profile_seen or index + 1 >= len(tail):
                 return None
-            profile = tail[index + 1]
+            profile = _canonical_profile_selector(
+                tail[index + 1], separated=True
+            )
+            if profile is None:
+                return None
             profile_seen = True
             index += 2
             continue
         if token.startswith("--profile="):
             if profile_seen:
                 return None
-            profile = token.split("=", 1)[1]
+            profile = _canonical_profile_selector(
+                token.split("=", 1)[1], separated=False
+            )
+            if profile is None:
+                return None
             profile_seen = True
             index += 1
             continue
@@ -280,10 +317,6 @@ def _parse_desktop_serve_argv(argv: list[str]) -> Optional[ParsedBackendCommand]
         elif token.startswith("--port="):
             port = token.split("=", 1)[1]
         index += 1
-    if profile is not None and not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9_-]*", profile
-    ):
-        return None
     if port != "0":
         return None
     kind = cli_argv[command_index]
