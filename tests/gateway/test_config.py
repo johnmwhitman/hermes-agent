@@ -24,6 +24,7 @@ from gateway.config import (
     _apply_env_overrides,
     load_gateway_config,
     persist_home_channel,
+    platform_binds_port,
 )
 
 
@@ -278,6 +279,56 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    @pytest.mark.parametrize(
+        ("gateway_role", "top_role", "gateway_port", "top_port", "binds"),
+        [
+            pytest.param(
+                "inbound", "remote", 9901, 9911, False, id="top-remote-wins"
+            ),
+            pytest.param(
+                "remote", "inbound", 9902, 9912, True, id="top-inbound-wins"
+            ),
+        ],
+    )
+    def test_a2a_hook_uses_effective_platform_precedence(
+        self,
+        tmp_path,
+        monkeypatch,
+        gateway_role,
+        top_role,
+        gateway_port,
+        top_port,
+        binds,
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    a2a:\n"
+            "      enabled: true\n"
+            f"      role: {gateway_role}\n"
+            f"      port: {gateway_port}\n"
+            "platforms:\n"
+            "  a2a:\n"
+            f"    role: {top_role}\n"
+            f"    port: {top_port}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("A2A_PORT", raising=False)
+
+        config = load_gateway_config()
+        a2a = next(
+            platform_config
+            for platform, platform_config in config.platforms.items()
+            if platform.value == "a2a"
+        )
+
+        assert a2a.extra["role"] == top_role
+        assert a2a.extra["port"] == top_port
+        assert platform_binds_port("a2a", a2a.extra) is binds
+
     def test_shipped_template_does_not_enable_auto_reset(self, tmp_path, monkeypatch):
         """A fresh install seeded from cli-config.yaml.example must not
         auto-reset sessions.

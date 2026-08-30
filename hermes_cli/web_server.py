@@ -3399,12 +3399,24 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
         gateway_cfg = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
         # gateway.platforms first, top-level platforms second — later wins,
         # matching the precedence in gateway.config.load_gateway_config().
-        for src in ((gateway_cfg or {}).get("platforms"), cfg.get("platforms")):
-            if not isinstance(src, dict):
-                continue
-            for plat_name, plat_block in src.items():
-                if isinstance(plat_block, dict):
-                    blocks.setdefault(plat_name, {}).update(plat_block)
+        from gateway.config import _merge_platform_config_blocks
+
+        nested_platforms = (gateway_cfg or {}).get("platforms")
+        top_platforms = cfg.get("platforms")
+        platform_names = set()
+        for source in (nested_platforms, top_platforms):
+            if isinstance(source, dict):
+                platform_names.update(source)
+        for name in platform_names:
+            nested_block = (
+                nested_platforms.get(name)
+                if isinstance(nested_platforms, dict)
+                else None
+            )
+            top_block = (
+                top_platforms.get(name) if isinstance(top_platforms, dict) else None
+            )
+            blocks[name] = _merge_platform_config_blocks(nested_block, top_block)
     except Exception:
         blocks = {}
 

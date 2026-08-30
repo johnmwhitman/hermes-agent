@@ -73,6 +73,38 @@ class TestProfilePlatformPorts:
 
         assert _profile_platform_ports(tmp_path, runtime) == {}
 
+    def test_a2a_topology_matches_loader_deep_merge(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    a2a:\n"
+            "      extra:\n"
+            "        role: remote\n"
+            "platforms:\n"
+            "  a2a:\n"
+            "    extra:\n"
+            "      port: 9911\n",
+            encoding="utf-8",
+        )
+        runtime = {"platforms": {"a2a": {"state": "connected"}}}
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from gateway.config import load_gateway_config, platform_binds_port
+
+        loaded = load_gateway_config()
+        a2a = next(
+            config
+            for platform, config in loaded.platforms.items()
+            if platform.value == "a2a"
+        )
+
+        assert a2a.extra["role"] == "remote"
+        assert a2a.extra["port"] == 9911
+        assert platform_binds_port("a2a", a2a.extra) is False
+        assert _profile_platform_ports(tmp_path, runtime) == {}
+
 
 # ---------------------------------------------------------------------------
 # _collect_profile_gateway_topology

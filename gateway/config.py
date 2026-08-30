@@ -284,6 +284,29 @@ def _ensure_platform_extra_dict(platforms_data: dict, name: str) -> tuple[dict, 
     return plat_data, extra
 
 
+def _merge_platform_config_blocks(*blocks: object) -> dict:
+    """Deep-merge platform blocks from lowest to highest precedence.
+
+    Platform configuration is shallow except for ``extra``, whose keys must
+    survive across ``gateway.platforms`` and authoritative top-level
+    ``platforms`` blocks.  Keeping this primitive separate lets read-only
+    topology consumers reproduce the loader's merge without invoking a live
+    profile/config scope.
+    """
+    merged: dict = {}
+    merged_extra: dict = {}
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_extra = block.get("extra")
+        merged = {**merged, **block}
+        if isinstance(block_extra, dict):
+            merged_extra.update(block_extra)
+    if merged_extra:
+        merged["extra"] = merged_extra
+    return merged
+
+
 def _getenv(name: str, default: Optional[str] = None) -> Optional[str]:
     """Read env vars through the active profile secret scope when present.
 
@@ -1622,13 +1645,14 @@ def load_gateway_config() -> GatewayConfig:
                     existing = platforms_data.get(plat_name, {})
                     if not isinstance(existing, dict):
                         existing = {}
-                    # Deep-merge extra dicts so gateway.json defaults survive
-                    merged_extra = {**existing.get("extra", {}), **plat_block.get("extra", {})}
+                    # Deep-merge extra dicts so gateway.json defaults survive.
+                    merged = _merge_platform_config_blocks(existing, plat_block)
                     if "enabled" in plat_block:
+                        merged_extra = merged.get("extra")
+                        if not isinstance(merged_extra, dict):
+                            merged_extra = {}
+                            merged["extra"] = merged_extra
                         merged_extra["_enabled_explicit"] = True
-                    merged = {**existing, **plat_block}
-                    if merged_extra:
-                        merged["extra"] = merged_extra
                     platforms_data[plat_name] = merged
 
             _merge_platform_map(gateway_platforms)
@@ -1834,19 +1858,15 @@ def load_gateway_config() -> GatewayConfig:
                 for entry in _pr.all_entries():
                     if entry.apply_yaml_config_fn is None:
                         continue
-                    platform_cfg = yaml_cfg.get(entry.name)
-                    # Fall back to the platform's block under ``platforms`` /
-                    # ``gateway.platforms`` so adapter hooks still run when the
-                    # user configured the platform only under those nested paths
-                    # (e.g. ``platforms.discord.extra.allow_from``) and not via a
-                    # top-level ``discord:`` block.
-                    if not isinstance(platform_cfg, dict):
-                        for _src in (gateway_platforms, yaml_cfg.get("platforms")):
-                            if isinstance(_src, dict):
-                                _candidate = _src.get(entry.name)
-                                if isinstance(_candidate, dict):
-                                    platform_cfg = _candidate
-                                    break
+                    # Feed hooks the already merged gateway.platforms ->
+                    # top-level platforms block. A legacy direct ``a2a:`` /
+                    # ``slack:`` section remains the highest-precedence layer.
+                    platform_cfg = platforms_data.get(entry.name)
+                    direct_cfg = yaml_cfg.get(entry.name)
+                    if isinstance(direct_cfg, dict):
+                        platform_cfg = _merge_platform_config_blocks(
+                            platform_cfg, direct_cfg
+                        )
                     if not isinstance(platform_cfg, dict):
                         continue
                     try:
