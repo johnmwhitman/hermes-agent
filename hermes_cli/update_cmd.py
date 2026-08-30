@@ -7888,7 +7888,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Plan phase (#91277 Phase 2): snapshot the pre-update fleet — every
     # running Hermes runtime, its supervisor, and its running code version —
     # into the receipt, so a post-mortem can compare what the update SAW
-    # against what it did. Read-only; a probe failure records nothing.
+    # against what it did. Read-only; a critical probe failure records an
+    # incomplete plan and aborts below before backup/download/apply.
     # ``_pre_update_plan`` is read again AFTER the restart phase to reconcile
     # every planned runtime against the phase's bookkeeping (restart via
     # declared mechanism — the plan is the worklist, not just a printout).

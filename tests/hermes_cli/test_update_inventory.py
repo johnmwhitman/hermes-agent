@@ -124,6 +124,49 @@ class TestCollectInventory:
         plan = ui.collect_runtime_inventory()
         assert plan.runtimes == []
         assert plan.install_method == "unknown"
+        assert plan.inventory_complete is False
+
+    @pytest.mark.parametrize(
+        ("target", "warning"),
+        [
+            ("hermes_cli.profiles._get_default_hermes_home", "profile enumeration unavailable"),
+            ("hermes_cli.gateway._get_service_pids", "service supervisor inventory unavailable"),
+            ("hermes_cli.gateway.supports_systemd_services", "gateway runtime-state inventory unavailable"),
+            ("gateway.status.read_runtime_status", "gateway runtime-state inventory unavailable"),
+            ("hermes_cli.gateway.find_profile_gateway_processes", "gateway PID inventory unavailable"),
+        ],
+    )
+    def test_critical_runtime_probe_failure_marks_inventory_incomplete(
+        self, fleet, monkeypatch, target, warning
+    ):
+        def denied(*_args, **_kwargs):
+            raise PermissionError("sensitive host detail must not be reported")
+
+        monkeypatch.setattr(target, denied)
+        plan = ui.collect_runtime_inventory()
+        assert plan.inventory_complete is False
+        assert warning in plan.inventory_warnings
+        assert "sensitive host detail" not in json.dumps(plan.to_dict())
+
+    def test_desktop_row_failure_marks_process_inventory_incomplete(
+        self, fleet, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ui,
+            "_iter_process_cmdlines",
+            lambda: ui.ProcessScanResult(
+                rows=[
+                    ui.ProcessMetadata(
+                        pid="not-a-pid",
+                        argv=["python", "-m", "hermes_cli.main", "serve", "--port", "0"],
+                        hermes_desktop=True,
+                    )
+                ]
+            ),
+        )
+        plan = ui.collect_runtime_inventory()
+        assert plan.inventory_complete is False
+        assert "HTTP backend inventory incomplete" in plan.inventory_warnings
 
     def test_plan_serializes_for_receipt(self, fleet):
         plan = ui.collect_runtime_inventory()
@@ -344,17 +387,15 @@ class TestDesktopServeCommandParser:
             "serve --port=0"
         ).profile == "coder"
 
-    def test_bare_profile_is_unknown_and_duplicate_flags_use_last_value(self):
+    def test_bare_profile_is_unknown_and_duplicate_profile_flags_are_rejected(self):
         bare = ui._parse_desktop_serve_command(
             "python -m hermes_cli.main serve --port 0"
         )
         assert bare.profile is None
-        parsed = ui._parse_desktop_serve_command(
+        assert ui._parse_desktop_serve_command(
             "python -m hermes_cli.main --profile first -p second serve "
             "--port 9119 --port=0"
-        )
-        assert parsed.profile == "second"
-        assert parsed.port == 0
+        ) is None
 
     def test_accepts_legacy_dashboard_and_remote_python_script_family(self):
         parsed = ui._parse_desktop_serve_command(

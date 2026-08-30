@@ -128,6 +128,42 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
 
 
+def test_incomplete_runtime_inventory_aborts_before_backup_or_apply(
+    monkeypatch, tmp_path, capsys
+):
+    from hermes_cli import update_inventory
+
+    _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    monkeypatch.setattr(
+        update_inventory,
+        "collect_runtime_inventory",
+        lambda: update_inventory.UpdatePlan(
+            inventory_complete=False,
+            inventory_warnings=["process inventory unavailable"],
+        ),
+    )
+    mutations = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_run_pre_update_backup",
+        lambda *_args, **_kwargs: mutations.append("backup"),
+    )
+    monkeypatch.setattr(
+        hermes_main.subprocess,
+        "run",
+        lambda *_args, **_kwargs: mutations.append("apply"),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        hermes_main.cmd_update(
+            SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+        )
+
+    assert raised.value.code == 1
+    assert mutations == []
+    assert "aborted before mutation" in capsys.readouterr().out
+
+
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     """When the pull advances HEAD, the update proceeds normally."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)

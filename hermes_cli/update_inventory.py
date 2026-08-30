@@ -112,6 +112,13 @@ class ProcessScanResult:
     warnings: list[str] = field(default_factory=list)
 
 
+def _mark_inventory_incomplete(plan: UpdatePlan, warning: str) -> None:
+    """Record sanitized, deduplicated uncertainty from a critical probe."""
+    plan.inventory_complete = False
+    if warning not in plan.inventory_warnings:
+        plan.inventory_warnings.append(warning)
+
+
 def _detect_supervisor_for_pid(
     pid: int, service_pids: set, windows_service_pids: set | None = None
 ) -> str:
@@ -123,15 +130,12 @@ def _detect_supervisor_for_pid(
         # under its own mechanism id, not "manual".
         return "windows-service"
     if pid in service_pids:
-        try:
-            from hermes_cli.gateway import is_macos, supports_systemd_services
+        from hermes_cli.gateway import is_macos, supports_systemd_services
 
-            if supports_systemd_services():
-                return "systemd"
-            if is_macos():
-                return "launchd"
-        except Exception:
-            pass
+        if supports_systemd_services():
+            return "systemd"
+        if is_macos():
+            return "launchd"
         return "service"
     return "manual"
 
@@ -217,6 +221,7 @@ def _parse_desktop_serve_argv(argv: list[str]) -> Optional[ParsedBackendCommand]
         return None
 
     profile: Optional[str] = None
+    profile_seen = False
     command_index: Optional[int] = None
     index = 0
     while index < len(cli_argv):
@@ -225,13 +230,19 @@ def _parse_desktop_serve_argv(argv: list[str]) -> Optional[ParsedBackendCommand]
             command_index = index
             break
         if token in {"--profile", "-p"}:
+            if profile_seen:
+                return None
             if index + 1 >= len(cli_argv):
                 return None
             profile = cli_argv[index + 1]
+            profile_seen = True
             index += 2
             continue
         if token.startswith("--profile="):
+            if profile_seen:
+                return None
             profile = token.split("=", 1)[1]
+            profile_seen = True
             index += 1
             continue
         # Desktop only places its optional profile selector before the command.
@@ -489,6 +500,9 @@ def _collect_desktop_serve_runtimes(
             seen_pids.add(pid)
         except Exception as exc:
             logger.debug("Desktop serve inventory row failed: %s", exc)
+            scanned.complete = False
+            if "HTTP backend inventory incomplete" not in scanned.warnings:
+                scanned.warnings.append("HTTP backend inventory incomplete")
     return runtimes, scanned
 
 
@@ -569,6 +583,7 @@ def collect_runtime_inventory() -> UpdatePlan:
         plan.profiles = [name for name, _ in profile_homes]
     except Exception as exc:
         logger.debug("Profile enumeration failed: %s", exc)
+        _mark_inventory_incomplete(plan, "profile enumeration unavailable")
 
     # --- service-managed PIDs (fleet-wide) ---------------------------------
     service_pids: set = set()
@@ -578,6 +593,9 @@ def collect_runtime_inventory() -> UpdatePlan:
         service_pids = _get_service_pids(all_profiles=True) or set()
     except Exception as exc:
         logger.debug("Service-PID probe failed: %s", exc)
+        _mark_inventory_incomplete(
+            plan, "service supervisor inventory unavailable"
+        )
 
     # --- SCM-supervised gateway PIDs (Windows) ------------------------------
     # find_windows_gateway_services() maps validated gateway PIDs through
@@ -674,6 +692,9 @@ def collect_runtime_inventory() -> UpdatePlan:
             )
     except Exception as exc:
         logger.debug("Gateway-state inventory failed: %s", exc)
+        _mark_inventory_incomplete(
+            plan, "gateway runtime-state inventory unavailable"
+        )
 
     # PID-file mapped gateways not covered by a runtime-status record
     try:
@@ -697,6 +718,7 @@ def collect_runtime_inventory() -> UpdatePlan:
             )
     except Exception as exc:
         logger.debug("PID-file gateway inventory failed: %s", exc)
+        _mark_inventory_incomplete(plan, "gateway PID inventory unavailable")
 
     # Serve/dashboard backends from the spawn ledger (#63206). These are the
     # runtimes the gateway collectors above can never see: a manually
@@ -748,8 +770,8 @@ def collect_runtime_inventory() -> UpdatePlan:
     )
     plan.runtimes.extend(http_runtimes)
     if not process_scan.complete:
-        plan.inventory_complete = False
-        plan.inventory_warnings.extend(process_scan.warnings)
+        for warning in process_scan.warnings:
+            _mark_inventory_incomplete(plan, warning)
 
     return plan
 

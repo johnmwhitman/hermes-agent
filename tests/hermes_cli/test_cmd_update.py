@@ -88,6 +88,7 @@ def _patch_gateway_discovery():
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
          patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.gateway._get_service_pids", return_value=set()), \
          patch(
              "hermes_cli.update_inventory._iter_process_cmdlines",
              return_value=ProcessScanResult(),
