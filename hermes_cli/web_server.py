@@ -3396,27 +3396,10 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
         # home, so read the probed profile's file via the raw primitive.
         from hermes_cli.config import read_user_config_raw
         cfg = read_user_config_raw(profile_home / "config.yaml")
-        gateway_cfg = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
-        # gateway.platforms first, top-level platforms second — later wins,
-        # matching the precedence in gateway.config.load_gateway_config().
-        from gateway.config import _merge_platform_config_blocks
+        from gateway.config import _effective_yaml_platform_config
 
-        nested_platforms = (gateway_cfg or {}).get("platforms")
-        top_platforms = cfg.get("platforms")
-        platform_names = set()
-        for source in (nested_platforms, top_platforms):
-            if isinstance(source, dict):
-                platform_names.update(source)
-        for name in platform_names:
-            nested_block = (
-                nested_platforms.get(name)
-                if isinstance(nested_platforms, dict)
-                else None
-            )
-            top_block = (
-                top_platforms.get(name) if isinstance(top_platforms, dict) else None
-            )
-            blocks[name] = _merge_platform_config_blocks(nested_block, top_block)
+        for name in active:
+            blocks[name] = _effective_yaml_platform_config(cfg, name)
     except Exception:
         blocks = {}
 

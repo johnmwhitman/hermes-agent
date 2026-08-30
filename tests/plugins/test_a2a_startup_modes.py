@@ -134,7 +134,11 @@ def test_top_level_remote_config_is_bridged_into_platform_extra():
 
     seeded = platform_registration["apply_yaml_config_fn"]({}, raw)
 
-    assert seeded == {"role": "remote", "port": 0}
+    assert seeded == {
+        "inbound_disabled": True,
+        "role": "remote",
+        "port": 0,
+    }
     assert registered_tools == {
         "a2a_call",
         "a2a_discover",

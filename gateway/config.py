@@ -288,10 +288,9 @@ def _merge_platform_config_blocks(*blocks: object) -> dict:
     """Deep-merge platform blocks from lowest to highest precedence.
 
     Platform configuration is shallow except for ``extra``, whose keys must
-    survive across ``gateway.platforms`` and authoritative top-level
-    ``platforms`` blocks.  Keeping this primitive separate lets read-only
-    topology consumers reproduce the loader's merge without invoking a live
-    profile/config scope.
+    survive across every accepted YAML location. Keeping this primitive
+    separate lets read-only topology consumers reproduce the loader's merge
+    without invoking a live profile/config scope.
     """
     merged: dict = {}
     merged_extra: dict = {}
@@ -305,6 +304,38 @@ def _merge_platform_config_blocks(*blocks: object) -> dict:
     if merged_extra:
         merged["extra"] = merged_extra
     return merged
+
+
+def _effective_yaml_platform_config(yaml_cfg: object, name: str) -> dict:
+    """Return one platform's canonical config.yaml block.
+
+    Source precedence, lowest to highest, is:
+
+    1. ``gateway.platforms.<name>``
+    2. ``gateway.<name>``
+    3. top-level ``platforms.<name>``
+    4. legacy top-level ``<name>``
+
+    Each layer shallow-merges ordinary keys and deep-merges ``extra``.  Both
+    runtime loading and read-only dashboard topology use this function.
+    """
+    if not isinstance(yaml_cfg, dict):
+        return {}
+    gateway_cfg = yaml_cfg.get("gateway")
+    if not isinstance(gateway_cfg, dict):
+        gateway_cfg = {}
+    gateway_platforms = gateway_cfg.get("platforms")
+    if not isinstance(gateway_platforms, dict):
+        gateway_platforms = {}
+    top_platforms = yaml_cfg.get("platforms")
+    if not isinstance(top_platforms, dict):
+        top_platforms = {}
+    return _merge_platform_config_blocks(
+        gateway_platforms.get(name),
+        gateway_cfg.get(name),
+        top_platforms.get(name),
+        yaml_cfg.get(name),
+    )
 
 
 def _getenv(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -1655,27 +1686,25 @@ def load_gateway_config() -> GatewayConfig:
                         merged_extra["_enabled_explicit"] = True
                     platforms_data[plat_name] = merged
 
-            _merge_platform_map(gateway_platforms)
-            _merge_platform_map(yaml_cfg.get("platforms"))
-
-            # Also merge platform configs placed directly under ``gateway.*``
-            # (e.g. ``gateway.api_server``) so subsections are discovered the
-            # same way ``gateway.streaming`` is handled elsewhere.  Iterate
-            # all ``gateway:*`` keys and merge only those that match a known
-            # platform value, skipping reserved keys like ``platforms``.
-            if isinstance(gateway_cfg, dict):
-                _nested_platforms: dict = {}
-                for _k, _v in gateway_cfg.items():
-                    if _k == "platforms":
+            configured_platform_names: set[str] = set()
+            for source in (gateway_platforms, yaml_cfg.get("platforms")):
+                if isinstance(source, dict):
+                    configured_platform_names.update(str(name) for name in source)
+            for source in (gateway_cfg, yaml_cfg):
+                if not isinstance(source, dict):
+                    continue
+                for name, block in source.items():
+                    if name in {"gateway", "platforms"} or not isinstance(block, dict):
                         continue
                     try:
-                        Platform(_k)
+                        Platform(name)
                     except (ValueError, AttributeError):
                         continue
-                    if isinstance(_v, dict):
-                        _nested_platforms[_k] = _v
-                if _nested_platforms:
-                    _merge_platform_map(_nested_platforms)
+                    configured_platform_names.add(name)
+            for name in configured_platform_names:
+                effective = _effective_yaml_platform_config(yaml_cfg, name)
+                if effective:
+                    _merge_platform_map({name: effective})
 
             # Bridge api_server-specific keys (port, key, host, cors_origins,
             # model_name) into extra so PlatformConfig.from_dict preserves
@@ -1717,26 +1746,16 @@ def load_gateway_config() -> GatewayConfig:
             for plat in _shared_loop_targets:
                 if plat == Platform.LOCAL:
                     continue
-                platform_cfg = yaml_cfg.get(plat.value)
-                _cfg_toplevel = isinstance(platform_cfg, dict)
-                # Fall back to the platform's block under ``platforms`` /
-                # ``gateway.platforms`` so shared-key bridging (allow_from,
-                # require_mention, free_response_channels, …) still runs when
-                # the user configured the platform only under those nested paths
-                # and not via a top-level block.  Mirrors the identical fallback
-                # already applied to the apply_yaml_config_fn dispatch below
-                # (#44f3e51).
+                direct_platform_cfg = yaml_cfg.get(plat.value)
+                _cfg_toplevel = isinstance(direct_platform_cfg, dict)
+                # Shared-key bridges consume the same four-source effective
+                # block as generic loading, plugin hooks, and dashboard
+                # topology (#44f3e51).
                 # Note: ``enabled`` is only written to plat_data from a
                 # top-level block (``_cfg_toplevel``); for nested-only configs
                 # ``_merge_platform_map`` already merged it with the correct
                 # precedence, so re-applying it here would overwrite that.
-                if not _cfg_toplevel:
-                    for _src in (gateway_platforms, yaml_cfg.get("platforms")):
-                        if isinstance(_src, dict):
-                            _candidate = _src.get(plat.value)
-                            if isinstance(_candidate, dict):
-                                platform_cfg = _candidate
-                                break
+                platform_cfg = _effective_yaml_platform_config(yaml_cfg, plat.value)
                 if not isinstance(platform_cfg, dict):
                     continue
                 # Collect bridgeable keys from this platform section
@@ -1858,15 +1877,11 @@ def load_gateway_config() -> GatewayConfig:
                 for entry in _pr.all_entries():
                     if entry.apply_yaml_config_fn is None:
                         continue
-                    # Feed hooks the already merged gateway.platforms ->
-                    # top-level platforms block. A legacy direct ``a2a:`` /
-                    # ``slack:`` section remains the highest-precedence layer.
-                    platform_cfg = platforms_data.get(entry.name)
-                    direct_cfg = yaml_cfg.get(entry.name)
-                    if isinstance(direct_cfg, dict):
-                        platform_cfg = _merge_platform_config_blocks(
-                            platform_cfg, direct_cfg
-                        )
+                    # Feed hooks the same four-source effective block used by
+                    # the generic loader and dashboard topology.
+                    platform_cfg = _effective_yaml_platform_config(
+                        yaml_cfg, entry.name
+                    )
                     if not isinstance(platform_cfg, dict):
                         continue
                     try:

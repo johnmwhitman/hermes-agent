@@ -55,6 +55,13 @@ value takes precedence. Unknown roles and non-boolean `inbound_disabled`
 values are rejected before listener construction. Bind host and port settings,
 including `A2A_HOST` and `A2A_PORT`, are not parsed in listener-free mode.
 
+Hermes accepts four historical YAML locations. Their precedence from lowest
+to highest is `gateway.platforms.a2a`, `gateway.a2a`, `platforms.a2a`, then the
+legacy direct root `a2a` block. Ordinary keys are replaced by the higher
+source; `extra` is deep-merged so unrelated lower-source keys survive. Within
+one effective block, an explicit `extra.role`, `extra.port`, or
+`extra.inbound_disabled` wins over the corresponding shorthand key.
+
 ## Outbound — call other agents
 
 The agent gets five tools:

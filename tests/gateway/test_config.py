@@ -280,6 +280,74 @@ class TestGatewayConfigRoundtrip:
 
 class TestLoadGatewayConfig:
     @pytest.mark.parametrize(
+        ("direct_extra", "expected_binds", "expected_valid"),
+        [
+            pytest.param(
+                {"role": "remote", "port": 9903},
+                False,
+                True,
+                id="remote-role",
+            ),
+            pytest.param(
+                {"inbound_disabled": True, "port": 9904},
+                False,
+                True,
+                id="inbound-disabled",
+            ),
+            pytest.param(
+                {"role": "sideways", "port": 9905},
+                True,
+                False,
+                id="malformed-role",
+            ),
+            pytest.param(
+                {"inbound_disabled": "true", "port": 9906},
+                True,
+                False,
+                id="malformed-flag",
+            ),
+            pytest.param(
+                {"role": "inbound", "port": 9907},
+                True,
+                True,
+                id="inbound-port",
+            ),
+        ],
+    )
+    def test_a2a_legacy_direct_nested_extra_is_persisted(
+        self,
+        tmp_path,
+        monkeypatch,
+        direct_extra,
+        expected_binds,
+        expected_valid,
+    ):
+        import yaml
+        from plugins.platforms import a2a as a2a_plugin
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"a2a": {"enabled": True, "extra": direct_extra}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("A2A_PORT", raising=False)
+
+        config = load_gateway_config()
+        a2a = next(
+            platform_config
+            for platform, platform_config in config.platforms.items()
+            if platform.value == "a2a"
+        )
+
+        assert a2a.enabled is True
+        for key, value in direct_extra.items():
+            assert a2a.extra[key] == value
+        assert platform_binds_port("a2a", a2a.extra) is expected_binds
+        assert a2a_plugin.validate_config(a2a) is expected_valid
+
+    @pytest.mark.parametrize(
         ("gateway_role", "top_role", "gateway_port", "top_port", "binds"),
         [
             pytest.param(
@@ -327,6 +395,66 @@ class TestLoadGatewayConfig:
 
         assert a2a.extra["role"] == top_role
         assert a2a.extra["port"] == top_port
+        assert platform_binds_port("a2a", a2a.extra) is binds
+
+    @pytest.mark.parametrize(
+        ("config_text", "expected_role", "expected_port", "binds"),
+        [
+            pytest.param(
+                "gateway:\n"
+                "  a2a:\n"
+                "    enabled: true\n"
+                "    role: inbound\n"
+                "    port: 9901\n"
+                "platforms:\n"
+                "  a2a:\n"
+                "    role: remote\n"
+                "    port: 9902\n",
+                "remote",
+                9902,
+                False,
+                id="platforms-over-gateway-direct",
+            ),
+            pytest.param(
+                "platforms:\n"
+                "  a2a:\n"
+                "    enabled: true\n"
+                "    role: inbound\n"
+                "    port: 9902\n"
+                "a2a:\n"
+                "  role: remote\n"
+                "  port: 9904\n",
+                "remote",
+                9904,
+                False,
+                id="legacy-direct-over-platforms",
+            ),
+        ],
+    )
+    def test_a2a_all_yaml_locations_share_canonical_precedence(
+        self,
+        tmp_path,
+        monkeypatch,
+        config_text,
+        expected_role,
+        expected_port,
+        binds,
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(config_text, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("A2A_PORT", raising=False)
+
+        config = load_gateway_config()
+        a2a = next(
+            platform_config
+            for platform, platform_config in config.platforms.items()
+            if platform.value == "a2a"
+        )
+
+        assert a2a.extra["role"] == expected_role
+        assert a2a.extra["port"] == expected_port
         assert platform_binds_port("a2a", a2a.extra) is binds
 
     def test_shipped_template_does_not_enable_auto_reset(self, tmp_path, monkeypatch):

@@ -65,11 +65,12 @@ def _apply_yaml_config(_yaml_cfg: dict, a2a_cfg: dict) -> dict | None:
     nested = a2a_cfg.get("extra")
     if not isinstance(nested, dict):
         nested = {}
-    seeded = {
+    seeded = dict(nested)
+    seeded.update({
         key: a2a_cfg[key]
         for key in ("role", "port", "inbound_disabled")
         if key in a2a_cfg and key not in nested
-    }
+    })
     return seeded or None
 
 

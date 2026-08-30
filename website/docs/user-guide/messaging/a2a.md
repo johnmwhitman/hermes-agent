@@ -76,6 +76,12 @@ value wins. In a multiplexed gateway, outbound-only A2A is allowed on a
 secondary profile; listener-capable or malformed A2A configurations remain
 reserved for the default profile and are rejected before startup/config write.
 
+For compatibility, Hermes accepts four A2A YAML locations. Precedence from
+lowest to highest is `gateway.platforms.a2a`, `gateway.a2a`,
+`platforms.a2a`, then the legacy direct root `a2a` block. Higher sources
+replace ordinary keys, while `extra` is deep-merged. Within the resulting
+block, an explicit nested `extra` value wins over the matching shorthand.
+
 ## Outbound: calling other agents
 
 With the `a2a` toolset enabled, the agent gets:

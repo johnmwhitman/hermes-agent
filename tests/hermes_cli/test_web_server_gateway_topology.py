@@ -105,6 +105,38 @@ class TestProfilePlatformPorts:
         assert platform_binds_port("a2a", a2a.extra) is False
         assert _profile_platform_ports(tmp_path, runtime) == {}
 
+    @pytest.mark.parametrize(
+        "config",
+        [
+            pytest.param(
+                "gateway:\n"
+                "  a2a:\n"
+                "    role: inbound\n"
+                "    port: 9901\n"
+                "platforms:\n"
+                "  a2a:\n"
+                "    role: remote\n"
+                "    port: 9902\n",
+                id="platforms-over-gateway-direct",
+            ),
+            pytest.param(
+                "platforms:\n"
+                "  a2a:\n"
+                "    role: inbound\n"
+                "    port: 9902\n"
+                "a2a:\n"
+                "  role: remote\n"
+                "  port: 9904\n",
+                id="legacy-direct-over-platforms",
+            ),
+        ],
+    )
+    def test_a2a_topology_uses_all_source_precedence(self, tmp_path, config):
+        (tmp_path / "config.yaml").write_text(config, encoding="utf-8")
+        runtime = {"platforms": {"a2a": {"state": "connected"}}}
+
+        assert _profile_platform_ports(tmp_path, runtime) == {}
+
 
 # ---------------------------------------------------------------------------
 # _collect_profile_gateway_topology
