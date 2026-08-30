@@ -260,6 +260,11 @@ def _parse_desktop_serve_argv(argv: list[str]) -> Optional[ParsedBackendCommand]
     port: Optional[str] = None
     tail = cli_argv[command_index + 1 :]
     for index, token in enumerate(tail):
+        if token in {"--profile", "-p"} or token.startswith("--profile="):
+            # The real top-level parser consumes profile selectors only before
+            # the subcommand; leftovers in the subparser make the invocation
+            # invalid. Never inventory a command the CLI itself would reject.
+            return None
         if token == "--port":
             if index + 1 >= len(tail):
                 return None

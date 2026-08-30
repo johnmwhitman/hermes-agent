@@ -397,6 +397,17 @@ class TestDesktopServeCommandParser:
             "--port 9119 --port=0"
         ) is None
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python -m hermes_cli.main --profile first serve -p second --port 0",
+            "python -m hermes_cli.main serve --profile first -p second --port 0",
+            "python -m hermes_cli.main dashboard --no-open --profile=first --port 0",
+        ],
+    )
+    def test_rejects_profile_selectors_after_backend_subcommand(self, command):
+        assert ui._parse_desktop_serve_command(command) is None
+
     def test_accepts_legacy_dashboard_and_remote_python_script_family(self):
         parsed = ui._parse_desktop_serve_command(
             "python /opt/hermes/hermes --profile remote dashboard --no-open --port 0"
