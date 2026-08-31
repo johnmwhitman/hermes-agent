@@ -788,6 +788,65 @@ def test_forwarded_profile_scope_honors_cli_coding_focus(monkeypatch, tmp_path):
     ) == (["coding"], [])
 
 
+def test_forwarded_profile_scope_uses_canonical_env_expansion_and_defaults(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli.config import DEFAULT_CONFIG
+    from hermes_cli.tools_config import _get_platform_tools
+    from plugins.platforms.a2a import adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_profile_home", lambda _profile: str(tmp_path))
+    monkeypatch.setenv("A2A_TEST_TOOLSET", "hermes-cli")
+    (tmp_path / "config.yaml").write_text(
+        'platform_toolsets:\n  cli: ["${A2A_TEST_TOOLSET}"]\n',
+        encoding="utf-8",
+    )
+
+    expanded = adapter_module._served_profile_toolset_scope(
+        {"profile": "research", "local": False}
+    )
+    expected_config = dict(DEFAULT_CONFIG)
+    expected_config["platform_toolsets"] = {"cli": ["hermes-cli"]}
+    assert expanded == (sorted(_get_platform_tools(expected_config, "cli")), [])
+
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  max_turns: 7\n",
+        encoding="utf-8",
+    )
+    resolved = adapter_module._served_profile_toolset_scope(
+        {"profile": "research", "local": False}
+    )
+
+    assert resolved is not None
+    enabled, disabled = resolved
+    assert enabled == sorted(_get_platform_tools(DEFAULT_CONFIG, "cli"))
+    assert disabled == []
+
+
+def test_malformed_served_scope_does_not_hydrate_profile_secrets(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import env_loader
+    from plugins.platforms.a2a import adapter as adapter_module
+
+    (tmp_path / "config.yaml").write_text(
+        "platform_toolsets:\n  cli: hermes-cli\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(adapter_module, "_profile_home", lambda _profile: str(tmp_path))
+    hydrate_calls = []
+    monkeypatch.setattr(
+        env_loader,
+        "hydrate_profile_secret_sources",
+        lambda home: hydrate_calls.append(home),
+    )
+
+    assert adapter_module._served_profile_toolset_scope(
+        {"profile": "research", "local": False}
+    ) is None
+    assert hydrate_calls == []
+
+
 def test_prepare_task_scopes_binding_catalog_to_served_profile(monkeypatch, tmp_path):
     from gateway.config import PlatformConfig
     from plugins.platforms.a2a import adapter as adapter_module
@@ -927,6 +986,66 @@ def test_prepare_task_rejects_when_served_profile_scope_is_unavailable(
     assert pending is None
     assert terminal["status"]["state"] == protocol.STATE_REJECTED
     assert "served profile tool scope" in terminal["status"]["message"]["parts"][0]["text"]
+
+
+def test_prepare_task_rejects_when_scoped_catalog_assembly_fails_before_side_effects(
+    monkeypatch, tmp_path,
+):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.a2a import adapter as adapter_module
+    from plugins.platforms.a2a import protocol
+
+    profile_home = tmp_path / "research"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli: [hermes-cli]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(adapter_module, "_profile_home", lambda _profile: str(profile_home))
+    monkeypatch.setattr(posture, "load_persisted_bindings", lambda: {})
+    monkeypatch.setattr(posture, "_binding_store_path", lambda: tmp_path / "bindings.json")
+    monkeypatch.setattr(
+        adapter_module,
+        "_served_profile_toolset_scope",
+        lambda _route: (["hermes-cli"], ["a2a"]),
+    )
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("catalog unavailable")),
+    )
+    adapter = adapter_module.A2AAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"agents": {"research": {"profile": "research"}}},
+        )
+    )
+
+    def side_effect(*_args, **_kwargs):
+        raise AssertionError("catalog failure reached a side-effect boundary")
+
+    monkeypatch.setattr(adapter_module.security, "audit", side_effect)
+    monkeypatch.setattr(protocol, "persist_message", side_effect)
+    monkeypatch.setattr(posture, "claim_persisted_binding", side_effect)
+    monkeypatch.setattr(adapter.tasks, "create", side_effect)
+    adapter._forward_to_profile = side_effect
+    params = {
+        "message": protocol.text_message(
+            protocol.ROLE_USER,
+            "must fail closed",
+            context_id="ctx-catalog-failure",
+        )
+    }
+
+    terminal, pending = adapter._prepare_task(
+        params,
+        "alice",
+        agent=adapter._agents["research"],
+        credential_authenticated=True,
+    )
+
+    assert pending is None
+    assert terminal["status"]["state"] == protocol.STATE_REJECTED
+    assert "catalog" in terminal["status"]["message"]["parts"][0]["text"]
 
 
 def test_prepare_task_establishes_authorized_mutable_binding_and_rejects_reuse(

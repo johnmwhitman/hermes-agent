@@ -30,7 +30,6 @@ Bind safety: with no token configured, the server binds 127.0.0.1 only.
 from __future__ import annotations
 
 import asyncio
-import copy
 import hashlib
 import json
 import logging
@@ -153,31 +152,21 @@ def _profile_home(profile: str) -> Optional[str]:
 
 
 @contextmanager
-def _served_profile_home_scope(agent: dict):
-    """Temporarily apply the served profile's config and secret scope."""
+def _served_profile_config_scope(agent: dict):
+    """Temporarily apply only the served profile's configuration home."""
     profile = str(agent.get("profile") or "").strip() if isinstance(agent, dict) else ""
     home = _profile_home(profile)
     if not home:
         yield False
         return
     home_token = None
-    secret_token = None
     try:
         from hermes_constants import (
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        from agent.secret_scope import (
-            build_profile_secret_scope,
-            reset_secret_scope,
-            set_secret_scope,
-        )
-        from hermes_cli.env_loader import hydrate_profile_secret_sources
 
-        token = set_hermes_home_override(str(home))
-        home_token = token
-        hydrate_profile_secret_sources(Path(home))
-        secret_token = set_secret_scope(build_profile_secret_scope(Path(home)))
+        home_token = set_hermes_home_override(str(home))
     except Exception:
         if home_token is not None:
             reset_hermes_home_override(home_token)
@@ -186,10 +175,42 @@ def _served_profile_home_scope(agent: dict):
     try:
         yield True
     finally:
-        if secret_token is not None:
-            reset_secret_scope(secret_token)
         if home_token is not None:
             reset_hermes_home_override(home_token)
+
+
+@contextmanager
+def _served_profile_secret_scope(agent: dict):
+    """Apply secrets only after the served profile policy has validated."""
+    home = _profile_home(
+        str(agent.get("profile") or "").strip() if isinstance(agent, dict) else ""
+    )
+    if not home:
+        yield False
+        return
+    secret_token = None
+    with _served_profile_config_scope(agent) as scoped:
+        if not scoped:
+            yield False
+            return
+        try:
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                reset_secret_scope,
+                set_secret_scope,
+            )
+            from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+            hydrate_profile_secret_sources(Path(home))
+            secret_token = set_secret_scope(build_profile_secret_scope(Path(home)))
+        except Exception:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
 
 
 def _served_profile_toolset_scope(
@@ -213,34 +234,30 @@ def _served_profile_toolset_scope(
         return None
     config_path = Path(home) / "config.yaml"
     try:
-        with _served_profile_home_scope(agent) as scoped:
+        with _served_profile_config_scope(agent) as scoped:
             if not scoped:
                 return None
             if config_path.is_file():
-                import yaml
+                from utils import fast_safe_load
 
                 with config_path.open("r", encoding="utf-8") as handle:
-                    config = yaml.safe_load(handle)
-                if not isinstance(config, dict):
+                    raw_config = fast_safe_load(handle)
+                if raw_config is not None and not isinstance(raw_config, dict):
                     return None
             elif agent.get("local") is True:
                 # The active/default profile may legitimately have no user
-                # config; destination construction then uses canonical
-                # defaults.  A forwarded named profile without config has no
-                # independently resolvable scope and remains fail-closed.
-                from hermes_cli.config import DEFAULT_CONFIG
-
-                config = copy.deepcopy(DEFAULT_CONFIG)
+                # config; canonical loading then supplies DEFAULT_CONFIG.
+                pass
             else:
                 return None
 
-            # These are the same two transformations used by
-            # gateway.run._load_gateway_config before destination construction.
-            from hermes_cli import managed_scope
-            from hermes_cli.config import _normalize_root_model_keys
+            # Forwarded profiles execute through ``hermes chat``. Resolve the
+            # policy with that same canonical loader so DEFAULT_CONFIG,
+            # environment expansion, normalization, and managed overlay stay
+            # byte-for-byte semantic peers of destination construction.
+            from hermes_cli.config import load_config
 
-            config = managed_scope.apply_managed_overlay(config)
-            config = _normalize_root_model_keys(config)
+            config = load_config()
             if not isinstance(config, dict):
                 return None
 
@@ -1225,10 +1242,9 @@ class A2AAdapter(BasePlatformAdapter):
             ), None
         enabled_toolsets, disabled_toolsets = toolset_scope
         available_names = set(agent.get("mutable_tool_names") or ())
-        catalog_loaded = False
         try:
             from model_tools import get_tool_definitions
-            with _served_profile_home_scope(agent) as scoped:
+            with _served_profile_secret_scope(agent) as scoped:
                 if not scoped:
                     raise RuntimeError("served profile home is unavailable")
                 catalog = get_tool_definitions(
@@ -1237,19 +1253,23 @@ class A2AAdapter(BasePlatformAdapter):
                     quiet_mode=True,
                     skip_tool_search_assembly=True,
                 ) or []
-            catalog_loaded = True
             available_names.update(
                 td.get("function", {}).get("name")
                 for td in catalog
                 if isinstance(td, dict) and isinstance(td.get("function"), dict)
             )
         except Exception:
-            pass
-        # If schema assembly was unavailable, retain the closed policy names;
-        # otherwise bind only the concrete names that actually assembled.
-        if not catalog_loaded:
-            available_names.update(posture.READONLY_TOOL_NAMES)
-            available_names.update(mutable_toolsets)
+            logger.warning(
+                "A2A: scoped tool catalog assembly failed for served profile %r",
+                agent.get("profile") if isinstance(agent, dict) else None,
+                exc_info=True,
+            )
+            return protocol.build_task(
+                task_id,
+                context_id,
+                protocol.STATE_REJECTED,
+                "served profile tool catalog is unavailable",
+            ), None
         mutable_names = posture.resolve_mutable_names(mutable_toolsets, available_names)
         requested_allowed = posture.allowed_tool_names(mutable, mutable_names)
         allowed = frozenset(requested_allowed & available_names)
