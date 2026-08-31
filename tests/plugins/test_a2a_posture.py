@@ -719,6 +719,216 @@ def test_served_agent_peer_binding_is_explicit_not_slug_equality():
     assert not security.is_authorized_for_agent("conductor", None)
 
 
+def test_served_profile_toolset_scope_fails_closed_without_valid_config(
+    monkeypatch, tmp_path,
+):
+    from plugins.platforms.a2a import adapter as adapter_module
+
+    profile_home = tmp_path / "research"
+    profile_home.mkdir()
+    monkeypatch.setattr(adapter_module, "_profile_home", lambda _profile: str(profile_home))
+    route = {"profile": "research", "local": False}
+
+    assert adapter_module._served_profile_toolset_scope(route) is None
+
+    (profile_home / "config.yaml").write_text("- malformed\n", encoding="utf-8")
+    assert adapter_module._served_profile_toolset_scope(route) is None
+
+    (profile_home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli: hermes-cli\n", encoding="utf-8",
+    )
+    assert adapter_module._served_profile_toolset_scope(route) is None
+
+    (profile_home / "config.yaml").write_text(
+        "agent:\n  disabled_toolsets:\n    malformed: mapping\n", encoding="utf-8",
+    )
+    assert adapter_module._served_profile_toolset_scope(route) is None
+
+
+def test_local_default_profile_without_config_uses_canonical_scope(monkeypatch, tmp_path):
+    from plugins.platforms.a2a import adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_profile_home", lambda _profile: str(tmp_path))
+
+    resolved = adapter_module._served_profile_toolset_scope(
+        {"profile": "default", "local": True}
+    )
+
+    assert resolved is not None
+    enabled, disabled = resolved
+    assert isinstance(enabled, list)
+    assert enabled
+    assert disabled == []
+
+
+def test_forwarded_profile_scope_honors_cli_coding_focus(monkeypatch, tmp_path):
+    from agent import coding_context
+    from hermes_cli import tools_config
+    from plugins.platforms.a2a import adapter as adapter_module
+
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  coding_context: focus\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(adapter_module, "_profile_home", lambda _profile: str(tmp_path))
+    monkeypatch.setattr(
+        coding_context,
+        "coding_selection",
+        lambda **_kwargs: ["coding"],
+    )
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda *_args, **_kwargs: pytest.fail(
+            "focus selection must replace the ordinary CLI toolset resolver"
+        ),
+    )
+
+    assert adapter_module._served_profile_toolset_scope(
+        {"profile": "research", "local": False}
+    ) == (["coding"], [])
+
+
+def test_prepare_task_scopes_binding_catalog_to_served_profile(monkeypatch, tmp_path):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.a2a import adapter as adapter_module
+    from plugins.platforms.a2a import protocol
+
+    monkeypatch.setattr(posture, "load_persisted_bindings", lambda: {})
+    monkeypatch.setattr(
+        posture, "_binding_store_path", lambda: tmp_path / "bindings.json",
+    )
+    monkeypatch.setattr(protocol, "load_conversation", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(protocol, "persist_message", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(adapter_module.security, "audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        adapter_module,
+        "_served_profile_toolset_scope",
+        lambda _route: (["hermes-cli"], ["a2a"]),
+    )
+    catalog_calls = []
+
+    def fake_catalog(**kwargs):
+        catalog_calls.append(kwargs)
+        names = ["read_file"]
+        if kwargs.get("enabled_toolsets") is None:
+            names += ["a2a_history", "a2a_list"]
+        return [
+            {"type": "function", "function": {"name": name}}
+            for name in names
+        ]
+
+    monkeypatch.setattr("model_tools.get_tool_definitions", fake_catalog)
+    adapter = adapter_module.A2AAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "agents": {
+                    "research": {
+                        "profile": "research",
+                        "tenant": "research",
+                    }
+                }
+            },
+        )
+    )
+    captured = {}
+    protected = tmp_path / "read-only-proof.txt"
+    protected.write_text("scoped sentinel", encoding="utf-8")
+    tool_observations = {}
+
+    def fake_forward(*_args, posture_policy=None, **_kwargs):
+        captured.update(posture_policy or {})
+        from model_tools import handle_function_call
+
+        tool_observations["read"] = handle_function_call(
+            "read_file", {"path": str(protected)}, a2a_posture=posture_policy,
+        )
+        tool_observations["terminal"] = handle_function_call(
+            "terminal",
+            {"command": f"printf changed > {protected}"},
+            a2a_posture=posture_policy,
+        )
+        return "ok", protocol.STATE_COMPLETED
+
+    adapter._forward_to_profile = fake_forward
+    params = {
+        "message": protocol.text_message(
+            protocol.ROLE_USER, "read-only task", context_id="ctx-scoped",
+        )
+    }
+
+    terminal, pending = adapter._prepare_task(
+        params,
+        "alice",
+        agent=adapter._agents["research"],
+        credential_authenticated=True,
+    )
+
+    assert pending is None
+    assert terminal["status"]["state"] == protocol.STATE_COMPLETED
+    assert catalog_calls == [{
+        "enabled_toolsets": ["hermes-cli"],
+        "disabled_toolsets": ["a2a"],
+        "quiet_mode": True,
+        "skip_tool_search_assembly": True,
+    }]
+    assert captured["allowed_tool_names"] == ["read_file"]
+    assert "a2a_history" not in captured["allowed_tool_names"]
+    assert "a2a_list" not in captured["allowed_tool_names"]
+    assert posture.child_policy_matches_tools(captured, ["read_file"])
+    assert "scoped sentinel" in str(tool_observations["read"])
+    assert "A2A mutation posture" in str(tool_observations["terminal"])
+    assert protected.read_text(encoding="utf-8") == "scoped sentinel"
+
+
+def test_prepare_task_rejects_when_served_profile_scope_is_unavailable(
+    monkeypatch, tmp_path,
+):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.a2a import adapter as adapter_module
+    from plugins.platforms.a2a import protocol
+
+    monkeypatch.setattr(posture, "load_persisted_bindings", lambda: {})
+    monkeypatch.setattr(
+        posture, "_binding_store_path", lambda: tmp_path / "bindings.json",
+    )
+    monkeypatch.setattr(adapter_module, "_served_profile_toolset_scope", lambda _route: None)
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **_kwargs: pytest.fail("unscoped catalog must not be assembled"),
+    )
+    adapter = adapter_module.A2AAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"agents": {"research": {"profile": "research"}}},
+        )
+    )
+    def side_effect(*_args, **_kwargs):
+        raise AssertionError("missing scope reached a side-effect boundary")
+
+    monkeypatch.setattr(adapter_module.security, "audit", side_effect)
+    monkeypatch.setattr(protocol, "persist_message", side_effect)
+    monkeypatch.setattr(posture, "claim_persisted_binding", side_effect)
+    monkeypatch.setattr(adapter.tasks, "create", side_effect)
+    adapter._forward_to_profile = side_effect
+    params = {
+        "message": protocol.text_message(
+            protocol.ROLE_USER, "must fail closed", context_id="ctx-missing-scope",
+        )
+    }
+
+    terminal, pending = adapter._prepare_task(
+        params,
+        "alice",
+        agent=adapter._agents["research"],
+        credential_authenticated=True,
+    )
+
+    assert pending is None
+    assert terminal["status"]["state"] == protocol.STATE_REJECTED
+    assert "served profile tool scope" in terminal["status"]["message"]["parts"][0]["text"]
+
+
 def test_prepare_task_establishes_authorized_mutable_binding_and_rejects_reuse(
     monkeypatch, tmp_path,
 ):
@@ -733,6 +943,11 @@ def test_prepare_task_establishes_authorized_mutable_binding_and_rejects_reuse(
     monkeypatch.setattr(protocol, "load_conversation", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(protocol, "persist_message", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(adapter_module.security, "audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        adapter_module,
+        "_served_profile_toolset_scope",
+        lambda _route: (["hermes-cli"], []),
+    )
     monkeypatch.setattr(
         "model_tools.get_tool_definitions",
         lambda **_kwargs: [

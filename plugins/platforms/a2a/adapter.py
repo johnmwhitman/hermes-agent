@@ -30,6 +30,7 @@ Bind safety: with no token configured, the server binds 127.0.0.1 only.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -44,8 +45,10 @@ import urllib.request
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import (
@@ -147,6 +150,148 @@ def _profile_home(profile: str) -> Optional[str]:
             except Exception:
                 return None
         return os.path.expanduser(f"~/.hermes/profiles/{profile}")
+
+
+@contextmanager
+def _served_profile_home_scope(agent: dict):
+    """Temporarily apply the served profile's config and secret scope."""
+    profile = str(agent.get("profile") or "").strip() if isinstance(agent, dict) else ""
+    home = _profile_home(profile)
+    if not home:
+        yield False
+        return
+    home_token = None
+    secret_token = None
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            reset_secret_scope,
+            set_secret_scope,
+        )
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+        token = set_hermes_home_override(str(home))
+        home_token = token
+        hydrate_profile_secret_sources(Path(home))
+        secret_token = set_secret_scope(build_profile_secret_scope(Path(home)))
+    except Exception:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _served_profile_toolset_scope(
+    agent: dict,
+) -> Optional[tuple[list[str], list[str]]]:
+    """Resolve the exact toolset scope used by the destination agent.
+
+    Forwarded served profiles execute through ``hermes chat`` and therefore
+    use the CLI platform toolset law.  A route handled by the gateway's active
+    profile executes locally as the A2A platform.  Read the served profile's
+    raw config through the same managed-overlay and normalization steps as the
+    gateway, then use the canonical platform resolver.  Missing, malformed, or
+    unreadable profile config is not a request for every tool: callers must
+    reject the task before assembling an unscoped catalog.
+    """
+    if not isinstance(agent, dict):
+        return None
+    profile = str(agent.get("profile") or "").strip()
+    home = _profile_home(profile)
+    if not home:
+        return None
+    config_path = Path(home) / "config.yaml"
+    try:
+        with _served_profile_home_scope(agent) as scoped:
+            if not scoped:
+                return None
+            if config_path.is_file():
+                import yaml
+
+                with config_path.open("r", encoding="utf-8") as handle:
+                    config = yaml.safe_load(handle)
+                if not isinstance(config, dict):
+                    return None
+            elif agent.get("local") is True:
+                # The active/default profile may legitimately have no user
+                # config; destination construction then uses canonical
+                # defaults.  A forwarded named profile without config has no
+                # independently resolvable scope and remains fail-closed.
+                from hermes_cli.config import DEFAULT_CONFIG
+
+                config = copy.deepcopy(DEFAULT_CONFIG)
+            else:
+                return None
+
+            # These are the same two transformations used by
+            # gateway.run._load_gateway_config before destination construction.
+            from hermes_cli import managed_scope
+            from hermes_cli.config import _normalize_root_model_keys
+
+            config = managed_scope.apply_managed_overlay(config)
+            config = _normalize_root_model_keys(config)
+            if not isinstance(config, dict):
+                return None
+
+            from hermes_cli.tools_config import _get_platform_tools
+
+            platform = "a2a" if agent.get("local") is True else "cli"
+            platform_toolsets = config.get("platform_toolsets")
+            if platform_toolsets is not None and not isinstance(platform_toolsets, dict):
+                return None
+            if (
+                isinstance(platform_toolsets, dict)
+                and platform in platform_toolsets
+                and not isinstance(platform_toolsets[platform], list)
+            ):
+                return None
+            coding_scope = None
+            if platform == "cli":
+                from agent.coding_context import coding_selection
+
+                coding_scope = coding_selection(platform="cli", config=config)
+                if coding_scope is not None and not isinstance(coding_scope, list):
+                    return None
+            enabled = sorted(
+                coding_scope
+                if coding_scope is not None
+                else _get_platform_tools(config, platform)
+            )
+            agent_config = config.get("agent") or {}
+            if not isinstance(agent_config, dict):
+                return None
+            raw_disabled = agent_config.get("disabled_toolsets")
+            if raw_disabled is not None and not isinstance(
+                raw_disabled, (str, list, tuple, set)
+            ):
+                return None
+            from agent.skill_utils import parse_config_string_list
+
+            disabled = [
+                value.strip()
+                for value in parse_config_string_list(raw_disabled or [])
+                if value.strip()
+            ]
+            return enabled, disabled
+    except Exception:
+        logger.warning(
+            "A2A: could not resolve served profile %r toolset scope",
+            profile,
+            exc_info=True,
+        )
+        return None
+
 
 def _safe_context_slug(value: str, max_len: int = 96) -> str:
     """Create a bounded title slug with collision-resistant context identity."""
@@ -1070,14 +1215,28 @@ class A2AAdapter(BasePlatformAdapter):
         # Resolve route toolsets against the same pre-Tool-Search catalog used
         # by agent construction, so the binding fingerprints concrete tool
         # names rather than policy labels such as ``filesystem``.
+        toolset_scope = _served_profile_toolset_scope(agent)
+        if toolset_scope is None:
+            return protocol.build_task(
+                task_id,
+                context_id,
+                protocol.STATE_REJECTED,
+                "served profile tool scope is missing or malformed",
+            ), None
+        enabled_toolsets, disabled_toolsets = toolset_scope
         available_names = set(agent.get("mutable_tool_names") or ())
         catalog_loaded = False
         try:
             from model_tools import get_tool_definitions
-            catalog = get_tool_definitions(
-                quiet_mode=True,
-                skip_tool_search_assembly=True,
-            ) or []
+            with _served_profile_home_scope(agent) as scoped:
+                if not scoped:
+                    raise RuntimeError("served profile home is unavailable")
+                catalog = get_tool_definitions(
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                ) or []
             catalog_loaded = True
             available_names.update(
                 td.get("function", {}).get("name")
