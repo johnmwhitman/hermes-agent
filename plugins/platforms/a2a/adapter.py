@@ -1229,9 +1229,10 @@ class A2AAdapter(BasePlatformAdapter):
         # A genuinely new context may establish a mutable binding. A context
         # with prior durable conversation/task evidence but no binding is a
         # restart/corruption case and must fall back read-only.
-        # Resolve route toolsets against the same pre-Tool-Search catalog used
-        # by agent construction, so the binding fingerprints concrete tool
-        # names rather than policy labels such as ``filesystem``.
+        # Resolve route toolsets through the same final Tool Search assembly
+        # used by child construction, so the binding fingerprints directly
+        # exposed tool names rather than raw deferred catalog entries or
+        # policy labels such as ``filesystem``.
         toolset_scope = _served_profile_toolset_scope(agent)
         if toolset_scope is None:
             return protocol.build_task(
@@ -1251,7 +1252,7 @@ class A2AAdapter(BasePlatformAdapter):
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     quiet_mode=True,
-                    skip_tool_search_assembly=True,
+                    skip_tool_search_assembly=False,
                 ) or []
             available_names.update(
                 td.get("function", {}).get("name")

@@ -6,8 +6,6 @@ context_length, causing the CLI status bar to show 'ctx --'.
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from agent.context_engine import ContextEngine
 
 
@@ -109,10 +107,10 @@ def test_active_context_engine_tools_survive_explicit_platform_toolsets():
     }
 
 
-def test_forwarded_a2a_policy_rejects_late_context_engine_tool_drift(
+def test_forwarded_a2a_policy_filters_unbound_late_context_engine_tools(
     monkeypatch, tmp_path,
 ):
-    """The child fingerprint must cover schemas appended after base tools."""
+    """Late schemas cannot widen the authenticated child allowlist."""
     from plugins.platforms.a2a import posture
 
     engine = _ToolEngine()
@@ -140,11 +138,10 @@ def test_forwarded_a2a_policy_rejects_late_context_engine_tool_drift(
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
-        pytest.raises(ValueError, match="post-assembly toolset fingerprint mismatch"),
     ):
         from run_agent import AIAgent
 
-        AIAgent(
+        agent = AIAgent(
             api_key="test-key-1234567890",
             base_url="https://openrouter.ai/api/v1",
             quiet_mode=True,
@@ -152,6 +149,10 @@ def test_forwarded_a2a_policy_rejects_late_context_engine_tool_drift(
             skip_memory=True,
             a2a_policy=policy,
         )
+
+    assert agent.valid_tool_names == set()
+    assert agent.tools == []
+    assert agent._context_engine_tool_names == set()
 
 
 def test_plugin_engine_update_model_args():
@@ -255,4 +256,3 @@ def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
     assert agent.context_compressor.threshold_percent == 0.85
     # Gateway parity: the notice is stashed for replay on turn 1.
     assert agent._compression_warning and "85%" in agent._compression_warning
-

@@ -25,6 +25,19 @@ class RecordingMemoryProvider:
         pass
 
 
+class ToolMemoryProvider(RecordingMemoryProvider):
+    name = "tool-memory"
+
+    def get_tool_schemas(self):
+        return [
+            {
+                "name": "memory_recall",
+                "description": "Recall provider memory.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+
+
 def test_shutdown_memory_provider_is_idempotent():
     from unittest.mock import MagicMock
 
@@ -75,6 +88,53 @@ def test_blank_memory_provider_does_not_auto_enable_honcho():
     from_global_config.assert_not_called()
     load_memory_provider.assert_not_called()
     save_config.assert_not_called()
+
+
+def test_forwarded_a2a_policy_filters_unbound_memory_provider_tools(
+    monkeypatch, tmp_path,
+):
+    """External memory schemas cannot widen the authenticated child surface."""
+    from plugins.platforms.a2a import posture
+
+    provider = ToolMemoryProvider()
+    cfg = {"memory": {"provider": "tool-memory"}, "agent": {}}
+    secret = b"m" * 32
+    key_path = tmp_path / "a2a_child_issuer.key"
+    key_path.write_bytes(secret)
+    key_path.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    binding = posture.make_binding("alice", "research", "ctx-memory", [])
+    policy = posture.sign_child_policy({
+        "authenticated": True,
+        "served_agent_slug": "research",
+        "context_id": "ctx-memory",
+        "mutation_enabled": False,
+        "allowed_tool_names": [],
+        "binding": binding,
+    }, secret=secret)
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            a2a_policy=policy,
+        )
+
+    assert agent.valid_tool_names == set()
+    assert agent.tools == []
 
 
 def test_close_shuts_down_memory_provider():
@@ -168,5 +228,3 @@ def test_core_tool_names_rejected_from_memory_routing_table():
     assert "clarify" not in schema_names
     assert "delegate_task" not in schema_names
     assert "honcho_search" in schema_names
-
-

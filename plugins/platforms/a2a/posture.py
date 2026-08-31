@@ -52,8 +52,11 @@ READONLY_TOOL_NAMES = frozenset(
 
 # Composite tools create a second execution authority beneath the A2A turn.
 # They remain unavailable until the exact signed posture can be propagated and
-# revalidated inside every nested sandbox RPC and delegated child agent.
-NON_TRANSITIVE_TOOL_NAMES = frozenset({"execute_code", "delegate_task"})
+# revalidated inside every nested sandbox RPC, delegated child agent, or Tool
+# Search bridge dispatch.
+NON_TRANSITIVE_TOOL_NAMES = frozenset(
+    {"execute_code", "delegate_task", "tool_call"}
+)
 
 
 def _platform_value(platform: Any) -> str:

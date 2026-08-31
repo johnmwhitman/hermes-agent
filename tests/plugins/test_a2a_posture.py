@@ -234,12 +234,13 @@ def test_read_only_allowlist_is_exact_and_immutable():
 
 def test_mutable_allowlist_excludes_unbounded_composite_tools():
     allowed = posture.allowed_tool_names(
-        True, ["terminal", "execute_code", "delegate_task"],
+        True, ["terminal", "execute_code", "delegate_task", "tool_call"],
     )
 
     assert "terminal" in allowed
     assert "execute_code" not in allowed
     assert "delegate_task" not in allowed
+    assert "tool_call" not in allowed
 
 
 def test_resume_binding_mismatch_rejects_but_corrupt_binding_is_read_only():
@@ -411,7 +412,9 @@ def test_forwarded_policy_rejects_decision_and_readonly_surface_mismatch():
     assert not posture.child_policy_matches_tools(normalized, [])
 
 
-@pytest.mark.parametrize("forbidden_name", ["execute_code", "delegate_task"])
+@pytest.mark.parametrize(
+    "forbidden_name", ["execute_code", "delegate_task", "tool_call"],
+)
 def test_forwarded_policy_rejects_unbounded_composite_tools(forbidden_name):
     secret = b"c" * 32
     binding = posture.make_binding(
@@ -432,7 +435,9 @@ def test_forwarded_policy_rejects_unbounded_composite_tools(forbidden_name):
     assert posture.load_child_policy(signed, secret=secret).get("error")
 
 
-@pytest.mark.parametrize("forbidden_name", ["execute_code", "delegate_task"])
+@pytest.mark.parametrize(
+    "forbidden_name", ["execute_code", "delegate_task", "tool_call"],
+)
 def test_direct_dispatch_rejects_unbounded_composite_tools(forbidden_name):
     from model_tools import handle_function_call
     from tools.registry import registry
@@ -449,7 +454,9 @@ def test_direct_dispatch_rejects_unbounded_composite_tools(forbidden_name):
     assert "A2A mutation posture" in str(registry_result)
 
 
-@pytest.mark.parametrize("forbidden_name", ["execute_code", "delegate_task"])
+@pytest.mark.parametrize(
+    "forbidden_name", ["execute_code", "delegate_task", "tool_call"],
+)
 def test_direct_dispatch_rejects_forged_composite_allowlist(forbidden_name):
     from model_tools import handle_function_call
     from tools.registry import registry
@@ -500,7 +507,9 @@ def test_source_binding_requires_exact_transport_fields():
     assert not posture.source_binding_valid(source)
 
 
-@pytest.mark.parametrize("forbidden_name", ["execute_code", "delegate_task"])
+@pytest.mark.parametrize(
+    "forbidden_name", ["execute_code", "delegate_task", "tool_call"],
+)
 def test_source_binding_rejects_unbounded_composite_tools(forbidden_name):
     binding = posture.make_binding(
         "alice", "research", "ctx-1", [forbidden_name], mutation_enabled=True,
@@ -869,7 +878,10 @@ def test_prepare_task_scopes_binding_catalog_to_served_profile(monkeypatch, tmp_
     def fake_catalog(**kwargs):
         catalog_calls.append(kwargs)
         names = ["read_file"]
-        if kwargs.get("enabled_toolsets") is None:
+        # The raw catalog contains outbound A2A plugin tools, but Tool Search
+        # defers them from the child's directly exposed schema.  The signed
+        # policy must bind the latter surface.
+        if kwargs.get("skip_tool_search_assembly"):
             names += ["a2a_history", "a2a_list"]
         return [
             {"type": "function", "function": {"name": name}}
@@ -929,7 +941,7 @@ def test_prepare_task_scopes_binding_catalog_to_served_profile(monkeypatch, tmp_
         "enabled_toolsets": ["hermes-cli"],
         "disabled_toolsets": ["a2a"],
         "quiet_mode": True,
-        "skip_tool_search_assembly": True,
+        "skip_tool_search_assembly": False,
     }]
     assert captured["allowed_tool_names"] == ["read_file"]
     assert "a2a_history" not in captured["allowed_tool_names"]
@@ -1074,6 +1086,7 @@ def test_prepare_task_establishes_authorized_mutable_binding_and_rejects_reuse(
             {"type": "function", "function": {"name": "terminal"}},
             {"type": "function", "function": {"name": "execute_code"}},
             {"type": "function", "function": {"name": "delegate_task"}},
+            {"type": "function", "function": {"name": "tool_call"}},
         ],
     )
     adapter = adapter_module.A2AAdapter(
@@ -1088,7 +1101,10 @@ def test_prepare_task_establishes_authorized_mutable_binding_and_rejects_reuse(
                             "terminal", "code_execution", "delegation",
                         ],
                         "mutable_tool_names": [
-                            "terminal", "execute_code", "delegate_task",
+                            "terminal",
+                            "execute_code",
+                            "delegate_task",
+                            "tool_call",
                         ],
                         "mutation_allowed_peers": ["alice"],
                     }
@@ -1121,6 +1137,7 @@ def test_prepare_task_establishes_authorized_mutable_binding_and_rejects_reuse(
     assert "terminal" in captured["allowed_tool_names"]
     assert "execute_code" not in captured["allowed_tool_names"]
     assert "delegate_task" not in captured["allowed_tool_names"]
+    assert "tool_call" not in captured["allowed_tool_names"]
 
     terminal, pending = adapter._prepare_task(
         params,

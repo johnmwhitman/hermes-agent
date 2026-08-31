@@ -2009,6 +2009,16 @@ def init_agent(
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
+    if a2a_policy is not None:
+        # External memory providers are another late schema producer.  Keep
+        # their routing state available to the profile, but expose only names
+        # already authenticated by the forwarded A2A policy.
+        _a2a_allowed_names = frozenset(a2a_policy.get("allowed_tool_names", ()))
+        agent.tools = [
+            tool for tool in (agent.tools or [])
+            if tool.get("function", {}).get("name") in _a2a_allowed_names
+        ]
+        agent.valid_tool_names.intersection_update(_a2a_allowed_names)
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
@@ -2991,6 +3001,14 @@ def init_agent(
                 )
                 continue
             _tname = _schema["name"]
+            # A context engine is a late schema producer.  Forwarded children
+            # may expose one of its tools only when the adapter signed that
+            # exact name into the authenticated posture binding.
+            if (
+                a2a_policy is not None
+                and _tname not in a2a_policy.get("allowed_tool_names", ())
+            ):
+                continue
             if _tname in _existing_tool_names:
                 continue  # already registered via plugin/cache path
             _wrapped = {"type": "function", "function": _schema}
