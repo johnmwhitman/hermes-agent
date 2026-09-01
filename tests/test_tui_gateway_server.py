@@ -16680,7 +16680,9 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server, "_session_info", lambda agent, session=None: {"model": agent.model}
+    )
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -16747,7 +16749,9 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server, "_session_info", lambda agent, session=None: {"model": agent.model}
+    )
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -16780,7 +16784,9 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server, "_session_info", lambda agent, session=None: {"model": agent.model}
+    )
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -16817,7 +16823,9 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
 
 
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server, "_session_info", lambda agent, session=None: {"model": agent.model}
+    )
     server._sessions["sid-large"] = _session(
         agent=types.SimpleNamespace(model="model-large"),
         history=[
@@ -20879,6 +20887,46 @@ def test_fallback_session_info_always_emits_branch(monkeypatch):
 
     assert "branch" in info
     assert info["branch"] == ""
+
+
+@pytest.mark.parametrize(
+    ("provenance", "expected"),
+    [
+        (False, False),
+        (True, True),
+        (None, True),
+        (0, True),
+        ("false", True),
+        ({}, True),
+    ],
+    ids=("false", "true", "null", "zero", "string", "mapping"),
+)
+def test_fallback_session_info_built_agent_preserves_route_pin_provenance(
+    provenance, expected
+):
+    """A deferred agent build must not discard the session's route policy."""
+    agent = types.SimpleNamespace(
+        model="manual/model",
+        provider="anthropic",
+        reasoning_config={},
+        service_tier="",
+        working_directory="",
+        tools=[],
+    )
+    info = server._fallback_session_info(
+        {
+            "agent": agent,
+            "model_override": {
+                "model": "manual/model",
+                "provider": "anthropic",
+                "fallback_disabled": provenance,
+            },
+        }
+    )
+
+    assert info["model"] == "manual/model"
+    assert info["provider"] == "anthropic"
+    assert info["fallback_disabled"] is expected
 
 
 BRANCH_REASONING = "the parent's chain of thought"

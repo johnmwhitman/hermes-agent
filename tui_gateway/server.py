@@ -10986,7 +10986,12 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent)
+        # A lazy session can cross this branch between two watchers: the first
+        # watcher attaches while metadata-only, then the deferred agent build
+        # finishes before the second watcher reconnects. Keep the session record
+        # attached so its model/provider/fallback provenance survives that state
+        # transition instead of falling back to agent/global defaults.
+        return _session_info(agent, session)
     # The SESSION's own workspace, not the gateway's launch directory. Reporting
     # `_default_session_cwd()` here told a lazily-resumed session's client that
     # its workspace was wherever the gateway process happened to start, so the
