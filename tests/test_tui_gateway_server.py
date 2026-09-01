@@ -3236,6 +3236,59 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
     assert captured["history_calls"] == expected_calls
 
 
+@pytest.mark.parametrize(
+    ("provenance", "expected"),
+    [(False, False), (True, True), (None, True), (0, True), ("false", True)],
+)
+def test_session_resume_lazy_info_preserves_exact_route_pin_provenance(
+    monkeypatch, provenance, expected
+):
+    """The immediate cold-resume payload must carry the same exact-boolean
+    route policy that the deferred agent build restores from the stored row.
+
+    Missing or malformed legacy provenance stays pinned; only literal false
+    may advertise the profile-default route before deferred session.info lands.
+    """
+
+    target = f"route-policy-{type(provenance).__name__}-{provenance!s}"
+
+    class FakeDB:
+        def get_session(self, session_id):
+            assert session_id == target
+            return {
+                "id": target,
+                "model": "stored/model",
+                "model_config": {"fallback_disabled": provenance},
+            }
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def reopen_session(self, session_id):
+            assert session_id == target
+
+        def get_resume_conversations(self, session_id):
+            assert session_id == target
+            return [], []
+
+        def get_ancestor_display_prefix(self, session_id):
+            assert session_id == target
+            return []
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: None)
+
+    response = server._methods["session.resume"]("r1", {"session_id": target})
+    sid = response["result"]["session_id"]
+    try:
+        assert response["result"]["info"]["fallback_disabled"] is expected
+        assert server._sessions[sid]["model_override"]["fallback_disabled"] is expected
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_live_visible_history_prefers_db_display_with_candidate():
     """A warm/live session must serve the persisted DISPLAY lineage, not the
     collapsed in-memory model history.
@@ -3538,7 +3591,12 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
 
     class FakeDB:
         def get_session(self, target):
-            return {"id": target, "message_count": 1200}
+            return {
+                "id": target,
+                "message_count": 1200,
+                "model": "stored/default-model",
+                "model_config": {"fallback_disabled": False},
+            }
 
         def resolve_resume_session_id(self, target):
             return target
@@ -3585,6 +3643,7 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         assert first["result"]["hydrating"] is True
         assert first["result"]["messages"] == []
         assert first["result"]["message_count"] == 1200
+        assert first["result"]["info"]["fallback_disabled"] is False
         assert history_started.wait(timeout=1.0)
 
         second = server._methods["session.resume"](
@@ -5803,6 +5862,10 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         running=False,
         history=[],
         profile_home=None,
+        model_override={
+            "model": "stored/default-model",
+            "fallback_disabled": False,
+        },
     )
     server._sessions["lazy-sid"] = session
 
@@ -5820,6 +5883,8 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         )
 
         assert resp is not None and resp["result"]["session_id"] == "lazy-sid"
+        assert resp["result"]["info"]["model"] == "stored/default-model"
+        assert resp["result"]["info"]["fallback_disabled"] is False
         assert session["transport"] is live_transport
         assert "lazy-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
@@ -19030,6 +19095,7 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
         # the client never clobbers its sticky pick before the build lands.
         assert resp["result"]["info"]["model"] == "claude-sonnet-4.6"
         assert resp["result"]["info"]["provider"] == "anthropic"
+        assert resp["result"]["info"]["fallback_disabled"] is True
 
         default_seed = server._methods["session.create"](
             "r-default",
@@ -19042,6 +19108,7 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
         )
         default_sess = server._sessions[default_seed["result"]["session_id"]]
         assert default_sess["model_override"]["fallback_disabled"] is False
+        assert default_seed["result"]["info"]["fallback_disabled"] is False
 
         # Explicit false is not the same as omission: it must suppress a Fast
         # profile default for this session's first request.
@@ -19057,8 +19124,36 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
         assert plain_sess["model_override"] is None
         assert plain_sess["create_reasoning_override"] is None
         assert plain_sess["create_service_tier_override"] is None
+        assert plain["result"]["info"]["fallback_disabled"] is False
     finally:
         server._sessions.clear()
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [None, 0, 1, "", "false", "unknown", [], {}],
+)
+def test_session_create_malformed_fallback_provenance_fails_closed(
+    monkeypatch, provenance
+):
+    """Only the JSON boolean false may enable fallback for a concrete model."""
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+
+    response = server._methods["session.create"](
+        "r-malformed",
+        {
+            "cols": 80,
+            "model": "manual/model",
+            "fallback_disabled": provenance,
+        },
+    )
+    sid = response["result"]["session_id"]
+    try:
+        assert server._sessions[sid]["model_override"]["fallback_disabled"] is True
+        assert response["result"]["info"]["fallback_disabled"] is True
+    finally:
+        server._sessions.pop(sid, None)
 
 
 @pytest.mark.parametrize("service_tier_override", ["priority", ""])

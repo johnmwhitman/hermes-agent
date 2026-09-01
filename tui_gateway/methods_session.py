@@ -48,11 +48,10 @@ def _(rid, params: dict) -> dict:
     # for a new chat can't mutate the profile default. provider is optional
     # (resolved at build).
     create_model = str(params.get("model") or "").strip()
-    fallback_disabled = (
-        bool(params.get("fallback_disabled"))
-        if "fallback_disabled" in params
-        else True
-    )
+    # Only the literal JSON boolean false can opt a concrete session model into
+    # the profile fallback chain. Truthiness would let malformed values such as
+    # 0, null, or "" silently erase a route pin.
+    fallback_disabled = params.get("fallback_disabled") is not False
     session_model_override = (
         {
             "model": create_model,
@@ -152,6 +151,11 @@ def _(rid, params: dict) -> dict:
                     session_model_override.get("model")
                     if session_model_override
                     else _resolve_model()
+                ),
+                "fallback_disabled": (
+                    session_model_override["fallback_disabled"]
+                    if session_model_override
+                    else False
                 ),
                 **(
                     {"provider": session_model_override["provider"]}
@@ -480,6 +484,10 @@ def _(rid, params: dict) -> dict:
                             live.setdefault("viewers", {})[transport] = time.time()
                     _cancel_ws_orphan_reap(live_sid)
                     history = live.get("history") or []
+                    live_model_override = live.get("model_override")
+                    if not isinstance(live_model_override, dict):
+                        live_model_override = {}
+                    live_model = str(live_model_override.get("model") or "").strip()
                     return _ok(
                         rid,
                         _attach_todo_state(
@@ -489,7 +497,13 @@ def _(rid, params: dict) -> dict:
                                 "message_count": len(history),
                                 "messages": [] if omit_messages else _history_to_messages(history),
                                 "info": {
-                                    "model": _resolve_model(),
+                                    "model": live_model or _resolve_model(),
+                                    "fallback_disabled": (
+                                        live_model_override.get("fallback_disabled")
+                                        is not False
+                                        if live_model
+                                        else False
+                                    ),
                                     "lazy": True,
                                     "profile_name": profile or "",
                                 },
@@ -797,6 +811,9 @@ def _(rid, params: dict) -> dict:
                             cwd,
                             model=model_override.get("model") or "",
                             provider=overrides.get("provider_override") or "",
+                            fallback_disabled=model_override.get(
+                                "fallback_disabled", False
+                            ),
                             profile=profile,
                         ),
                         "inflight": None,
@@ -891,6 +908,7 @@ def _(rid, params: dict) -> dict:
                     cwd,
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
+                    fallback_disabled=model_override.get("fallback_disabled", False),
                     profile=profile,
                 ),
                 "inflight": None,

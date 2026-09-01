@@ -10636,6 +10636,7 @@ def _lazy_resume_info(
     *,
     model: str = "",
     provider: str = "",
+    fallback_disabled: object = False,
     profile: str | None = None,
 ) -> dict:
     """session.info for a not-yet-built session (the shape session.create
@@ -10645,6 +10646,9 @@ def _lazy_resume_info(
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "model": model or _resolve_model(),
+        # Match stored/create normalization: only literal false advertises the
+        # profile-default route; malformed provenance must remain pinned.
+        "fallback_disabled": fallback_disabled is not False,
         "tools": {},
         "skills": {},
         "lazy": True,
