@@ -154,6 +154,25 @@ class TestCollectInventory:
             "gateway runtime-state inventory unavailable" in plan.inventory_warnings
         )
 
+    @pytest.mark.parametrize(
+        "payload",
+        [{}, {"pid": None}, {"pid": False}, {"pid": 0}, {"pid": "100"}],
+    )
+    def test_malformed_runtime_status_pid_marks_inventory_incomplete(
+        self, fleet, payload
+    ):
+        default_home = fleet / "home"
+        (default_home / "gateway_state.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is False
+        assert (
+            "gateway runtime-state inventory unavailable" in plan.inventory_warnings
+        )
+
     def test_missing_runtime_status_is_legitimate_absence(self, fleet):
         (fleet / "home" / "gateway_state.json").unlink()
         (fleet / "home" / "profiles" / "work" / "gateway_state.json").unlink()

@@ -1459,3 +1459,17 @@ def test_strict_gateway_identity_rejects_reused_pid(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="identity changed"):
         status.get_running_pid_identity_strict(pid_path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"pid": None}, {"pid": False}, {"pid": 0}, {"pid": "123"}],
+)
+def test_strict_runtime_status_rejects_missing_or_nonliteral_positive_pid(
+    tmp_path, payload
+):
+    state_path = tmp_path / "gateway_state.json"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="PID"):
+        status.read_runtime_status(state_path, strict=True)

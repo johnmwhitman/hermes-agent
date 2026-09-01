@@ -51,9 +51,11 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -463,8 +465,11 @@ def query_gateway_control(
     while transport, timeout, protocol, and payload failures raise so a
     safety-critical caller cannot mistake uncertainty for absence.
     """
+    request_id = 1
     request = (
-        json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
+        json.dumps(
+            {"verb": verb, "id": request_id, "protocol": CONTROL_PROTOCOL_VERSION}
+        )
         .encode("utf-8")
         + b"\n"
     )
@@ -487,6 +492,21 @@ def query_gateway_control(
         if strict:
             raise RuntimeError("gateway control response was malformed") from exc
         return None
+    if strict:
+        protocol = response.get("protocol") if isinstance(response, dict) else None
+        if (
+            not isinstance(protocol, int)
+            or isinstance(protocol, bool)
+            or protocol != CONTROL_PROTOCOL_VERSION
+        ):
+            raise RuntimeError("gateway control response protocol was incompatible")
+        response_id = response.get("id")
+        if (
+            not isinstance(response_id, int)
+            or isinstance(response_id, bool)
+            or response_id != request_id
+        ):
+            raise RuntimeError("gateway control response request id was mismatched")
     if not isinstance(response, dict) or response.get("ok") is not True:
         if strict:
             raise RuntimeError("gateway control response was unsuccessful")
@@ -499,14 +519,28 @@ def query_gateway_control(
     return result
 
 
+def _remaining_deadline(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("gateway control deadline exceeded")
+    return remaining
+
+
 def _query_unix_socket(
     home: Path, request: bytes, timeout: float, *, strict: bool = False
 ) -> Optional[bytes]:
+    deadline = time.monotonic() + max(0.0, float(timeout))
     path = resolve_client_socket_path(home, strict=strict)
+    try:
+        remaining = _remaining_deadline(deadline)
+    except TimeoutError:
+        if strict:
+            raise
+        return None
     if path is None:
         return None
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
+        sock.settimeout(remaining)
         try:
             sock.connect(str(path))
         except FileNotFoundError:
@@ -517,15 +551,21 @@ def _query_unix_socket(
             if strict:
                 raise
             return None
-        sock.sendall(request)
+        try:
+            sock.settimeout(_remaining_deadline(deadline))
+            sock.sendall(request)
+        except (socket.timeout, TimeoutError) as exc:
+            if strict:
+                raise TimeoutError("gateway control deadline exceeded") from exc
+            return None
         chunks: list[bytes] = []
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:
             try:
+                sock.settimeout(_remaining_deadline(deadline))
                 chunk = sock.recv(65536)
-            except socket.timeout:
+            except (socket.timeout, TimeoutError) as exc:
                 if strict:
-                    raise
+                    raise TimeoutError("gateway control deadline exceeded") from exc
                 return None
             if not chunk:
                 break
@@ -541,6 +581,28 @@ def _query_unix_socket(
         if not line and strict:
             raise RuntimeError("gateway control response was empty")
         return line or None
+
+
+def _call_with_deadline(callback: Callable[[], Any], deadline: float) -> Any:
+    """Run one blocking named-pipe operation without exceeding the deadline."""
+    remaining = _remaining_deadline(deadline)
+    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _invoke() -> None:
+        try:
+            result.put((True, callback()))
+        except BaseException as exc:  # preserve the pipe operation's real failure
+            result.put((False, exc))
+
+    worker = threading.Thread(target=_invoke, daemon=True)
+    worker.start()
+    worker.join(timeout=remaining)
+    if worker.is_alive():
+        raise TimeoutError("gateway control deadline exceeded")
+    succeeded, value = result.get_nowait()
+    if not succeeded:
+        raise value
+    return value
 
 
 def _query_windows_pipe(
@@ -556,30 +618,38 @@ def _query_windows_pipe(
             return None
         except OSError as exc:
             # Pipe busy (another client mid-handshake) — brief retry window.
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 if strict:
                     raise TimeoutError("gateway control pipe remained busy") from exc
                 return None
-            time.sleep(0.05)
+            time.sleep(min(0.05, remaining))
     try:
-        handle.write(request)
-        chunks: list[bytes] = []
-        while time.monotonic() < deadline:
-            chunk = handle.read(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if b"\n" in chunk:
-                break
-            if sum(len(c) for c in chunks) > _MAX_RESPONSE_BYTES:
-                if strict:
-                    raise RuntimeError("gateway control response exceeded size limit")
-                return None
-        data = b"".join(chunks)
-        line, _, _ = data.partition(b"\n")
-        if not line and strict:
-            raise RuntimeError("gateway control response was empty")
-        return line or None
+        try:
+            _call_with_deadline(lambda: handle.write(request), deadline)
+            chunks: list[bytes] = []
+            while True:
+                chunk = _call_with_deadline(lambda: handle.read(65536), deadline)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\n" in chunk:
+                    break
+                if sum(len(c) for c in chunks) > _MAX_RESPONSE_BYTES:
+                    if strict:
+                        raise RuntimeError(
+                            "gateway control response exceeded size limit"
+                        )
+                    return None
+            data = b"".join(chunks)
+            line, _, _ = data.partition(b"\n")
+            if not line and strict:
+                raise RuntimeError("gateway control response was empty")
+            return line or None
+        except TimeoutError:
+            if strict:
+                raise
+            return None
     finally:
         with contextlib.suppress(Exception):
             handle.close()
@@ -591,12 +661,81 @@ def identify_gateway(
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
     strict: bool = False,
 ) -> Optional[dict[str, Any]]:
-    """Identify the gateway, validating its PID for strict callers."""
+    """Identify the gateway, binding its live process for strict callers."""
     identity = query_gateway_control(home, "identify", timeout=timeout, strict=strict)
     if strict and identity is not None:
         pid = identity.get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise RuntimeError("gateway control identity PID was malformed")
+        protocol = identity.get("protocol")
+        if (
+            not isinstance(protocol, int)
+            or isinstance(protocol, bool)
+            or protocol != CONTROL_PROTOCOL_VERSION
+        ):
+            raise RuntimeError("gateway control identity protocol was incompatible")
+        if identity.get("kind") != "hermes-gateway":
+            raise RuntimeError("gateway control identity kind was malformed")
+
+        from gateway.status import (
+            _get_process_start_time,
+            _pid_exists,
+            _profile_label_for_home,
+            _same_hermes_home,
+        )
+
+        declared_home = identity.get("hermes_home")
+        bound_home = False
+        if isinstance(declared_home, str) and declared_home.strip():
+            try:
+                bound_home = _same_hermes_home(declared_home, home)
+            except Exception:
+                bound_home = False
+        if not bound_home:
+            expected_profile = _profile_label_for_home(home)
+            served_profiles = identity.get("served_profiles")
+            multiplex_root_matches = False
+            try:
+                requested_home = Path(home).expanduser().resolve(strict=False)
+                multiplex_root_matches = bool(
+                    requested_home.parent.name == "profiles"
+                    and isinstance(declared_home, str)
+                    and declared_home.strip()
+                    and _same_hermes_home(declared_home, requested_home.parent.parent)
+                )
+            except Exception:
+                multiplex_root_matches = False
+            bound_home = bool(
+                expected_profile
+                and multiplex_root_matches
+                and isinstance(served_profiles, list)
+                and any(
+                    isinstance(profile, str) and profile == expected_profile
+                    for profile in served_profiles
+                )
+            )
+        if not bound_home:
+            raise RuntimeError("gateway control identity home/profile was mismatched")
+
+        recorded_start = identity.get("start_time")
+        if (
+            not isinstance(recorded_start, (int, float))
+            or isinstance(recorded_start, bool)
+            or float(recorded_start) <= 0
+        ):
+            raise RuntimeError("gateway control identity start time was malformed")
+        if not _pid_exists(pid):
+            raise RuntimeError("gateway control identity PID was not live")
+        current_start = _get_process_start_time(pid)
+        try:
+            current = float(current_start)
+            recorded = float(recorded_start)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "gateway control identity start time was unavailable"
+            ) from exc
+        if current <= 0 or abs(current - recorded) > 0.001:
+            raise RuntimeError("gateway control process identity changed")
     return identity
 
 

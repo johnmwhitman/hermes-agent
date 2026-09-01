@@ -4,9 +4,13 @@ import asyncio
 import json
 import socket
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
+
+import gateway.control_socket as control_socket
 
 from gateway.control_socket import (
     CONTROL_PROTOCOL_VERSION,
@@ -223,6 +227,156 @@ def test_long_home_end_to_end_via_pointer(tmp_path: Path):
 def test_no_socket_returns_none_fast(home: Path):
     assert identify_gateway(home) is None
     assert query_gateway_control(home, "status") is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"ok": True, "id": 1, "protocol": 2, "result": {"pid": 1}},
+        {"ok": True, "id": 2, "protocol": 1, "result": {"pid": 1}},
+        {"ok": True, "protocol": 1, "result": {"pid": 1}},
+        {"ok": True, "id": 1, "result": {"pid": 1}},
+    ],
+)
+def test_strict_query_rejects_mismatched_protocol_or_request_id(
+    home: Path, monkeypatch, response
+):
+    monkeypatch.setattr(
+        control_socket,
+        "_query_unix_socket",
+        lambda *_args, **_kwargs: json.dumps(response).encode() + b"\n",
+    )
+
+    with pytest.raises(RuntimeError, match="protocol|request"):
+        query_gateway_control(home, "identify", strict=True)
+
+
+def _strict_identity(home: Path, *, pid: int = 321, start_time: float = 10.0):
+    return {
+        "protocol": CONTROL_PROTOCOL_VERSION,
+        "pid": pid,
+        "start_time": start_time,
+        "kind": "hermes-gateway",
+        "hermes_home": str(home.resolve()),
+    }
+
+
+def test_strict_identity_rejects_absent_pid(home: Path, monkeypatch):
+    identity = _strict_identity(home)
+    monkeypatch.setattr(control_socket, "query_gateway_control", lambda *_a, **_k: identity)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+
+    with pytest.raises(RuntimeError, match="not live"):
+        identify_gateway(home, strict=True)
+
+
+def test_strict_identity_rejects_recycled_pid(home: Path, monkeypatch):
+    identity = _strict_identity(home, start_time=10.0)
+    monkeypatch.setattr(control_socket, "query_gateway_control", lambda *_a, **_k: identity)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr("gateway.status._get_process_start_time", lambda _pid: 20.0)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        identify_gateway(home, strict=True)
+
+
+def test_strict_identity_rejects_misbound_home(home: Path, tmp_path: Path, monkeypatch):
+    identity = _strict_identity(tmp_path / "other-home")
+    monkeypatch.setattr(control_socket, "query_gateway_control", lambda *_a, **_k: identity)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr("gateway.status._get_process_start_time", lambda _pid: 10.0)
+
+    with pytest.raises(RuntimeError, match="home|profile"):
+        identify_gateway(home, strict=True)
+
+
+def test_strict_identity_accepts_explicit_multiplex_profile_binding(
+    tmp_path: Path, monkeypatch
+):
+    default_home = tmp_path / ".hermes"
+    profile_home = default_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    identity = _strict_identity(default_home)
+    identity["served_profiles"] = ["default", "coder"]
+    monkeypatch.setattr(control_socket, "query_gateway_control", lambda *_a, **_k: identity)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr("gateway.status._get_process_start_time", lambda _pid: 10.0)
+
+    assert identify_gateway(profile_home, strict=True) == identity
+
+
+def test_strict_identity_rejects_same_profile_slug_from_other_root(
+    tmp_path: Path, monkeypatch
+):
+    expected_home = tmp_path / "tenant-a" / "profiles" / "coder"
+    expected_home.mkdir(parents=True)
+    other_root = tmp_path / "tenant-b"
+    identity = _strict_identity(other_root)
+    identity["served_profiles"] = ["default", "coder"]
+    monkeypatch.setattr(control_socket, "query_gateway_control", lambda *_a, **_k: identity)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr("gateway.status._get_process_start_time", lambda _pid: 10.0)
+
+    with pytest.raises(RuntimeError, match="home|profile"):
+        identify_gateway(expected_home, strict=True)
+
+
+def test_unix_strict_query_enforces_overall_slow_drip_deadline(
+    home: Path, monkeypatch
+):
+    class SlowDripSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, _request):
+            pass
+
+        def recv(self, _size):
+            time.sleep(0.01)
+            return b"x"
+
+    monkeypatch.setattr(
+        control_socket, "resolve_client_socket_path", lambda *_a, **_k: home / "gateway.sock"
+    )
+    monkeypatch.setattr(control_socket.socket, "socket", lambda *_a, **_k: SlowDripSocket())
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="deadline"):
+        control_socket._query_unix_socket(home, b"{}\n", 0.025, strict=True)
+    assert time.monotonic() - started < 0.25
+
+
+def test_windows_strict_query_enforces_blocking_read_deadline(
+    home: Path, monkeypatch
+):
+    released = threading.Event()
+
+    class BlockingPipe:
+        def write(self, _request):
+            return None
+
+        def read(self, _size):
+            released.wait(timeout=1.0)
+            return b""
+
+        def close(self):
+            released.set()
+
+    monkeypatch.setattr("builtins.open", lambda *_a, **_k: BlockingPipe())
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="deadline"):
+        control_socket._query_windows_pipe(home, b"{}\n", 0.025, strict=True)
+    assert time.monotonic() - started < 0.25
 
 
 def test_default_identify_payload_shape(home: Path, monkeypatch):

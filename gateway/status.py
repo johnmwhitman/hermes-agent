@@ -1296,7 +1296,12 @@ def read_runtime_status(
     the active profile's ``gateway_state.json``. Missing files remain a
     legitimate absence in strict mode; unreadable or malformed files raise.
     """
-    return _read_json_file(path or _get_runtime_status_path(), strict=strict)
+    payload = _read_json_file(path or _get_runtime_status_path(), strict=strict)
+    if strict and payload is not None:
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise RuntimeError("runtime status PID was malformed")
+    return payload
 
 
 # Max age of a persisted ``gateway_state.json`` snapshot before its liveness
