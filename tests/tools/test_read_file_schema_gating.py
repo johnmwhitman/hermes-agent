@@ -11,7 +11,9 @@ when pages are missing, with the page map and recovery commands.
 """
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -58,28 +60,28 @@ class TestReadFileSchemaStatic(unittest.TestCase):
 
         # A direct key alone must never turn document upload on.
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
-            with patch("hermes_cli.config.load_config_readonly",
+            with patch("hermes_cli.config.load_config_readonly_strict",
                        return_value={}):
                 self.assertFalse(rx.hosted_ocr_available())
         # Explicit false keeps it off.
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
-            with patch("hermes_cli.config.load_config_readonly",
+            with patch("hermes_cli.config.load_config_readonly_strict",
                        return_value={"file_tools": {"hosted_ocr": False}}):
                 self.assertFalse(rx.hosted_ocr_available())
         # Only literal True opts in; truthy values are not policy.
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
-            with patch("hermes_cli.config.load_config_readonly",
+            with patch("hermes_cli.config.load_config_readonly_strict",
                        return_value={"file_tools": {"hosted_ocr": "true"}}):
                 self.assertFalse(rx.hosted_ocr_available())
         # Explicit true WITHOUT a key cannot provide a hosted route.
         with patch.dict(rx.os.environ, {}, clear=False):
             rx.os.environ.pop("FIRECRAWL_API_KEY", None)
-            with patch("hermes_cli.config.load_config_readonly",
+            with patch("hermes_cli.config.load_config_readonly_strict",
                        return_value={"file_tools": {"hosted_ocr": True}}):
                 self.assertFalse(rx.hosted_ocr_available())
         # Explicit true plus the direct key is the only enabled state.
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
-            with patch("hermes_cli.config.load_config_readonly",
+            with patch("hermes_cli.config.load_config_readonly_strict",
                        return_value={"file_tools": {"hosted_ocr": True}}):
                 self.assertTrue(rx.hosted_ocr_available())
 
@@ -87,7 +89,7 @@ class TestReadFileSchemaStatic(unittest.TestCase):
         import tools.read_extract as rx
 
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
-            with patch("hermes_cli.config.load_config_readonly",
+            with patch("hermes_cli.config.load_config_readonly_strict",
                        side_effect=OSError("unreadable config")):
                 self.assertFalse(rx.hosted_ocr_available())
                 self.assertEqual(
@@ -95,25 +97,139 @@ class TestReadFileSchemaStatic(unittest.TestCase):
                     (False, "fc-x", None),
                 )
 
+    def test_malformed_current_config_cannot_reuse_cached_opt_in(self):
+        """A prior valid opt-in must not survive a broken current file."""
+        from hermes_cli import config as config_mod
+        from hermes_cli import managed_scope
+        from tools import file_tools as ft
+        from tools import read_extract as rx
+
+        class NeedsOcrError(Exception):
+            def __init__(self, pages):
+                super().__init__("needs ocr")
+                self.pages = pages
+
+        calls = []
+
+        class FakeAnydoc:
+            @staticmethod
+            def to_markdown(path, **kwargs):
+                calls.append(kwargs)
+                if not kwargs:
+                    raise NeedsOcrError([1])
+                return "HOSTED TEXT"
+
+        FakeAnydoc.NeedsOcrError = NeedsOcrError
+
+        with tempfile.TemporaryDirectory(prefix="hosted-ocr-config-") as temp:
+            home = Path(temp)
+            config_path = home / "config.yaml"
+            scan_path = home / "scan.pdf"
+            config_path.write_text(
+                "file_tools:\n  hosted_ocr: true\n",
+                encoding="utf-8",
+            )
+            scan_path.write_bytes(b"%PDF fixture")
+
+            with patch.dict(
+                rx.os.environ,
+                {
+                    "HERMES_HOME": str(home),
+                    "FIRECRAWL_API_KEY": "fc-test",
+                },
+                clear=False,
+            ):
+                rx.os.environ.pop("HERMES_MANAGED_DIR", None)
+                config_mod._LOAD_CONFIG_CACHE.clear()
+                config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+                managed_scope.invalidate_managed_cache()
+                try:
+                    # Prime the ordinary loader's cache and last-known-good
+                    # state from a real, valid current file.
+                    self.assertTrue(
+                        config_mod.load_config_readonly()["file_tools"]["hosted_ocr"]
+                    )
+                    self.assertTrue(rx.hosted_ocr_available())
+
+                    # The ordinary config loader retains the previous value on
+                    # this parse failure. The upload gate must independently
+                    # verify the current merged-config read and fail closed.
+                    config_path.write_text(
+                        "file_tools:\n  hosted_ocr: [broken\n",
+                        encoding="utf-8",
+                    )
+
+                    self.assertFalse(rx.hosted_ocr_available())
+                    self.assertEqual(ft._read_file_schema_overrides(), {})
+                    with patch.object(rx, "_anydoc", return_value=FakeAnydoc):
+                        out = rx._extract_anydoc(str(scan_path))
+                    self.assertIn("[NEEDS OCR", out)
+                    self.assertEqual(calls, [{}])
+                finally:
+                    config_mod._LOAD_CONFIG_CACHE.clear()
+                    config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+                    managed_scope.invalidate_managed_cache()
+
+    def test_strict_current_read_preserves_managed_precedence(self):
+        from hermes_cli import config as config_mod
+        from hermes_cli import managed_scope
+
+        with tempfile.TemporaryDirectory(prefix="hosted-ocr-precedence-") as temp:
+            root = Path(temp)
+            home = root / "profile"
+            managed = root / "managed"
+            home.mkdir()
+            managed.mkdir()
+            (home / "config.yaml").write_text(
+                "file_tools:\n  hosted_ocr: true\n",
+                encoding="utf-8",
+            )
+            (managed / "config.yaml").write_text(
+                "file_tools:\n  hosted_ocr: false\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(home),
+                    "HERMES_MANAGED_DIR": str(managed),
+                },
+                clear=False,
+            ):
+                config_mod._LOAD_CONFIG_CACHE.clear()
+                config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+                managed_scope.invalidate_managed_cache()
+                try:
+                    cfg = config_mod.load_config_readonly_strict()
+                    self.assertIs(
+                        cfg["file_tools"]["hosted_ocr"],
+                        False,
+                    )
+                finally:
+                    config_mod._LOAD_CONFIG_CACHE.clear()
+                    config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+                    managed_scope.invalidate_managed_cache()
+
     def test_runtime_route_is_direct_key_only(self):
         """Runtime route requires explicit opt-in and never uses Nous."""
         import tools.read_extract as rx
 
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
-            with patch("hermes_cli.config.load_config_readonly",
+            with patch("hermes_cli.config.load_config_readonly_strict",
                        return_value={}):
                 enabled, key, url = rx._hosted_ocr_config()
         self.assertFalse(enabled)
         self.assertEqual(key, "fc-x")
         self.assertIsNone(url)
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
-            with patch("hermes_cli.config.load_config_readonly",
+            with patch("hermes_cli.config.load_config_readonly_strict",
                        return_value={"file_tools": {"hosted_ocr": True}}):
                 enabled, key, url = rx._hosted_ocr_config()
         self.assertTrue(enabled)
         self.assertEqual(key, "fc-x")
         self.assertIsNone(url)
-        with patch("hermes_cli.config.load_config_readonly",
+        with patch("hermes_cli.config.load_config_readonly_strict",
                    return_value={}):
             rx.os.environ.pop("FIRECRAWL_API_KEY", None)
             enabled, key, url = rx._hosted_ocr_config()
@@ -230,7 +346,7 @@ class TestNeedsOcrPath(unittest.TestCase):
         with patch.object(rx, "_anydoc", return_value=mod), \
              patch.object(rx.os.path, "getsize", return_value=10), \
              patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}), \
-             patch("hermes_cli.config.load_config_readonly", return_value={}):
+             patch("hermes_cli.config.load_config_readonly_strict", return_value={}):
             out = rx._extract_anydoc("scan.pdf")
         self.assertIn("[NEEDS OCR", out)
         self.assertEqual(calls, [{}])
@@ -242,7 +358,7 @@ class TestNeedsOcrPath(unittest.TestCase):
         with patch.object(rx, "_anydoc", return_value=mod), \
              patch.object(rx.os.path, "getsize", return_value=10), \
              patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}), \
-             patch("hermes_cli.config.load_config_readonly",
+             patch("hermes_cli.config.load_config_readonly_strict",
                    return_value={"file_tools": {"hosted_ocr": True}}):
             out = rx._extract_anydoc("scan.pdf")
         self.assertEqual(out, "OCR TEXT\n")

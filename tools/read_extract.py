@@ -191,9 +191,9 @@ def _hosted_ocr_config() -> tuple:
     """
     api_key = os.environ.get("FIRECRAWL_API_KEY") or None
     try:
-        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config import load_config_readonly_strict
 
-        cfg = load_config_readonly()
+        cfg = load_config_readonly_strict()
         section = cfg.get("file_tools") if isinstance(cfg, dict) else None
         enabled = (
             api_key is not None
