@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
+from hermes_cli.update_inventory import UpdatePlan
 from hermes_constants import get_hermes_home
 
 
@@ -90,6 +91,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None
     )
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda *a, **k: None)
     monkeypatch.setattr(
         hermes_main, "_pause_windows_gateways_for_update", lambda: None
@@ -123,7 +125,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
     monkeypatch.setattr(
         "hermes_cli.update_inventory.collect_runtime_inventory",
-        lambda: SimpleNamespace(runtimes=[], to_dict=lambda: {}),
+        UpdatePlan,
     )
 
 
