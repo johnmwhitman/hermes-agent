@@ -12,8 +12,12 @@ from hermes_cli import runtime_provider as rp
 
 @pytest.fixture(autouse=True)
 def _no_live_builtin_provider_probes(monkeypatch):
-    """Keep picker tests offline: builtin-provider catalog fetches hit the network."""
+    """Keep picker tests offline: provider catalog fetches hit the network."""
     monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "hermes_cli.models.should_use_ollama_native_catalog",
+        lambda *_a, **_kw: False,
+    )
     monkeypatch.setattr(
         "hermes_cli.models.cached_provider_model_ids", lambda *_a, **_kw: []
     )

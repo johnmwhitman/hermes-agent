@@ -1330,17 +1330,39 @@ def _live_system_guard(request, monkeypatch):
     import subprocess as _subprocess
 
     test_pid = _os.getpid()
-    # Capture the test process's existing children at fixture start —
-    # any *new* children spawned by the test are also allowlisted via
-    # the live psutil walk below. Static set keeps the fast path cheap.
+    # Capture the test process's existing children at fixture start.  PID
+    # alone is not an identity: a short-lived setup child can exit and its PID
+    # can be reused before teardown.  Pair each PID with psutil's creation
+    # timestamp and revalidate both before treating it as test-owned.
     try:
         import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
     except Exception:
         _psutil = None
-        _initial_children = set()
+
+    _initial_children = {}
+    if _psutil is not None:
+        try:
+            initial_children = _psutil.Process(test_pid).children(recursive=True)
+        except Exception:
+            # An unavailable inventory is an empty allowlist, not evidence
+            # that later psutil identity checks are unavailable too.
+            initial_children = ()
+        for child in initial_children:
+            try:
+                _initial_children[int(child.pid)] = float(child.create_time())
+            except Exception:
+                # No positive identity proof means no fast-path allow entry.
+                continue
+
+    # Record children at the guarded creation boundary.  A live ancestry
+    # walk is useful for descendants spawned below them, but it is not a
+    # reliable ownership oracle by itself: macOS sandboxing can deny the
+    # process-table read, and teardown can race with child exit/reparenting.
+    # Only PIDs created through this test process's patched Popen enter this
+    # map, so foreign processes remain fail-closed.  Keep the Popen object as
+    # the identity witness: once it reports exit, discard the numeric PID so
+    # later OS PID reuse cannot inherit the allowlist entry.
+    _spawned_children: dict[int, object] = {}
 
     def _is_own_subtree(pid: int) -> bool:
         # PID 0 means "our own process group"; -1 means "every process we
@@ -1351,15 +1373,39 @@ def _live_system_guard(request, monkeypatch):
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid:
             return True
+        initial_create_time = _initial_children.get(pid)
+        if initial_create_time is not None and _psutil is not None:
+            try:
+                current = _psutil.Process(pid)
+                if float(current.create_time()) == initial_create_time:
+                    return True
+            except Exception:
+                pass
+            _initial_children.pop(pid, None)
+        spawned = _spawned_children.get(pid)
+        if spawned is not None:
+            try:
+                if spawned.poll() is None:
+                    return True
+            except Exception:
+                pass
+            _spawned_children.pop(pid, None)
         if _psutil is None:
             return False
         try:
             walker = _psutil.Process(pid)
+        except _psutil.NoSuchProcess:
+            # Preserve Popen.send_signal's normal exit race without issuing a
+            # second, raw PID-based signal.  The numeric PID may be recycled
+            # between this check and os.kill(), so report the same benign
+            # "already gone" outcome directly and keep the guard fail-closed.
+            raise ProcessLookupError(pid)
         except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
-            return True
+            # AccessDenied and other inspection failures are uncertainty, not
+            # evidence that the PID belongs to this test. Fail closed.
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
@@ -1579,6 +1625,8 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                if self.pid is not None:
+                    _spawned_children[int(self.pid)] = self
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"

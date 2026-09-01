@@ -56,8 +56,16 @@ def catalog_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _isolate_hermes
 
 @pytest.fixture
 def client():
-    with TestClient(app) as test_client:
+    # These tests exercise request-level credential boundaries, not dashboard
+    # startup.  Entering TestClient as a context manager runs the full app
+    # lifespan, which launches state-reconcile and hosted-room daemon threads;
+    # under parallel load those unrelated threads can outlive this test's
+    # temporary HERMES_HOME and crash inside native SQLite teardown.
+    test_client = TestClient(app)
+    try:
         yield test_client
+    finally:
+        test_client.close()
 
 
 def test_catalog_rejects_undeclared_key_before_any_write_or_install(

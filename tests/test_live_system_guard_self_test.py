@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import types
 
 import pytest
@@ -114,6 +115,60 @@ def test_os_kill_blocks_negative_one():
     """``os.kill(-1, sig)`` signals every process we can reach. Must be blocked."""
     with pytest.raises(RuntimeError, match="live-system guard"):
         os.kill(-1, signal.SIGTERM)
+
+
+def test_os_kill_allows_child_recorded_at_spawn_when_ancestry_is_unavailable(
+    monkeypatch,
+):
+    """A test-owned child stays signalable when psutil cannot walk parents.
+
+    macOS sandboxing can deny process-table access, and a child in teardown
+    can disappear from the live ancestry walk before ``Popen.terminate()``
+    delivers SIGTERM.  Spawn ownership is still definitive in both cases.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.5)"]
+    )
+
+    import psutil
+
+    def _ancestry_unavailable(_pid):
+        raise psutil.AccessDenied(pid=_pid)
+
+    monkeypatch.setattr(psutil, "Process", _ancestry_unavailable)
+    try:
+        proc.terminate()
+    finally:
+        # Before the guard learns spawn ownership, terminate() raises and the
+        # short-lived child exits naturally; never leave a helper behind.
+        proc.wait(timeout=2)
+
+
+def test_os_kill_drops_recorded_child_after_it_exits(monkeypatch):
+    """Spawn ownership must not become a stale PID-reuse allowlist."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=2)
+
+    import psutil
+
+    def _ancestry_unavailable(_pid):
+        raise psutil.AccessDenied(pid=_pid)
+
+    monkeypatch.setattr(psutil, "Process", _ancestry_unavailable)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        os.kill(proc.pid, signal.SIGTERM)
+
+
+def test_os_kill_never_signals_after_process_identity_disappears(monkeypatch):
+    """NoSuchProcess must stop before a raw kill can race with PID reuse."""
+    import psutil
+
+    def _identity_disappeared(pid):
+        raise psutil.NoSuchProcess(pid=pid)
+
+    monkeypatch.setattr(psutil, "Process", _identity_disappeared)
+    with pytest.raises(ProcessLookupError):
+        os.kill(FOREIGN_PID, signal.SIGTERM)
 
 
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
