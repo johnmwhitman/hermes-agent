@@ -5552,8 +5552,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         # concrete session model. Treat unknown provenance as an explicit pin:
         # silently enabling the current profile's fallback chain can route this
         # restored conversation to a model/provider the user never selected.
-        overrides["model_override"]["fallback_disabled"] = bool(
-            model_config.get("fallback_disabled", True)
+        overrides["model_override"]["fallback_disabled"] = (
+            model_config.get("fallback_disabled") is not False
         )
     if provider:
         overrides["provider_override"] = provider

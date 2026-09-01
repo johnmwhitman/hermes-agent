@@ -4089,6 +4089,23 @@ def test_stored_session_runtime_overrides_restores_route_pin_policy():
     assert legacy["model_override"]["fallback_disabled"] is True
 
 
+@pytest.mark.parametrize(
+    "provenance",
+    [None, 0, 1, "", "false", "unknown", [], {}],
+)
+def test_stored_session_runtime_overrides_malformed_provenance_stays_pinned(
+    provenance,
+):
+    overrides = server._stored_session_runtime_overrides(
+        {
+            "model": "legacy/model",
+            "model_config": {"fallback_disabled": provenance},
+        }
+    )
+
+    assert overrides["model_override"]["fallback_disabled"] is True
+
+
 def test_stored_session_runtime_overrides_restores_explicit_normal_tier():
     overrides = server._stored_session_runtime_overrides(
         {
