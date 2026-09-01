@@ -38,6 +38,12 @@ def fleet(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: default_home / "profiles")
     monkeypatch.setattr("hermes_cli.profiles._PROFILE_ID_RE", re.compile(r"^[a-z0-9][a-z0-9_-]*$"), raising=False)
     monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid in (100, 200))
+    monkeypatch.setattr(
+        "gateway.status.get_runtime_status_running_pid",
+        lambda runtime=None, expected_home=None: (
+            runtime.get("pid") if runtime and runtime.get("pid") in (100, 200) else None
+        ),
+    )
     monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda all_profiles=False: {100})
     monkeypatch.setattr(
         "hermes_cli.gateway.find_windows_gateway_services", lambda: []
@@ -98,9 +104,34 @@ class TestCollectInventory:
         assert "docker pull" in plan.update_mechanism
 
     def test_dead_pids_excluded(self, fleet, monkeypatch):
-        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        monkeypatch.setattr(
+            "gateway.status.get_runtime_status_running_pid",
+            lambda runtime=None, expected_home=None: None,
+        )
         plan = ui.collect_runtime_inventory()
         assert plan.runtimes == []
+
+    def test_recycled_runtime_pid_is_excluded_by_profile_identity(
+        self, fleet, monkeypatch
+    ):
+        default_home = fleet / "home"
+        work_home = default_home / "profiles" / "work"
+        seen_homes = []
+
+        def validate(runtime=None, *, expected_home=None):
+            seen_homes.append(expected_home)
+            if expected_home == work_home:
+                return runtime.get("pid")
+            return None
+
+        monkeypatch.setattr(
+            "gateway.status.get_runtime_status_running_pid", validate
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert [runtime.profile for runtime in plan.runtimes] == ["work"]
+        assert seen_homes == [default_home, work_home]
 
     def test_pid_file_fallback_covers_unstamped_profiles(self, fleet, monkeypatch):
         """Gateways with a PID file but no runtime-status record still appear."""
@@ -849,12 +880,18 @@ class TestPrintPlan:
         assert "docker pull" in out
 
     def test_empty_fleet_message(self, fleet, monkeypatch, capsys):
-        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        monkeypatch.setattr(
+            "gateway.status.get_runtime_status_running_pid",
+            lambda runtime=None, expected_home=None: None,
+        )
         ui.print_update_plan(ui.collect_runtime_inventory())
         assert "none detected" in capsys.readouterr().out
 
     def test_incomplete_empty_scan_never_claims_none_detected(self, fleet, monkeypatch, capsys):
-        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        monkeypatch.setattr(
+            "gateway.status.get_runtime_status_running_pid",
+            lambda runtime=None, expected_home=None: None,
+        )
         monkeypatch.setattr(
             ui,
             "_iter_process_cmdlines",

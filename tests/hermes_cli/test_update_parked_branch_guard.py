@@ -27,6 +27,7 @@ import pytest
 
 from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
+from hermes_cli import update_inventory
 
 
 GIT = ["git"]
@@ -268,6 +269,11 @@ def _patch_update_flow(monkeypatch, repo, run_real_git=True):
     )
     monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
     monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(
+        update_inventory,
+        "collect_runtime_inventory",
+        update_inventory.UpdatePlan,
+    )
 
 
 def test_update_skips_and_warns_on_dirty_parked_branch(

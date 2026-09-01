@@ -168,7 +168,7 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
     tmp_path, monkeypatch
 ):
     """The updater must carry pre-rebuild state into its repair refresh."""
-    from hermes_cli import managed_uv, update_cmd
+    from hermes_cli import managed_uv, update_cmd, update_inventory
 
     (tmp_path / ".git").mkdir()
     snapshot = ["platform.telegram"]
@@ -201,6 +201,11 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
     )
     monkeypatch.setattr(m, "_is_windows", lambda: False)
     monkeypatch.setattr(m, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(
+        update_inventory,
+        "collect_runtime_inventory",
+        update_inventory.UpdatePlan,
+    )
     monkeypatch.setattr(m, "_pause_windows_gateways_for_update", lambda: None)
     monkeypatch.setattr(m, "_resume_windows_gateways_after_update", lambda state: None)
     monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *args: None)
@@ -253,7 +258,6 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
             expected_env,
         )
     ]
-
 
 
 

@@ -67,11 +67,15 @@ async def test_cleanup_off_loop_does_not_block_event_loop():
     stall the runtime-status updated_at heartbeat, #53175)."""
     runner, executor = _make_runner()
     close_started = threading.Event()
+    close_finished = threading.Event()
     release = threading.Event()
 
     def slow_close():
         close_started.set()
-        release.wait(timeout=5)  # block the WORKER thread, not the loop
+        try:
+            release.wait(timeout=5)  # block the WORKER thread, not the loop
+        finally:
+            close_finished.set()
 
     agent = _agent_with_close(slow_close)
 
@@ -93,10 +97,20 @@ async def test_cleanup_off_loop_does_not_block_event_loop():
             break
         await asyncio.sleep(0.005)
     assert close_started.is_set(), "close() never ran"
+    assert not close_finished.is_set(), (
+        "close() finished before the event loop regained control"
+    )
 
     ticks_at_block = ticks["n"]
-    await asyncio.sleep(0.1)
-    ticks_during_block = ticks["n"] - ticks_at_block
+
+    async def _wait_for_heartbeat_progress():
+        while ticks["n"] == ticks_at_block:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_wait_for_heartbeat_progress(), timeout=1.0)
+    assert not close_finished.is_set(), (
+        "worker cleanup finished before the blocked interval was observed"
+    )
 
     release.set()
     await cleanup_task
@@ -104,10 +118,6 @@ async def test_cleanup_off_loop_does_not_block_event_loop():
     await hb
     executor.shutdown(wait=False)
 
-    assert ticks_during_block >= 5, (
-        f"event loop was blocked during agent cleanup (#53175): only "
-        f"{ticks_during_block} ticks while close() was running"
-    )
 
 
 @pytest.mark.asyncio
@@ -164,5 +174,3 @@ async def test_cleanup_off_loop_swallows_executor_failure(caplog):
     assert any(
         "failed" in r.message and "#53175" in r.message for r in caplog.records
     ), "expected the cleanup-failure warning to be logged"
-
-
