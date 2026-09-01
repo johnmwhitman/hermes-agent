@@ -675,6 +675,9 @@ def collect_runtime_inventory() -> UpdatePlan:
         }
     except Exception as exc:
         logger.debug("Windows SCM service-ownership probe failed: %s", exc)
+        _mark_inventory_incomplete(
+            plan, "Windows SCM service inventory unavailable"
+        )
 
     # --- per-profile gateways (PID files + runtime status stamps) ----------
     seen_pids: set[int] = set()
@@ -821,6 +824,9 @@ def collect_runtime_inventory() -> UpdatePlan:
             )
     except Exception as exc:
         logger.debug("Serve/dashboard ledger inventory failed: %s", exc)
+        _mark_inventory_incomplete(
+            plan, "serve/dashboard runtime inventory unavailable"
+        )
 
     # Desktop-supervised ephemeral HTTP workers have no gateway PID file or
     # gateway_state.json in older/custom launch paths. Manual lookalikes are

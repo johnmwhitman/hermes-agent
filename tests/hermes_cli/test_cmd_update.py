@@ -279,6 +279,56 @@ class TestUpdateManagedPythonEnvIsolation:
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
+    def test_inventory_acquisition_exception_aborts_before_mutation(
+        self, monkeypatch, capsys
+    ):
+        """An unreadable fleet inventory must stop before backup/apply/restart."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mutation_calls = []
+
+        def inventory_denied():
+            raise PermissionError("sensitive host detail must not be reported")
+
+        def mutation_boundary(name):
+            def crossed(*_args, **_kwargs):
+                mutation_calls.append(name)
+                raise AssertionError(f"mutation boundary crossed: {name}")
+
+            return crossed
+
+        monkeypatch.setattr(update_cmd, "_capture_active_lazy_features", lambda: [])
+        monkeypatch.setattr(update_cmd, "_capture_active_tool_dependencies", lambda: [])
+        monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "2026.8.31")
+        monkeypatch.setattr(
+            "hermes_cli.update_receipt.begin_update_receipt", lambda: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.update_inventory.collect_runtime_inventory",
+            inventory_denied,
+        )
+        monkeypatch.setattr(
+            hm, "_run_pre_update_backup", mutation_boundary("backup")
+        )
+        monkeypatch.setattr(
+            hm,
+            "_pause_windows_gateways_for_update",
+            mutation_boundary("restart pause"),
+        )
+        monkeypatch.setattr(
+            update_cmd.subprocess, "run", mutation_boundary("apply")
+        )
+
+        with pytest.raises(SystemExit) as raised:
+            update_cmd._cmd_update_impl(SimpleNamespace(), gateway_mode=False)
+
+        assert raised.value.code == 1
+        assert mutation_calls == []
+        output = capsys.readouterr().out
+        assert "aborted before mutation" in output
+        assert "sensitive host detail" not in output
+
 
 
 
