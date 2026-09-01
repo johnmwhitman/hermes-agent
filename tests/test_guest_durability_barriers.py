@@ -20,6 +20,9 @@ def _config(monkeypatch, database_section):
 
     cfg = {"database": database_section}
     monkeypatch.setattr(config_mod, "load_config_readonly", lambda *a, **k: cfg)
+    monkeypatch.setattr(
+        hermes_state, "_enforce_macos_synchronous_full", lambda _conn: None
+    )
     return cfg
 
 

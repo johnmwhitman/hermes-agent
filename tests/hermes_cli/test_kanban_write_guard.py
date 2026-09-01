@@ -19,25 +19,21 @@ def test_connect_succeeds_under_test_home(tmp_path, monkeypatch):
         conn.close()
 
 
-def test_connect_raises_when_kanban_home_is_real_root(monkeypatch):
+def test_connect_raises_when_kanban_home_is_real_root(monkeypatch, real_kanban_root):
     """When kanban paths resolve to the REAL root, connect raises RuntimeError."""
-    import tests.conftest as _conftest
-
     monkeypatch.setattr(
-        kanban_db, "kanban_home", lambda: _conftest._REAL_KANBAN_ROOT
+        kanban_db, "kanban_home", lambda: real_kanban_root
     )
     monkeypatch.setattr(
         kanban_db,
         "kanban_db_path",
-        lambda board=None: _conftest._REAL_KANBAN_ROOT / "kanban.db",
+        lambda board=None: real_kanban_root / "kanban.db",
     )
     with pytest.raises(RuntimeError, match="kanban_write_guard"):
         kanban_db.connect()
 
 
-def test_connect_raises_for_explicit_db_path_under_real_root():
+def test_connect_raises_for_explicit_db_path_under_real_root(real_kanban_root):
     """Explicit db_path pointing under the real root is also refused."""
-    import tests.conftest as _conftest
-
     with pytest.raises(RuntimeError, match="kanban_write_guard"):
-        kanban_db.connect(_conftest._REAL_KANBAN_ROOT / "kanban.db")
+        kanban_db.connect(real_kanban_root / "kanban.db")

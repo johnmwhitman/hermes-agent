@@ -690,6 +690,12 @@ def _capture_real_kanban_root() -> Path:
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()
 
 
+@pytest.fixture
+def real_kanban_root() -> Path:
+    """Expose the pre-sandbox Kanban root without re-importing conftest."""
+    return _REAL_KANBAN_ROOT
+
+
 @pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, monkeypatch):
     """Fail-closed guard: refuse kanban writes that target the REAL root.
@@ -722,17 +728,19 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
 
     def _guarded_connect(db_path=None, *args, **kwargs):
         if db_path is not None:
-            resolved = Path(db_path).expanduser().resolve()
+            expanded = Path(db_path).expanduser()
         else:
-            resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
-            )
-        try:
-            resolved.relative_to(_REAL_KANBAN_ROOT)
-        except ValueError:
-            # Resolved path is NOT under the real root — safe to write.
+            expanded = _kdb.kanban_db_path(board=kwargs.get("board")).expanduser()
+        lexical = Path(os.path.abspath(str(expanded)))
+        resolved = expanded.resolve()
+        for candidate in (lexical, resolved):
+            try:
+                candidate.relative_to(_REAL_KANBAN_ROOT)
+            except ValueError:
+                continue
+            break
+        else:
+            # Neither spelling is under the real root — safe to write.
             return _orig_connect(db_path, *args, **kwargs)
         raise RuntimeError(
             f"kanban_write_guard: kanban DB path resolved to {resolved}, "

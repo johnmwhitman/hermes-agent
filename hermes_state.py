@@ -721,6 +721,23 @@ _STATE_DB_GUARD_BYPASS_ENV = "HERMES_STATE_DB_GUARD_BYPASS"
 _STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
 
 
+def _logical_platform_state_root() -> Optional[Path]:
+    """Return the REAL platform-default root without resolving symlinks."""
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA", "").strip()
+            root = (
+                Path(base) / "hermes"
+                if base
+                else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
+            )
+        else:
+            root = Path(os.path.expanduser("~")) / ".hermes"
+        return Path(os.path.abspath(str(root)))
+    except Exception:
+        return None
+
+
 def _real_platform_state_root() -> Optional[Path]:
     """Resolve the REAL platform-default Hermes root for the guard.
 
@@ -733,16 +750,8 @@ def _real_platform_state_root() -> Optional[Path]:
     variable / passwd entry, which the hermetic conftest never rewrites.
     """
     try:
-        if sys.platform == "win32":
-            base = os.environ.get("LOCALAPPDATA", "").strip()
-            root = (
-                Path(base) / "hermes"
-                if base
-                else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
-            )
-        else:
-            root = Path(os.path.expanduser("~")) / ".hermes"
-        return root.resolve()
+        root = _logical_platform_state_root()
+        return root.resolve() if root is not None else None
     except Exception:
         return None
 
@@ -850,14 +859,19 @@ def _in_test_context() -> bool:
 
 def _production_state_roots() -> List[Path]:
     roots: List[Path] = []
-    real_root = _real_platform_state_root()
-    if real_root is not None:
-        roots.append(real_root)
-    for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
+    logical_root = _logical_platform_state_root()
+    raw_roots = ([logical_root] if logical_root is not None else []) + list(
+        _STATE_DB_GUARD_EXTRA_DENY_ROOTS
+    )
+    for raw_root in raw_roots:
         try:
-            roots.append(Path(extra).expanduser().resolve())
+            lexical = Path(os.path.abspath(str(Path(raw_root).expanduser())))
+            resolved = lexical.resolve()
         except Exception:
             continue
+        for root in (lexical, resolved):
+            if root not in roots:
+                roots.append(root)
     return roots
 
 
@@ -897,11 +911,15 @@ def _ensure_test_isolation(db_path: Path) -> None:
     if not _in_test_context():
         return
     try:
-        resolved = Path(db_path).expanduser().resolve()
+        expanded = Path(db_path).expanduser()
+        lexical = Path(os.path.abspath(str(expanded)))
+        resolved = expanded.resolve()
     except Exception:
         return
-    for root in _production_state_roots():
-        if _is_production_state_db(resolved, root):
+    for candidate in (lexical, resolved):
+        for root in _production_state_roots():
+            if not _is_production_state_db(candidate, root):
+                continue
             raise RuntimeError(
                 "live-system guard: test attempted to open production "
                 f"state.db at {resolved} (under real Hermes root {root}). "
