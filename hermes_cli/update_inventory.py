@@ -716,7 +716,7 @@ def collect_runtime_inventory() -> UpdatePlan:
             try:
                 from gateway.control_socket import identify_gateway
 
-                identity = identify_gateway(home)
+                identity = identify_gateway(home, strict=True)
             except Exception as exc:
                 _log_probe_failure("Gateway control-socket probe failed", exc)
                 _mark_inventory_incomplete(
@@ -756,7 +756,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                         )
                     )
                     continue
-            record = read_runtime_status(home / "gateway_state.json")
+            record = read_runtime_status(home / "gateway_state.json", strict=True)
             pid: Optional[int] = None
             code_sha = code_version = None
             if record:
@@ -793,7 +793,7 @@ def collect_runtime_inventory() -> UpdatePlan:
     try:
         from hermes_cli.gateway import find_profile_gateway_processes
 
-        for proc in find_profile_gateway_processes():
+        for proc in find_profile_gateway_processes(strict=True):
             if proc.pid in seen_pids:
                 continue
             seen_pids.add(proc.pid)

@@ -2,6 +2,7 @@
 
 import json
 import os
+import socket
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_cli.update_inventory as ui
+from hermes_cli.gateway import (
+    find_profile_gateway_processes as _real_find_profile_gateway_processes,
+)
 
 
 def _write_state(home: Path, pid: int, sha: str | None = None, version: str | None = None):
@@ -39,7 +43,10 @@ def fleet(monkeypatch, tmp_path):
         "hermes_cli.gateway.find_windows_gateway_services", lambda: []
     )
     monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: True)
-    monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda exclude_pids=None: [])
+    monkeypatch.setattr(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        lambda exclude_pids=None, **_kwargs: [],
+    )
     monkeypatch.setattr("hermes_cli.process_identity.ledger_entries", lambda: [])
     monkeypatch.setattr(
         ui,
@@ -61,6 +68,7 @@ class TestCollectInventory:
         plan = ui.collect_runtime_inventory()
         assert plan.install_method == "git"
         assert plan.updatable_in_place is True
+        assert plan.inventory_complete is True
         assert plan.expected_sha == "a" * 40
         assert plan.profiles == ["default", "work"]
         assert len(plan.runtimes) == 2
@@ -100,7 +108,7 @@ class TestCollectInventory:
 
         monkeypatch.setattr(
             "hermes_cli.gateway.find_profile_gateway_processes",
-            lambda exclude_pids=None: [
+            lambda exclude_pids=None, **_kwargs: [
                 ProfileGatewayProcess(profile="legacy", path=Path("/x"), pid=300),
                 # duplicate of an already-seen pid — must be deduped
                 ProfileGatewayProcess(profile="default", path=Path("/y"), pid=100),
@@ -111,6 +119,138 @@ class TestCollectInventory:
         profiles = [r.profile for r in plan.runtimes]
         assert profiles.count("default") == 1  # deduped by pid
         assert "legacy" in profiles
+
+    def test_real_pid_collector_failure_marks_inventory_incomplete(
+        self, fleet, monkeypatch, caplog
+    ):
+        secret = "private-profile-path-must-not-leak"
+
+        def denied():
+            raise PermissionError(13, secret)
+
+        caplog.set_level("DEBUG", logger="hermes_cli.update_inventory")
+        monkeypatch.setattr(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            _real_find_profile_gateway_processes,
+        )
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", denied)
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is False
+        assert "gateway PID inventory unavailable" in plan.inventory_warnings
+        assert secret not in caplog.text
+
+    def test_corrupt_runtime_status_marks_inventory_incomplete(self, fleet):
+        default_home = fleet / "home"
+        (default_home / "gateway_state.json").write_text(
+            "{not-json", encoding="utf-8"
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is False
+        assert (
+            "gateway runtime-state inventory unavailable" in plan.inventory_warnings
+        )
+
+    def test_missing_runtime_status_is_legitimate_absence(self, fleet):
+        (fleet / "home" / "gateway_state.json").unlink()
+        (fleet / "home" / "profiles" / "work" / "gateway_state.json").unlink()
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is True
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            PermissionError(13, "private socket path must not leak"),
+            socket.timeout("private timeout detail must not leak"),
+        ],
+    )
+    def test_real_control_helper_failure_marks_inventory_incomplete(
+        self, fleet, monkeypatch, caplog, failure
+    ):
+        def failed_transport(*_args, **_kwargs):
+            raise failure
+
+        caplog.set_level("DEBUG", logger="hermes_cli.update_inventory")
+        monkeypatch.setattr(
+            "gateway.control_socket._query_unix_socket", failed_transport
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is False
+        assert (
+            "gateway control-socket inventory unavailable" in plan.inventory_warnings
+        )
+        assert str(failure) not in caplog.text
+
+    def test_control_socket_disappearing_after_resolution_marks_inventory_incomplete(
+        self, fleet, monkeypatch, caplog
+    ):
+        secret = "private vanished socket path must not leak"
+
+        class VanishedSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _path):
+                raise FileNotFoundError(2, secret)
+
+        caplog.set_level("DEBUG", logger="hermes_cli.update_inventory")
+        monkeypatch.setattr(
+            "gateway.control_socket.resolve_client_socket_path",
+            lambda *_args, **_kwargs: Path("/tmp/vanished-gateway.sock"),
+        )
+        monkeypatch.setattr(
+            "gateway.control_socket.socket.socket",
+            lambda *_args, **_kwargs: VanishedSocket(),
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is False
+        assert (
+            "gateway control-socket inventory unavailable" in plan.inventory_warnings
+        )
+        assert secret not in caplog.text
+
+    def test_malformed_control_identity_marks_inventory_incomplete(
+        self, fleet, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "gateway.control_socket._query_unix_socket",
+            lambda *_args, **_kwargs: (
+                b'{"ok":true,"result":{"pid":"not-a-pid"}}\n'
+            ),
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is False
+        assert (
+            "gateway control-socket inventory unavailable" in plan.inventory_warnings
+        )
+
+    def test_malformed_control_pointer_marks_inventory_incomplete(self, fleet):
+        default_home = fleet / "home"
+        (default_home / "gateway.sock.path").write_text("", encoding="utf-8")
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is False
+        assert (
+            "gateway control-socket inventory unavailable" in plan.inventory_warnings
+        )
 
     def test_never_raises_when_everything_fails(self, monkeypatch):
         def _boom(*a, **k):

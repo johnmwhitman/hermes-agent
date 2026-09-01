@@ -131,8 +131,10 @@ def resolve_server_socket_path(home: Path) -> tuple[Path, Optional[Path]]:
     return _fallback_socket_path(home), _pointer_path(home)
 
 
-def resolve_client_socket_path(home: Path) -> Optional[Path]:
-    """Where a client should connect for ``home``, or None when nothing exists."""
+def resolve_client_socket_path(
+    home: Path, *, strict: bool = False
+) -> Optional[Path]:
+    """Return the socket path, preserving path-read failures in strict mode."""
     direct = _default_socket_path(home)
     if direct.exists():
         return direct
@@ -140,12 +142,20 @@ def resolve_client_socket_path(home: Path) -> Optional[Path]:
     try:
         if pointer.is_file():
             target = pointer.read_text(encoding="utf-8").strip()
-            if target:
-                candidate = Path(target)
-                if candidate.exists():
-                    return candidate
+            if not target:
+                if strict:
+                    raise RuntimeError("gateway control pointer was empty")
+                return None
+            candidate = Path(target)
+            if candidate.exists():
+                return candidate
+            if strict:
+                raise RuntimeError("gateway control pointer target was absent")
+        elif strict and pointer.exists():
+            raise RuntimeError("gateway control pointer was malformed")
     except OSError:
-        pass
+        if strict:
+            raise
     return None
 
 
@@ -442,13 +452,16 @@ def query_gateway_control(
     verb: str,
     *,
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+    strict: bool = False,
 ) -> Optional[dict[str, Any]]:
-    """Ask the gateway serving ``home`` a control verb; None when unanswered.
+    """Ask the gateway serving ``home`` a control verb.
 
     Returns the verb's ``result`` payload on success. Any failure — no
     socket, stale socket nobody accepts on, timeout, malformed answer,
     ``ok: false`` — returns None so callers fall back to the scan layer.
-    Never raises.
+    With ``strict=True``, a genuinely absent endpoint still returns None,
+    while transport, timeout, protocol, and payload failures raise so a
+    safety-critical caller cannot mistake uncertainty for absence.
     """
     request = (
         json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
@@ -457,32 +470,52 @@ def query_gateway_control(
     )
     try:
         if _IS_WINDOWS:
-            raw = _query_windows_pipe(Path(home), request, timeout)
+            raw = _query_windows_pipe(
+                Path(home), request, timeout, strict=strict
+            )
         else:
-            raw = _query_unix_socket(Path(home), request, timeout)
+            raw = _query_unix_socket(Path(home), request, timeout, strict=strict)
     except Exception:
+        if strict:
+            raise
         return None
     if not raw:
         return None
     try:
         response = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError) as exc:
+        if strict:
+            raise RuntimeError("gateway control response was malformed") from exc
         return None
     if not isinstance(response, dict) or response.get("ok") is not True:
+        if strict:
+            raise RuntimeError("gateway control response was unsuccessful")
         return None
     result = response.get("result")
-    return result if isinstance(result, dict) else None
+    if not isinstance(result, dict):
+        if strict:
+            raise RuntimeError("gateway control result was malformed")
+        return None
+    return result
 
 
-def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[bytes]:
-    path = resolve_client_socket_path(home)
+def _query_unix_socket(
+    home: Path, request: bytes, timeout: float, *, strict: bool = False
+) -> Optional[bytes]:
+    path = resolve_client_socket_path(home, strict=strict)
     if path is None:
         return None
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
         try:
             sock.connect(str(path))
-        except (ConnectionRefusedError, FileNotFoundError, OSError):
+        except FileNotFoundError:
+            if strict:
+                raise
+            return None
+        except OSError:
+            if strict:
+                raise
             return None
         sock.sendall(request)
         chunks: list[bytes] = []
@@ -491,6 +524,8 @@ def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[b
             try:
                 chunk = sock.recv(65536)
             except socket.timeout:
+                if strict:
+                    raise
                 return None
             if not chunk:
                 break
@@ -498,14 +533,18 @@ def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[b
             if b"\n" in chunk:
                 break
             if sum(len(c) for c in chunks) > _MAX_RESPONSE_BYTES:
+                if strict:
+                    raise RuntimeError("gateway control response exceeded size limit")
                 return None
         data = b"".join(chunks)
         line, _, _ = data.partition(b"\n")
+        if not line and strict:
+            raise RuntimeError("gateway control response was empty")
         return line or None
 
 
 def _query_windows_pipe(
-    home: Path, request: bytes, timeout: float
+    home: Path, request: bytes, timeout: float, *, strict: bool = False
 ) -> Optional[bytes]:  # pragma: no cover - exercised on the wine2e lane
     pipe_name = windows_pipe_name(home)
     deadline = time.monotonic() + timeout
@@ -515,9 +554,11 @@ def _query_windows_pipe(
             handle = open(pipe_name, "r+b", buffering=0)
         except FileNotFoundError:
             return None
-        except OSError:
+        except OSError as exc:
             # Pipe busy (another client mid-handshake) — brief retry window.
             if time.monotonic() >= deadline:
+                if strict:
+                    raise TimeoutError("gateway control pipe remained busy") from exc
                 return None
             time.sleep(0.05)
     try:
@@ -531,18 +572,32 @@ def _query_windows_pipe(
             if b"\n" in chunk:
                 break
             if sum(len(c) for c in chunks) > _MAX_RESPONSE_BYTES:
+                if strict:
+                    raise RuntimeError("gateway control response exceeded size limit")
                 return None
         data = b"".join(chunks)
         line, _, _ = data.partition(b"\n")
+        if not line and strict:
+            raise RuntimeError("gateway control response was empty")
         return line or None
     finally:
         with contextlib.suppress(Exception):
             handle.close()
 
 
-def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
-    """Convenience wrapper: ``identify`` the gateway serving ``home``."""
-    return query_gateway_control(home, "identify", timeout=timeout)
+def identify_gateway(
+    home: Path,
+    *,
+    timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+    strict: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Identify the gateway, validating its PID for strict callers."""
+    identity = query_gateway_control(home, "identify", timeout=timeout, strict=strict)
+    if strict and identity is not None:
+        pid = identity.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise RuntimeError("gateway control identity PID was malformed")
+    return identity
 
 
 def pause_gateway_for_update(

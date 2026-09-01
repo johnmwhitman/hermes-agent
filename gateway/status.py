@@ -737,7 +737,7 @@ def _build_runtime_status_record() -> dict[str, Any]:
     return payload
 
 
-def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
+def _read_json_file(path: Path, *, strict: bool = False) -> Optional[dict[str, Any]]:
     if not path.exists():
         return None
     try:
@@ -746,14 +746,24 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
         # OSError: file vanished or permission flipped between exists() and
         # read. UnicodeDecodeError: file holds non-UTF-8 / binary garbage
         # (a truncated or clobbered status file). Either way it's unusable.
+        if strict:
+            raise
         return None
     if not raw:
+        if strict:
+            raise RuntimeError("runtime status file was empty")
         return None
     try:
         payload = json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise RuntimeError("runtime status file was malformed") from exc
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        if strict:
+            raise RuntimeError("runtime status payload was malformed")
+        return None
+    return payload
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
@@ -1275,15 +1285,18 @@ def write_runtime_status(
         pass
 
 
-def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
+def read_runtime_status(
+    path: Optional[Path] = None, *, strict: bool = False
+) -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information.
 
     ``path`` is optional so callers that need to inspect a *different*
     profile's state file (e.g. the dashboard enumerating every profile)
     can do so without mutating ``HERMES_HOME`` in-process.  Defaults to
-    the active profile's ``gateway_state.json``.
+    the active profile's ``gateway_state.json``. Missing files remain a
+    legitimate absence in strict mode; unreadable or malformed files raise.
     """
-    return _read_json_file(path or _get_runtime_status_path())
+    return _read_json_file(path or _get_runtime_status_path(), strict=strict)
 
 
 # Max age of a persisted ``gateway_state.json`` snapshot before its liveness
