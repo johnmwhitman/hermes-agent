@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -37,9 +38,21 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     [
         ("rg", ["--pre", "-payload-marker", "needle", "{input}"], None, False),
         ("rg", ["--hostname-bin=-payload-marker", "needle", "{input}"], None, False),
-        ("sort", ["--buffer-size=1K", "--compress-program", "-payload-marker"], "{bulk}", False),
+        pytest.param(
+            "sort",
+            ["--buffer-size=1K", "--compress-program", "-payload-marker"],
+            "{bulk}",
+            False,
+            marks=pytest.mark.linux_only,
+        ),
         ("ag", ["--pager=-payload-marker", "needle", "{input}"], None, True),
-        ("man", ["--pager", "-payload-marker", "ls"], None, True),
+        pytest.param(
+            "man",
+            ["--pager", "-payload-marker", "ls"],
+            None,
+            True,
+            marks=pytest.mark.linux_only,
+        ),
         ("man", ["-P", "-payload-marker", "ls"], None, True),
     ],
 )
@@ -70,7 +83,12 @@ def test_real_binaries_execute_leading_dash_program_payload(
     }
     argv = [tool, *resolved_args]
     if needs_tty:
-        argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
+        if sys.platform == "darwin":
+            # BSD script takes the output file before an argv command; the
+            # util-linux -c/-e spelling below is not supported on macOS.
+            argv = ["script", "-q", "/dev/null", *argv]
+        else:
+            argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
 
     subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
 
