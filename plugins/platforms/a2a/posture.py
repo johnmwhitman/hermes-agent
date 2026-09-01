@@ -662,17 +662,16 @@ def load_child_policy(
         return {"error": "forwarded A2A policy contains unbounded composite tools"}
     if not policy["mutation_enabled"] and not set(allowed).issubset(READONLY_TOOL_NAMES):
         return {"error": "read-only forwarded A2A policy contains mutable tools"}
-    if value is None:
-        try:
-            current_profile_identity = profile_home_identity(
-                os.environ.get("HERMES_HOME", "")
-            )
-        except Exception:
-            return {"error": "forwarded A2A profile instance identity unavailable"}
-        if not hmac.compare_digest(
-            current_profile_identity, binding.profile_home_identity
-        ):
-            return {"error": "forwarded A2A profile instance identity mismatch"}
+    try:
+        current_profile_identity = profile_home_identity(
+            os.environ.get("HERMES_HOME", "")
+        )
+    except Exception:
+        return {"error": "forwarded A2A profile instance identity unavailable"}
+    if not hmac.compare_digest(
+        current_profile_identity, binding.profile_home_identity
+    ):
+        return {"error": "forwarded A2A profile instance identity mismatch"}
     return {
         "issuer": CHILD_POLICY_ISSUER,
         "signature": signature,

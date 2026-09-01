@@ -432,6 +432,50 @@ def test_forwarded_child_rejects_recreated_profile_instance(monkeypatch, tmp_pat
     assert loaded and "profile instance identity mismatch" in loaded["error"]
 
 
+def test_agent_init_revalidation_rejects_recreation_after_initial_child_load(
+    monkeypatch, tmp_path
+):
+    profile_home = tmp_path / "profiles" / "research"
+    profile_home.mkdir(parents=True)
+    identity = posture.profile_home_identity(str(profile_home))
+    binding = _binding(
+        "alice",
+        "research",
+        "ctx-two-stage-child",
+        ["terminal"],
+        profile_home_identity=identity,
+        mutation_enabled=True,
+    )
+    secret = b"t" * 32
+    signed = posture.sign_child_policy(
+        {
+            "authenticated": True,
+            "served_agent_slug": "research",
+            "context_id": "ctx-two-stage-child",
+            "mutation_enabled": True,
+            "allowed_tool_names": ["terminal"],
+            "binding": binding,
+        },
+        secret=secret,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv(posture.CHILD_POLICY_ENV, json.dumps(signed))
+
+    initially_validated = posture.load_child_policy(secret=secret)
+    assert initially_validated and not initially_validated.get("error")
+
+    shutil.rmtree(profile_home)
+    profile_home.mkdir()
+
+    revalidated = posture.load_child_policy(initially_validated, secret=secret)
+
+    assert (
+        revalidated
+        and "profile instance identity mismatch" in revalidated["error"]
+    )
+    assert "terminal" not in revalidated.get("allowed_tool_names", ())
+
+
 def test_forwarded_child_rechecks_profile_instance_at_launch(monkeypatch, tmp_path):
     from gateway.config import PlatformConfig
     from plugins.platforms.a2a import adapter as adapter_module
@@ -682,8 +726,14 @@ def test_registry_backstop_denies_before_handler_lookup(monkeypatch):
     assert "A2A mutation posture" in str(result)
 
 
-def test_forwarded_policy_rejects_decision_and_readonly_surface_mismatch():
+def test_forwarded_policy_rejects_decision_and_readonly_surface_mismatch(
+    monkeypatch, tmp_path
+):
     secret = b"b" * 32
+    profile_home = tmp_path / "profiles" / "research"
+    profile_home.mkdir(parents=True)
+    profile_identity = posture.profile_home_identity(str(profile_home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
     assert posture.load_child_policy(
         {"authenticated": True}, secret=secret,
     ).get("error")
@@ -707,7 +757,12 @@ def test_forwarded_policy_rejects_decision_and_readonly_surface_mismatch():
     assert posture.load_child_policy(signed_bad_decision, secret=secret).get("error")
 
     valid_binding = _binding(
-        "alice", "research", "ctx-1", ["read_file"], mutation_enabled=False,
+        "alice",
+        "research",
+        "ctx-1",
+        ["read_file"],
+        profile_home_identity=profile_identity,
+        mutation_enabled=False,
     )
     valid_policy = {
         "authenticated": True,
