@@ -107,7 +107,7 @@ def test_forwarded_a2a_policy_filters_unbound_memory_provider_tools(
         "alice", "research", "ctx-memory", [],
         served_profile="research",
         served_tenant="research",
-        profile_home_identity="test-home:research",
+        profile_home_identity=posture.profile_home_identity(str(tmp_path)),
     )
     policy = posture.sign_child_policy({
         "authenticated": True,
