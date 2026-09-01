@@ -3289,6 +3289,65 @@ def test_session_resume_lazy_info_preserves_exact_route_pin_provenance(
         server._sessions.pop(sid, None)
 
 
+@pytest.mark.parametrize(
+    ("model_config", "expected"),
+    [
+        ({"provider": "anthropic", "fallback_disabled": False}, False),
+        ({"provider": "anthropic", "fallback_disabled": True}, True),
+        ({"provider": "anthropic"}, True),
+        ({"provider": "anthropic", "fallback_disabled": None}, True),
+        ({"provider": "anthropic", "fallback_disabled": 0}, True),
+        ({"provider": "anthropic", "fallback_disabled": "false"}, True),
+    ],
+    ids=("false", "true", "missing", "null", "zero", "string"),
+)
+def test_session_resume_actual_lazy_watch_preserves_route_pin_provenance(
+    monkeypatch, model_config, expected
+):
+    target = f"lazy-route-{model_config!r}"
+
+    class FakeDB:
+        def get_session(self, session_id):
+            assert session_id == target
+            return {
+                "id": target,
+                "model": "stored/model",
+                "model_config": model_config,
+            }
+
+        def reopen_session(self, session_id):
+            assert session_id == target
+
+        def get_messages_as_conversation(self, session_id, **_kwargs):
+            assert session_id == target
+            return []
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_child_run_active", lambda _target: False)
+    monkeypatch.setattr(
+        runtime_provider,
+        "is_routable_provider",
+        lambda provider: provider == "anthropic",
+    )
+
+    response = server._methods["session.resume"](
+        "r1", {"session_id": target, "lazy": True}
+    )
+    sid = response["result"]["session_id"]
+    try:
+        info = response["result"]["info"]
+        record = server._sessions[sid]
+        assert info["model"] == "stored/model"
+        assert info["provider"] == "anthropic"
+        assert info["fallback_disabled"] is expected
+        assert record["model_override"]["fallback_disabled"] is expected
+        assert record["resume_runtime_overrides"]["provider_override"] == "anthropic"
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_live_visible_history_prefers_db_display_with_candidate():
     """A warm/live session must serve the persisted DISPLAY lineage, not the
     collapsed in-memory model history.

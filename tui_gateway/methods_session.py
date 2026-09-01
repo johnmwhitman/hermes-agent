@@ -685,6 +685,8 @@ def _(rid, params: dict) -> dict:
             sid = uuid.uuid4().hex[:8]
             source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
+            overrides = _stored_session_runtime_overrides(found) or {}
+            model_override = overrides.get("model_override") or {}
             try:
                 db.reopen_session(target)
                 # The child's OWN conversation only — include_ancestors would prepend
@@ -711,6 +713,8 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
                 lazy=True,
+                model_override=overrides.get("model_override"),
+                resume_runtime_overrides=overrides or None,
                 todo_state=_todo_state_from_history(history),
                 explicit_cwd=bool(profile_resume_cwd),
             )
@@ -742,7 +746,15 @@ def _(rid, params: dict) -> dict:
                         "message_count": len(display_history) if omit_messages else len(messages),
                         "messages": messages,
                         "messages_omitted": omit_messages,
-                        "info": _lazy_resume_info(cwd, profile=profile),
+                        "info": _lazy_resume_info(
+                            cwd,
+                            model=model_override.get("model") or "",
+                            provider=overrides.get("provider_override") or "",
+                            fallback_disabled=model_override.get(
+                                "fallback_disabled", False
+                            ),
+                            profile=profile,
+                        ),
                         "inflight": None,
                         "running": child_running,
                         "session_key": target,
