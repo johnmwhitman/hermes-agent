@@ -151,13 +151,15 @@ def _profile_home(profile: str) -> Optional[str]:
         return os.path.expanduser(f"~/.hermes/profiles/{profile}")
 
 
-def _served_route_identity(agent: dict) -> Optional[dict[str, str]]:
+def _served_route_identity(
+    agent: dict, *, profile_home: Optional[str] = None,
+) -> Optional[dict[str, str]]:
     """Resolve the immutable profile/tenant identity behind a served route."""
     if not isinstance(agent, dict):
         return None
     profile = str(agent.get("profile") or "").strip()
     tenant = str(agent.get("tenant") or "").strip()
-    home = _profile_home(profile)
+    home = profile_home if profile_home is not None else _profile_home(profile)
     if not profile or not home:
         return None
     try:
@@ -1751,22 +1753,6 @@ class A2AAdapter(BasePlatformAdapter):
         """
         profile = str(agent.get("profile") or agent.get("slug") or "").strip()
         slug = str(agent.get("slug") or profile or "agent")
-        home = _profile_home(profile)
-        if posture_policy is not None:
-            # Re-resolve immediately before launch and pin this exact home into
-            # the child environment. A profile mapping changed after catalog
-            # assembly must never inherit the earlier route's authority.
-            current_identity = _served_route_identity(agent)
-            expected_identity = {
-                "served_profile": posture_policy.get("served_profile"),
-                "served_tenant": posture_policy.get("served_tenant"),
-                "profile_home_identity": posture_policy.get("profile_home_identity"),
-            }
-            if current_identity is None or current_identity != expected_identity:
-                return (
-                    "[served profile identity changed; start a new context]",
-                    protocol.STATE_FAILED,
-                )
         safe_ctx = _safe_context_slug(context_id)
         session_title = f"a2a-{slug}-{safe_ctx}"
         # Cache identity uses the raw context id; the sanitized title is only
@@ -1798,6 +1784,25 @@ class A2AAdapter(BasePlatformAdapter):
             if session_id:
                 cmd.extend(["--resume", session_id])
 
+            # Re-resolve after waiting for the profile-wide lock, immediately
+            # before building the launch environment. Pin the same exact home
+            # whose instance identity was compared with the signed policy.
+            home = _profile_home(profile)
+            if posture_policy is not None:
+                current_identity = (
+                    _served_route_identity(agent, profile_home=home)
+                    if home else None
+                )
+                expected_identity = {
+                    "served_profile": posture_policy.get("served_profile"),
+                    "served_tenant": posture_policy.get("served_tenant"),
+                    "profile_home_identity": posture_policy.get("profile_home_identity"),
+                }
+                if current_identity is None or current_identity != expected_identity:
+                    return (
+                        "[served profile identity changed; start a new context]",
+                        protocol.STATE_FAILED,
+                    )
             env = os.environ.copy()
             # A forwarded child must not inherit dispatcher/task injection
             # capability from the parent process.

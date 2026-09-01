@@ -1611,10 +1611,15 @@ class TestMultiAgentRouting:
         route = adapter._route_for_request("/dev/", {"tenant": "research"})
         assert "error" in route
 
-    def test_forwarded_profile_task_completes_in_task_store(self, monkeypatch):
+    def test_forwarded_profile_task_completes_in_task_store(self, monkeypatch, tmp_path):
         from plugins.platforms.a2a import adapter as adapter_module
         from gateway.config import PlatformConfig
 
+        profile_home = tmp_path / "dev"
+        profile_home.mkdir()
+        monkeypatch.setattr(
+            adapter_module, "_profile_home", lambda _profile: str(profile_home),
+        )
         monkeypatch.setattr(
             adapter_module,
             "_served_profile_toolset_scope",

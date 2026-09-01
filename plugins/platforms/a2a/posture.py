@@ -2,9 +2,9 @@
 
 The A2A transport is an authenticated peer boundary, not an operator
 boundary.  A peer may request mutable tools, but that request is effective
-only when the transport and the served route explicitly admit it.  This
-module intentionally contains no side effects so it can be used at every
-schema and dispatch seam.
+only when the transport and the served route explicitly admit it.  The only
+durable side effect in this module is creation of a profile-instance identity
+used to prevent authority from surviving profile replacement.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from pathlib import Path
 import secrets
 import stat
 import tempfile
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -32,6 +33,8 @@ except Exception:  # pragma: no cover - POSIX
 MUTATION_METADATA_KEY = "hermes.ai/mutationAllowed"
 CHILD_POLICY_ENV = "HERMES_A2A_POSTURE"
 CHILD_POLICY_ISSUER = "hermes-a2a-adapter-v1"
+PROFILE_INSTANCE_ID_FILE = ".a2a-profile-instance-id"
+PROFILE_INSTANCE_ID_VERSION = "profile-instance-v1"
 
 # This is a deliberately closed initial surface.  Adding a name is a policy
 # change, not an incidental schema change.
@@ -183,13 +186,66 @@ def toolset_fingerprint(tool_names: Iterable[str]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _read_profile_instance_id(path: Path) -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        uid_getter = getattr(os, "getuid", None)
+        owner_mismatch = uid_getter is not None and info.st_uid != uid_getter()
+        if not stat.S_ISREG(info.st_mode) or owner_mismatch:
+            raise PermissionError("unsafe A2A profile instance identity owner or type")
+        if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+            raise PermissionError("unsafe A2A profile instance identity permissions")
+        with os.fdopen(fd, "r", encoding="ascii") as handle:
+            fd = -1
+            raw = handle.read().strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    parsed = uuid.UUID(raw)
+    if parsed.version != 4 or str(parsed) != raw:
+        raise ValueError("invalid A2A profile instance identity")
+    return raw
+
+
+def _load_or_create_profile_instance_id(profile_home: Path) -> str:
+    path = profile_home / PROFILE_INSTANCE_ID_FILE
+    try:
+        return _read_profile_instance_id(path)
+    except FileNotFoundError:
+        value = str(uuid.uuid4())
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            return _read_profile_instance_id(path)
+        try:
+            payload = f"{value}\n".encode("ascii")
+            written = os.write(fd, payload)
+            if written != len(payload):
+                raise OSError("short A2A profile instance identity write")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return _read_profile_instance_id(path)
+
+
 def profile_home_identity(profile_home: str) -> str:
-    """Return a stable, non-disclosing identity for a served profile home."""
+    """Return the stable opaque identity of one concrete profile instance."""
     raw = str(profile_home or "").strip()
     if not raw:
         raise ValueError("served profile home is required")
-    canonical = str(Path(raw).expanduser().resolve(strict=False))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    home = Path(raw).expanduser().resolve(strict=True)
+    if not home.is_dir():
+        raise NotADirectoryError(f"served profile home is not a directory: {home}")
+    instance_id = _load_or_create_profile_instance_id(home)
+    material = f"{home}\x00{instance_id}".encode("utf-8")
+    return f"{PROFILE_INSTANCE_ID_VERSION}:{hashlib.sha256(material).hexdigest()}"
 
 
 def make_binding(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -304,6 +306,38 @@ def test_resume_binding_rejects_same_slug_route_identity_remap(
     assert posture.resume_binding_status(original, remapped) == "mismatch"
 
 
+def test_profile_home_identity_changes_when_profile_is_recreated(tmp_path):
+    profile_home = tmp_path / "profiles" / "research"
+    profile_home.mkdir(parents=True)
+
+    original = posture.profile_home_identity(str(profile_home))
+    assert posture.profile_home_identity(str(profile_home)) == original
+
+    shutil.rmtree(profile_home)
+    profile_home.mkdir()
+
+    assert posture.profile_home_identity(str(profile_home)) != original
+
+
+def test_profile_home_identity_rejects_legacy_path_hash_binding(tmp_path):
+    profile_home = tmp_path / "profiles" / "research"
+    profile_home.mkdir(parents=True)
+    legacy_path_hash = hashlib.sha256(
+        str(profile_home.resolve()).encode("utf-8"),
+    ).hexdigest()
+    legacy = _binding(
+        "alice", "research", "ctx-legacy-home", ["terminal"],
+        profile_home_identity=legacy_path_hash,
+        mutation_enabled=True,
+    )
+    current = {
+        **legacy,
+        "profile_home_identity": posture.profile_home_identity(str(profile_home)),
+    }
+
+    assert posture.resume_binding_status(legacy, current) == "mismatch"
+
+
 def test_agent_cache_key_rejects_same_slug_profile_remap():
     original = _binding(
         "alice", "research", "ctx-cache", ["read_file"],
@@ -543,14 +577,16 @@ def test_forwarded_policy_rejects_route_identity_mismatch():
     assert posture.load_child_policy(policy, secret=secret).get("error")
 
 
-def test_forwarded_child_rejects_profile_home_remap_before_launch(monkeypatch):
+def test_forwarded_child_rejects_profile_home_remap_before_launch(monkeypatch, tmp_path):
     from gateway.config import PlatformConfig
     from plugins.platforms.a2a import adapter as adapter_module
     from plugins.platforms.a2a import protocol
 
     adapter = adapter_module.A2AAdapter(PlatformConfig(enabled=True))
     agent = {"slug": "research", "profile": "research", "tenant": "tenant-a"}
-    old_home_identity = posture.profile_home_identity("/profiles/old-research")
+    old_home = tmp_path / "profiles" / "old-research"
+    old_home.mkdir(parents=True)
+    old_home_identity = posture.profile_home_identity(str(old_home))
     binding = _binding(
         "alice", "research", "ctx-route", ["read_file"],
         served_profile="research",
@@ -564,7 +600,9 @@ def test_forwarded_child_rejects_profile_home_remap_before_launch(monkeypatch):
         "binding": binding,
     }
     monkeypatch.setattr(
-        adapter_module, "_profile_home", lambda _profile: "/profiles/new-research",
+        adapter_module,
+        "_profile_home",
+        lambda _profile: str(tmp_path / "profiles" / "new-research"),
     )
     monkeypatch.setattr(
         adapter, "_run_profile_command",
@@ -573,6 +611,58 @@ def test_forwarded_child_rejects_profile_home_remap_before_launch(monkeypatch):
 
     reply, state = adapter._forward_to_profile(
         agent, "alice", "ctx-route", "hello", posture_policy=policy,
+    )
+
+    assert state == protocol.STATE_FAILED
+    assert "identity changed" in reply
+
+
+def test_forwarded_child_rechecks_profile_identity_after_waiting_for_lock(
+    monkeypatch, tmp_path,
+):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.a2a import adapter as adapter_module
+    from plugins.platforms.a2a import protocol
+
+    adapter = adapter_module.A2AAdapter(PlatformConfig(enabled=True))
+    agent = {"slug": "research", "profile": "research", "tenant": "tenant-a"}
+    old_home = tmp_path / "profiles" / "old-research"
+    new_home = tmp_path / "profiles" / "new-research"
+    old_home.mkdir(parents=True)
+    new_home.mkdir()
+    current_home = {"path": str(old_home)}
+    old_home_identity = posture.profile_home_identity(str(old_home))
+    binding = _binding(
+        "alice", "research", "ctx-lock-remap", ["read_file"],
+        served_profile="research",
+        served_tenant="tenant-a",
+        profile_home_identity=old_home_identity,
+    )
+    policy = {
+        "served_profile": "research",
+        "served_tenant": "tenant-a",
+        "profile_home_identity": old_home_identity,
+        "binding": binding,
+    }
+
+    class RemappingLock:
+        def __enter__(self):
+            current_home["path"] = str(new_home)
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        adapter_module, "_profile_home", lambda _profile: current_home["path"],
+    )
+    monkeypatch.setattr(adapter, "_forward_lock", lambda _profile: RemappingLock())
+    monkeypatch.setattr(
+        adapter, "_run_profile_command",
+        lambda *_args, **_kwargs: pytest.fail("remapped child must not launch"),
+    )
+
+    reply, state = adapter._forward_to_profile(
+        agent, "alice", "ctx-lock-remap", "hello", posture_policy=policy,
     )
 
     assert state == protocol.STATE_FAILED
@@ -1028,6 +1118,11 @@ def test_prepare_task_scopes_binding_catalog_to_served_profile(monkeypatch, tmp_
     from plugins.platforms.a2a import adapter as adapter_module
     from plugins.platforms.a2a import protocol
 
+    profile_home = tmp_path / "research"
+    profile_home.mkdir()
+    monkeypatch.setattr(
+        adapter_module, "_profile_home", lambda _profile: str(profile_home),
+    )
     monkeypatch.setattr(posture, "load_persisted_bindings", lambda: {})
     monkeypatch.setattr(
         posture, "_binding_store_path", lambda: tmp_path / "bindings.json",
@@ -1126,6 +1221,11 @@ def test_prepare_task_rejects_when_served_profile_scope_is_unavailable(
     from plugins.platforms.a2a import adapter as adapter_module
     from plugins.platforms.a2a import protocol
 
+    profile_home = tmp_path / "research"
+    profile_home.mkdir()
+    monkeypatch.setattr(
+        adapter_module, "_profile_home", lambda _profile: str(profile_home),
+    )
     monkeypatch.setattr(posture, "load_persisted_bindings", lambda: {})
     monkeypatch.setattr(
         posture, "_binding_store_path", lambda: tmp_path / "bindings.json",
@@ -1234,6 +1334,11 @@ def test_prepare_task_establishes_authorized_mutable_binding_and_rejects_reuse(
     from plugins.platforms.a2a import adapter as adapter_module
     from plugins.platforms.a2a import protocol
 
+    profile_home = tmp_path / "research"
+    profile_home.mkdir()
+    monkeypatch.setattr(
+        adapter_module, "_profile_home", lambda _profile: str(profile_home),
+    )
     monkeypatch.setattr(posture, "load_persisted_bindings", lambda: {})
     monkeypatch.setattr(
         posture, "_binding_store_path", lambda: tmp_path / "bindings.json",
