@@ -85,6 +85,14 @@ describe('applyRuntimeInfo model provenance', () => {
     expect(getCurrentModelSource()).toBe('default')
   })
 
+  it('treats a legacy resumed model without fallback provenance as pinned', () => {
+    setCurrentModelSource('default')
+
+    applyRuntimeInfo({ model: 'legacy/model', provider: 'openrouter' })
+
+    expect(getCurrentModelSource()).toBe('manual')
+  })
+
   it('clears sticky provenance while a stored-session preview is unresolved', () => {
     setCurrentModelSource('manual')
     applyStoredSessionPreviewRuntimeInfo({ model: 'claude-fable-5' }, 'stored-session')

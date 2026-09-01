@@ -276,7 +276,10 @@ async function desktopSessionCreateParams(
     ...(profile ? { profile: capturedRoute?.targetProfile || profile } : {}),
     ...(selection.model
       ? {
-          fallback_disabled: selection.source === 'manual',
+          // Legacy resumed sessions can expose a concrete model before an old
+          // backend reports route-pin provenance. Only an explicit `default`
+          // source may enable fallbacks; unknown provenance fails closed.
+          fallback_disabled: selection.source !== 'default',
           model: selection.model,
           ...(selection.provider ? { provider: selection.provider } : {})
         }

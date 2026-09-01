@@ -722,6 +722,20 @@ describe('createBackendSessionForSend profile routing', () => {
     })
   })
 
+  it('fails closed when immediate New Chat inherits a model with unresolved legacy provenance', async () => {
+    const params = await createWith(() => {
+      setCurrentModel('legacy/model')
+      setCurrentModelSource('')
+      setCurrentProvider('openrouter')
+    })
+
+    expect(params).toMatchObject({
+      fallback_disabled: true,
+      model: 'legacy/model',
+      provider: 'openrouter'
+    })
+  })
+
   it('falls back to the entered project cwd when the current cwd is blank', async () => {
     const params = await createWith(() => {
       $projectTree.set([

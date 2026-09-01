@@ -3871,6 +3871,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
         "provider": "openai-codex",
         "base_url": "https://custom.example/v1",
         "api_mode": "chat_completions",
+        "fallback_disabled": True,
     }
     assert captured["provider_override"] == "openai-codex"
     assert captured["reasoning_config_override"] == {"enabled": True, "effort": "high"}
@@ -4085,7 +4086,7 @@ def test_stored_session_runtime_overrides_restores_route_pin_policy():
     assert unpinned["model_override"]["fallback_disabled"] is False
 
     legacy = server._stored_session_runtime_overrides({"model": "legacy/model"})
-    assert "fallback_disabled" not in legacy["model_override"]
+    assert legacy["model_override"]["fallback_disabled"] is True
 
 
 def test_stored_session_runtime_overrides_restores_explicit_normal_tier():
@@ -10378,10 +10379,12 @@ def test_one_turn_restore_preserves_active_fallback_state():
         _fallback_activated = True
         _rate_limited_until = 123
         _rate_limit_backoff_count = 2
+        runtime_capabilities = {"vision": True, "tool_calling": True}
 
         def switch_model(self, **kwargs):
             self.model = kwargs["new_model"]
             self.provider = kwargs["new_provider"]
+            self.runtime_capabilities = kwargs["capabilities"]
 
     agent = Agent()
     snapshot = server._snapshot_agent_model_runtime(agent)
@@ -10391,6 +10394,7 @@ def test_one_turn_restore_preserves_active_fallback_state():
     agent._fallback_activated = False
     agent._rate_limited_until = 0
     agent._rate_limit_backoff_count = 0
+    agent.runtime_capabilities = {"vision": False, "tool_calling": False}
 
     server._restore_agent_model_runtime(agent, snapshot)
 
@@ -10400,6 +10404,7 @@ def test_one_turn_restore_preserves_active_fallback_state():
     assert agent._fallback_activated is True
     assert agent._rate_limited_until == 123
     assert agent._rate_limit_backoff_count == 2
+    assert agent.runtime_capabilities == {"vision": True, "tool_calling": True}
 
 
 def test_one_turn_restore_failure_does_not_claim_runtime_restored():

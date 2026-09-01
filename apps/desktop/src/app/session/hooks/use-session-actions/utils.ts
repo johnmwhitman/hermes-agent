@@ -1667,6 +1667,11 @@ export function applyRuntimeInfo(
 
     if (typeof info.fallback_disabled === 'boolean') {
       setCurrentModelSource(info.fallback_disabled ? 'manual' : 'default')
+    } else if (typeof info.model === 'string' && info.model.trim()) {
+      // Legacy runtimes report the restored session model but no route-pin
+      // provenance. Unknown must fail closed: presenting it as profile-default
+      // lets an immediate New Chat silently re-enable provider fallbacks.
+      setCurrentModelSource('manual')
     }
 
     if (info.usage) {

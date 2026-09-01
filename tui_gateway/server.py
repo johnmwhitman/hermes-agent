@@ -5548,10 +5548,13 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             "base_url": base_url or None,
             "api_mode": api_mode or None,
         }
-        if "fallback_disabled" in model_config:
-            overrides["model_override"]["fallback_disabled"] = bool(
-                model_config["fallback_disabled"]
-            )
+        # Rows created before route-pin provenance was persisted still carry a
+        # concrete session model. Treat unknown provenance as an explicit pin:
+        # silently enabling the current profile's fallback chain can route this
+        # restored conversation to a model/provider the user never selected.
+        overrides["model_override"]["fallback_disabled"] = bool(
+            model_config.get("fallback_disabled", True)
+        )
     if provider:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
@@ -6255,6 +6258,9 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
+        "capabilities": copy.deepcopy(
+            getattr(agent, "runtime_capabilities", None)
+        ),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
         "fallback_chain": copy.deepcopy(getattr(agent, "_fallback_chain", [])),
         "fallback_model": copy.deepcopy(getattr(agent, "_fallback_model", None)),
