@@ -69,7 +69,7 @@ def _fake_pool_store(monkeypatch):
     """
     store: Dict[str, list] = {}
 
-    def _write(provider, entries, *, removed_ids=None):
+    def _write(provider, entries, *, removed_ids=None, reset_status_ids=None):
         store[provider] = list(entries)
 
     def _read(provider=None):
@@ -279,6 +279,12 @@ def test_concurrent_claude_code_refresh_recovers_via_credentials_file(monkeypatc
     monkeypatch.setattr(
         "agent.anthropic_credentials._write_claude_code_credentials",
         _fake_write_claude_code_credentials,
+    )
+    claude_credentials_lock = threading.Lock()
+    monkeypatch.setattr(
+        CredentialPool,
+        "_claude_code_credentials_lock",
+        lambda _self: claude_credentials_lock,
     )
 
     shared_stale_entry = _entry(
