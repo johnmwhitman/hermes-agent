@@ -1061,7 +1061,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    calls = {"connect": 0, "to_thread": 0}
+    calls = {"connect": 0, "sleep": 0}
 
     def _connect(*args, **kwargs):
         calls["connect"] += 1
@@ -1073,25 +1073,17 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             )
         raise sqlite3.DatabaseError("file is not a database")
 
-    async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 6:
-            runner._running = False
-        return result
-
     async def _sleep(_delay):
+        # Bound the real watcher by lifecycle rather than mocking its blocking
+        # I/O seam.  Call 1 is the initial boot delay; calls 2 and 3 follow the
+        # first and second dispatch ticks.  This continues to exercise the
+        # dedicated executor introduced by cddb67b014.
+        calls["sleep"] += 1
+        if calls["sleep"] >= 3:
+            runner._running = False
         return None
 
     monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
     with caplog.at_level(logging.ERROR, logger="gateway.run"):
@@ -1406,5 +1398,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

@@ -543,6 +543,18 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
 def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
     task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
     assert kb.request_review(conn, task_id, summary="implementation handoff")
+    handoff_run = kb.latest_run(conn, task_id)
+    assert handoff_run is not None
+    # Manual approval can legitimately add no new evidence, but it is not a
+    # hollow instant worker completion. Age the closed handoff run beyond the
+    # production minimum-runtime guard without disabling that guard.
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs "
+            "SET started_at = ended_at - ? "
+            "WHERE id = ?",
+            (kb.DEFAULT_MIN_WORKER_RUNTIME_SECONDS + 1, handoff_run.id),
+        )
     assert kb.complete_task(conn, task_id)
     completed_event = _event(kb.list_events(conn, task_id), "completed")
     assert completed_event.run_id is not None

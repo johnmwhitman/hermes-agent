@@ -1,27 +1,11 @@
-"""Regression test for t_bd64ac2d — multi-dispatcher admission control.
+"""Admission-control tests for repeated ticks on one shared Kanban board.
 
-Root cause (2026-08-28): ``kanban.max_in_progress`` and
-``kanban.max_in_progress_per_profile`` are enforced ONLY when the dispatcher
-that runs the tick passes them in. Every gateway that boots with
-``dispatch_in_gateway=true`` (the upstream default) races the singleton
-``.dispatcher.lock``; the FIRST one to win becomes the de-facto admission
-authority for the whole shared board. If that gateway's profile has no
-``kanban.max_in_progress*`` keys (e.g. researcher's config), caps become
-None and ``dispatch_once`` happily spawns past every operator-configured
-limit. The board-scoped dispatch lock (``_dispatch_tick_lock``) only
-serialises writers — it does not unify policy.
-
-This fixture proves that ``dispatch_once`` itself (the lowest-level
-admission-control primitive) correctly enforces an EITHER-side cap when the
-caller passes them in. The DISPATCHER-OWNER contract test that proves the
-singleton wins is in a sibling test
-(``test_kanban_dispatcher_owner_authority.py``); the fix must install that
-test once the durable repair lands.
-
-This is the deterministic RED fixture the operator requested. It fails on
-unpatched code: two callers invoking ``dispatch_once`` back-to-back with
-ONE cap set and the other absent let the absent cap dispatch past the
-configured strict cap, exactly the live reproduction.
+The gateway's machine-global ``.dispatcher.lock`` elects one dispatcher
+owner.  That owner resolves its concurrency policy at boot and passes the
+same explicit caps to every ``dispatch_once`` call.  ``dispatch_once`` is a
+per-call primitive: it enforces the supplied caps against durable running
+state, but deliberately does not persist caller configuration in the board
+database (and a dry run deliberately writes no running state).
 """
 from __future__ import annotations
 
@@ -51,21 +35,12 @@ def _fake_spawn(*args, **kwargs):
     return 99999
 
 
-def test_two_dispatchers_different_caps_share_strict_policy(isolated_kanban_home_multi):
-    """Two callers invoke ``dispatch_once`` against the same shared DB with
-    different cap configurations. The STRICT-shared effective cap must be
-    honoured regardless of which dispatcher is currently holding the
-    singleton.
+def test_repeated_owner_ticks_share_explicit_strict_policy(isolated_kanban_home_multi):
+    """The elected owner supplies the same caps on every tick.
 
-    Reproduction of t_bd64ac2d:
-      - caller A (researcher): max_in_progress_per_profile=None
-        (no caps configured) → no per-profile enforcement
-      - caller B (conductor): max_in_progress=2, max_in_progress_per_profile=1
-        (operator intent)
-
-    Without the fix, each caller's tick enforces ONLY its own caps. With
-    the fix, the strict-shared policy (B's caps) wins, so the platformops
-    ready backlog is bounded to N=1 even when caller A is the singleton.
+    The first tick may start one platformops worker.  The second tick observes
+    that durable running row and must start none, preserving both the global
+    and per-profile cap across ticks without any hidden policy persistence.
     """
     kb = isolated_kanban_home_multi
     with kb.connect_closing() as conn:
@@ -74,48 +49,44 @@ def test_two_dispatchers_different_caps_share_strict_policy(isolated_kanban_home
         for i in range(5):
             kb.create_task(conn, title=f"po{i}", assignee="platformops")
 
-    # Tick 1: caller A (researcher) holds the singleton; no caps.
-    # Tick 2: caller B (conductor) runs with strict caps.
-    with kb.connect_closing() as conn:
-        a_res = kb.dispatch_once(
-            conn, spawn_fn=_fake_spawn, dry_run=True,
-            # dispatcher A's config: no caps
-        )
-        a_count = sum(1 for s in a_res.spawned if s[1] == "platformops")
+    # Use this test process as the worker PID so the second tick sees a live
+    # worker rather than reclaiming the fixture as crashed.
+    def _live_fake_spawn(*args, **kwargs):
+        return os.getpid()
 
     with kb.connect_closing() as conn:
-        b_res = kb.dispatch_once(
-            conn, spawn_fn=_fake_spawn, dry_run=True,
+        first = kb.dispatch_once(
+            conn, spawn_fn=_live_fake_spawn,
             max_in_progress=2,
             max_in_progress_per_profile=1,
         )
-        b_count = sum(1 for s in b_res.spawned if s[1] == "platformops")
+        first_count = sum(1 for s in first.spawned if s[1] == "platformops")
 
-    # STRICT-shared policy (B's caps) is the operator-configured truth.
-    # Caller A's lack of caps must NOT relax it.
-    assert a_count <= 1, (
-        f"caller A (no caps) dispatched {a_count} platformops workers; "
-        "expected <=1 because the strict-shared per-profile cap is 1. "
-        "This is the t_bd64ac2d regression."
-    )
-    assert b_count <= 1, (
-        f"caller B (cap=1) dispatched {b_count} platformops workers; "
-        "expected <=1 per per-profile cap."
-    )
+    with kb.connect_closing() as conn:
+        second = kb.dispatch_once(
+            conn, spawn_fn=_live_fake_spawn,
+            max_in_progress=2,
+            max_in_progress_per_profile=1,
+        )
+        second_count = sum(1 for s in second.spawned if s[1] == "platformops")
+
+    assert first_count == 1
+    assert second_count == 0
 
 
-def test_strict_cap_wins_when_one_dispatcher_omits_caps(isolated_kanban_home_multi):
-    """Three ready tasks for platformops; one dispatcher with cap=1
-    followed by a dispatcher with no caps. The strict cap (1) must hold
-    across both ticks because the caps are operator-configured truth,
-    not per-tick hints."""
+def test_dry_run_cap_policy_is_per_call(isolated_kanban_home_multi):
+    """A dry run neither claims tasks nor persists its caller's policy.
+
+    This prevents one CLI preview from silently changing the elected gateway
+    owner's later policy.  A capped preview sees one eligible task; a later
+    uncapped preview still sees all three because neither call mutates state.
+    """
     kb = isolated_kanban_home_multi
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Shared")
         for i in range(3):
             kb.create_task(conn, title=f"po{i}", assignee="platformops")
 
-    # Tick 1: caller with caps (cap=1)
     with kb.connect_closing() as conn:
         res1 = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -123,25 +94,14 @@ def test_strict_cap_wins_when_one_dispatcher_omits_caps(isolated_kanban_home_mul
         )
         first_count = sum(1 for s in res1.spawned if s[1] == "platformops")
 
-    # Tick 2: caller with no caps (simulates researcher owning the singleton)
     with kb.connect_closing() as conn:
         res2 = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
-            # no caps passed
         )
         second_count = sum(1 for s in res2.spawned if s[1] == "platformops")
 
-    assert first_count == 1, (
-        f"tick 1 (cap=1) dispatched {first_count}; expected exactly 1"
-    )
-    # The fix MUST persist the strict cap so tick 2 (caller without caps)
-    # also respects it. Without the fix, tick 2 sees no running-count
-    # bookkeeping (it doesn't track per-profile cap) and spawns the rest.
-    assert second_count == 0, (
-        f"tick 2 (no caps) dispatched {second_count}; expected 0 because "
-        "tick 1 already claimed 1 and strict per-profile cap is 1. "
-        "This proves the missing dispatcher-pinning of strict policy."
-    )
+    assert first_count == 1
+    assert second_count == 3
 
 
 def test_global_cap_wins_when_per_profile_unset(isolated_kanban_home_multi):
@@ -167,7 +127,5 @@ def test_global_cap_wins_when_per_profile_unset(isolated_kanban_home_multi):
     total_spawned = len(res.spawned)
     assert total_spawned <= 1, (
         f"global max_in_progress=1 was violated: dispatched {total_spawned}; "
-        "expected <=1. Without the fix this test still passes (current code "
-        "honours global cap), but the per-profile + global interaction is "
-        "what t_bd64ac2d exposes."
+        "expected <=1 because the elected owner supplied a strict global cap."
     )

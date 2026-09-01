@@ -571,6 +571,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
         assert kb.complete_task(
             conn,
             running_id,
+            summary="capacity fixture completed",
             expected_run_id=running.current_run_id,
         )
         global_dry_run = kb.dispatch_once(
