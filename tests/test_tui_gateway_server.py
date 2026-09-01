@@ -9858,10 +9858,11 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
                 "config": {
                     "model": "new/model",
                     "provider": "custom:new-provider",
-                    "base_url": profile_url,
-                    "api_mode": "chat_completions",
-                    "reasoning_config": reasoning,
-                },
+                        "base_url": profile_url,
+                        "api_mode": "chat_completions",
+                        "reasoning_config": reasoning,
+                        "fallback_disabled": True,
+                    },
             }
         ]
     finally:
