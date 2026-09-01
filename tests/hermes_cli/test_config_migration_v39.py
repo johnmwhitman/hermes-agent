@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import yaml
 
+from hermes_cli.config import DEFAULT_CONFIG, migrate_config
 from hermes_cli.config_migrations import _migrate_to_39
 
 
@@ -63,3 +64,46 @@ def test_v39_saved_toolset_cleanup_is_byte_idempotent(tmp_path):
     assert "stt" not in raw["platform_toolsets"]["cli"]
     assert "stt" not in raw["known_builtin_toolsets"]["cli"]
     assert second_pass == first_pass
+
+
+def test_released_v39_config_receives_stt_cleanup_through_current_driver(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "_config_version": 39,
+                "platform_toolsets": {"cli": ["a2a", "fleet_bus", "stt"]},
+                "known_builtin_toolsets": {"cli": ["a2a", "fleet_bus", "stt"]},
+                "stt": {"enabled": True, "provider": "local"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        migrate_config(interactive=False, quiet=True)
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert raw["platform_toolsets"]["cli"] == ["a2a", "fleet_bus"]
+    assert raw["known_builtin_toolsets"]["cli"] == ["a2a", "fleet_bus"]
+    assert raw["stt"] == {"enabled": True, "provider": "local"}
+    assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+
+
+def test_v39_cleanup_preserves_malformed_unhashable_list_entries(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        platform_toolsets=["a2a", {"bad": "shape"}, ["nested"], "stt", "bfl"],
+        known_toolsets=["fleet_bus", {"bad": "shape"}, "stt", "bfl"],
+    )
+
+    _run_v39_migration(tmp_path)
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert raw["platform_toolsets"]["cli"] == [
+        "a2a",
+        {"bad": "shape"},
+        ["nested"],
+    ]
+    assert raw["known_builtin_toolsets"]["cli"] == ["fleet_bus", {"bad": "shape"}]

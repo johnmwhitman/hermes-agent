@@ -851,10 +851,13 @@ def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
             continue
         for platform, toolsets in mapping.items():
             if isinstance(toolsets, list) and any(
-                ts in stale_saved_toolsets for ts in toolsets
+                isinstance(ts, str) and ts in stale_saved_toolsets
+                for ts in toolsets
             ):
                 mapping[platform] = [
-                    ts for ts in toolsets if ts not in stale_saved_toolsets
+                    ts
+                    for ts in toolsets
+                    if not (isinstance(ts, str) and ts in stale_saved_toolsets)
                 ]
                 changed = True
         if changed:
@@ -869,6 +872,14 @@ def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
                 "  ✓ Removed retired/config-only entries from saved toolset "
                 "lists (BFL FLUX 3 and STT); provider settings were preserved."
             )
+
+
+def _migrate_to_40(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 39 → 40: apply saved-toolset cleanup to released v39 configs ──
+    # v39 shipped before STT joined the cleanup above. Replaying the idempotent
+    # step gives already-v39 installations the repair while keeping v38 and
+    # older upgrades on the same single cleanup implementation.
+    _migrate_to_39(results, quiet)
 
 
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
@@ -898,6 +909,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (37, _migrate_to_37),
     (38, _migrate_to_38),
     (39, _migrate_to_39),
+    (40, _migrate_to_40),
 )
 
 
