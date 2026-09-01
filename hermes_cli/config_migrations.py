@@ -828,38 +828,46 @@ def _migrate_to_38(results: Dict[str, Any], quiet: bool) -> None:
 
 
 def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
-    # ── Version 38 → 39: remove the retired `bfl` toolset from saved lists ──
+    # ── Version 38 → 39: remove retired/config-only saved toolset entries ──
     # The six bfl_flux3_* core tools shipped for a free FLUX 3 promotional
     # period that has since ended server-side, leaving every Nous-signed-in
     # install paying ~2.7K tokens of schema per API call for tools that can
     # only refuse. They were removed in favor of the standard video_gen
     # provider surface (`video_generate`, `hermes tools` → Video Generation).
     # Strip the toolset key wherever the auto-backfill or a picker save wrote
-    # it, so stale config can't resurrect an unknown toolset.
+    # it, so stale config can't resurrect an unknown toolset. STT is likewise
+    # not a model toolset anymore: its enablement lives under ``stt.enabled``
+    # and that provider configuration must remain untouched.
     _c = _cfg()
     read_raw_config = _c.read_raw_config
     _persist_migration = _c._persist_migration
 
     config = read_raw_config()
     changed = False
+    stale_saved_toolsets = {"bfl", "stt"}
     for section in ("platform_toolsets", "known_builtin_toolsets"):
         mapping = config.get(section)
         if not isinstance(mapping, dict):
             continue
         for platform, toolsets in mapping.items():
-            if isinstance(toolsets, list) and "bfl" in toolsets:
-                mapping[platform] = [ts for ts in toolsets if ts != "bfl"]
+            if isinstance(toolsets, list) and any(
+                ts in stale_saved_toolsets for ts in toolsets
+            ):
+                mapping[platform] = [
+                    ts for ts in toolsets if ts not in stale_saved_toolsets
+                ]
                 changed = True
         if changed:
             config[section] = mapping
     if changed:
         _persist_migration(config)
-        results["config_added"].append("removed retired 'bfl' toolset from saved toolset lists")
+        results["config_added"].append(
+            "removed retired/config-only toolsets from saved toolset lists"
+        )
         if not quiet:
             print(
-                "  ✓ Removed the retired BFL FLUX 3 toolset from saved toolset "
-                "lists — video generation now lives under `hermes tools` → "
-                "Video Generation (Nous Subscription or FAL)."
+                "  ✓ Removed retired/config-only entries from saved toolset "
+                "lists (BFL FLUX 3 and STT); provider settings were preserved."
             )
 
 
