@@ -53,41 +53,62 @@ class TestReadFileSchemaStatic(unittest.TestCase):
         self.assertEqual(o, {})  # base wording stands
 
     def test_hosted_ocr_available_gate_states(self):
-        """Maintainer decision: ONLY a direct FIRECRAWL_API_KEY unlocks —
-        not config true, not the Nous gateway."""
+        """Hosted OCR needs both a direct key and literal config opt-in."""
         import tools.read_extract as rx
 
-        # direct key → True
+        # A direct key alone must never turn document upload on.
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
             with patch("hermes_cli.config.load_config_readonly",
                        return_value={}):
-                self.assertTrue(rx.hosted_ocr_available())
-        # config false beats key
+                self.assertFalse(rx.hosted_ocr_available())
+        # Explicit false keeps it off.
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
             with patch("hermes_cli.config.load_config_readonly",
                        return_value={"file_tools": {"hosted_ocr": False}}):
                 self.assertFalse(rx.hosted_ocr_available())
-        # config true WITHOUT key → False (key is the one gate)
+        # Only literal True opts in; truthy values are not policy.
+        with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
+            with patch("hermes_cli.config.load_config_readonly",
+                       return_value={"file_tools": {"hosted_ocr": "true"}}):
+                self.assertFalse(rx.hosted_ocr_available())
+        # Explicit true WITHOUT a key cannot provide a hosted route.
         with patch.dict(rx.os.environ, {}, clear=False):
             rx.os.environ.pop("FIRECRAWL_API_KEY", None)
             with patch("hermes_cli.config.load_config_readonly",
                        return_value={"file_tools": {"hosted_ocr": True}}):
                 self.assertFalse(rx.hosted_ocr_available())
-        # nothing → False (Nous gateway alone must NOT unlock)
-        with patch("hermes_cli.config.load_config_readonly",
-                   return_value={}):
-            rx.os.environ.pop("FIRECRAWL_API_KEY", None)
-            self.assertFalse(rx.hosted_ocr_available())
+        # Explicit true plus the direct key is the only enabled state.
+        with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
+            with patch("hermes_cli.config.load_config_readonly",
+                       return_value={"file_tools": {"hosted_ocr": True}}):
+                self.assertTrue(rx.hosted_ocr_available())
+
+    def test_hosted_ocr_config_load_failure_fails_closed(self):
+        import tools.read_extract as rx
+
+        with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
+            with patch("hermes_cli.config.load_config_readonly",
+                       side_effect=OSError("unreadable config")):
+                self.assertFalse(rx.hosted_ocr_available())
+                self.assertEqual(
+                    rx._hosted_ocr_config(),
+                    (False, "fc-x", None),
+                )
 
     def test_runtime_route_is_direct_key_only(self):
-        """_hosted_ocr_config never resolves the Nous gateway: api_url is
-        always None (anydoc defaults to api.firecrawl.dev) and enabled
-        tracks the key."""
+        """Runtime route requires explicit opt-in and never uses Nous."""
         import tools.read_extract as rx
 
         with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
             with patch("hermes_cli.config.load_config_readonly",
                        return_value={}):
+                enabled, key, url = rx._hosted_ocr_config()
+        self.assertFalse(enabled)
+        self.assertEqual(key, "fc-x")
+        self.assertIsNone(url)
+        with patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}):
+            with patch("hermes_cli.config.load_config_readonly",
+                       return_value={"file_tools": {"hosted_ocr": True}}):
                 enabled, key, url = rx._hosted_ocr_config()
         self.assertTrue(enabled)
         self.assertEqual(key, "fc-x")
@@ -201,6 +222,31 @@ class TestNeedsOcrPath(unittest.TestCase):
         self.assertIn("check whether an OCR skill is available", out)
         self.assertNotIn("hosted_ocr", out)
         self.assertNotIn("ocr-and-documents", out)
+
+    def test_key_without_explicit_opt_in_never_attempts_hosted_ocr(self):
+        from tools import read_extract as rx
+
+        mod, calls = self._fake_mod()
+        with patch.object(rx, "_anydoc", return_value=mod), \
+             patch.object(rx.os.path, "getsize", return_value=10), \
+             patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}), \
+             patch("hermes_cli.config.load_config_readonly", return_value={}):
+            out = rx._extract_anydoc("scan.pdf")
+        self.assertIn("[NEEDS OCR", out)
+        self.assertEqual(calls, [{}])
+
+    def test_explicit_opt_in_attempts_hosted_ocr(self):
+        from tools import read_extract as rx
+
+        mod, calls = self._fake_mod(hosted_result="OCR TEXT")
+        with patch.object(rx, "_anydoc", return_value=mod), \
+             patch.object(rx.os.path, "getsize", return_value=10), \
+             patch.dict(rx.os.environ, {"FIRECRAWL_API_KEY": "fc-x"}), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"file_tools": {"hosted_ocr": True}}):
+            out = rx._extract_anydoc("scan.pdf")
+        self.assertEqual(out, "OCR TEXT\n")
+        self.assertEqual(calls, [{}, {"ocr": "hosted", "api_key": "fc-x"}])
 
     def test_pin_lockstep(self):
         """pyproject core pin and lazy_deps self-heal pin must match."""
