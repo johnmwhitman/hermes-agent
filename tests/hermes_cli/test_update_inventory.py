@@ -135,6 +135,18 @@ class TestCollectInventory:
     @pytest.mark.parametrize(
         ("target", "warning"),
         [
+            (
+                "hermes_cli.image_provenance.read_image_provenance",
+                "image provenance inventory unavailable",
+            ),
+            (
+                "hermes_cli.config.detect_install_method",
+                "install-method inventory unavailable",
+            ),
+            (
+                "hermes_cli.build_info.get_code_identity",
+                "code-identity inventory unavailable",
+            ),
             ("hermes_cli.profiles._get_default_hermes_home", "profile enumeration unavailable"),
             ("hermes_cli.gateway._get_service_pids", "service supervisor inventory unavailable"),
             (
@@ -143,6 +155,10 @@ class TestCollectInventory:
             ),
             ("hermes_cli.gateway.supports_systemd_services", "gateway runtime-state inventory unavailable"),
             ("gateway.status.read_runtime_status", "gateway runtime-state inventory unavailable"),
+            (
+                "gateway.control_socket.identify_gateway",
+                "gateway control-socket inventory unavailable",
+            ),
             ("hermes_cli.gateway.find_profile_gateway_processes", "gateway PID inventory unavailable"),
             (
                 "hermes_cli.process_identity.ledger_entries",
@@ -151,16 +167,20 @@ class TestCollectInventory:
         ],
     )
     def test_critical_runtime_probe_failure_marks_inventory_incomplete(
-        self, fleet, monkeypatch, target, warning
+        self, fleet, monkeypatch, caplog, target, warning
     ):
         def denied(*_args, **_kwargs):
-            raise PermissionError("sensitive host detail must not be reported")
+            raise PermissionError(13, "sensitive host detail must not be reported")
 
+        caplog.set_level("DEBUG", logger="hermes_cli.update_inventory")
         monkeypatch.setattr(target, denied)
         plan = ui.collect_runtime_inventory()
         assert plan.inventory_complete is False
         assert warning in plan.inventory_warnings
         assert "sensitive host detail" not in json.dumps(plan.to_dict())
+        assert "sensitive host detail" not in caplog.text
+        assert "type=PermissionError" in caplog.text
+        assert "code=13" in caplog.text
 
     def test_desktop_row_failure_marks_process_inventory_incomplete(
         self, fleet, monkeypatch

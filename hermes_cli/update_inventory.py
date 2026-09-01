@@ -42,6 +42,25 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _safe_exception_context(exc: BaseException) -> tuple[str, str]:
+    """Return diagnostic context without retaining exception payload text."""
+    type_name = type(exc).__name__
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", type_name):
+        type_name = "Exception"
+    code: object = None
+    for attribute in ("winerror", "errno", "returncode"):
+        candidate = getattr(exc, attribute, None)
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            code = candidate
+            break
+    return type_name, str(code) if code is not None else "none"
+
+
+def _log_probe_failure(label: str, exc: BaseException) -> None:
+    type_name, code = _safe_exception_context(exc)
+    logger.debug("%s [type=%s code=%s]", label, type_name, code)
+
+
 @dataclass
 class RuntimeRecord:
     """One running (or expected) Hermes runtime on this machine."""
@@ -425,7 +444,7 @@ def _iter_process_cmdlines() -> ProcessScanResult:
                     result.warnings.append("one or more process records were unreadable")
                 continue
     except Exception as exc:
-        logger.debug("Desktop serve process enumeration failed: %s", exc)
+        _log_probe_failure("Desktop serve process enumeration failed", exc)
         result.complete = False
         result.warnings.append("process inventory unavailable")
     return result
@@ -520,7 +539,7 @@ def _collect_desktop_serve_runtimes(
     try:
         scanned = _iter_process_cmdlines()
     except Exception as exc:
-        logger.debug("Desktop serve process scan failed: %s", exc)
+        _log_probe_failure("Desktop serve process scan failed", exc)
         return runtimes, ProcessScanResult(
             complete=False, warnings=["process inventory unavailable"]
         )
@@ -561,7 +580,7 @@ def _collect_desktop_serve_runtimes(
             )
             seen_pids.add(pid)
         except Exception as exc:
-            logger.debug("Desktop serve inventory row failed: %s", exc)
+            _log_probe_failure("Desktop serve inventory row failed", exc)
             scanned.complete = False
             if "HTTP backend inventory incomplete" not in scanned.warnings:
                 scanned.warnings.append("HTTP backend inventory incomplete")
@@ -606,10 +625,14 @@ def collect_runtime_inventory() -> UpdatePlan:
                 if provenance.valid and provenance.manager:
                     plan.install_method = provenance.manager
         except Exception as exc:
-            logger.debug("Image provenance probe failed: %s", exc)
+            _log_probe_failure("Image provenance probe failed", exc)
+            _mark_inventory_incomplete(
+                plan, "image provenance inventory unavailable"
+            )
         plan.update_mechanism = recommended_update_command_for_method(method)
     except Exception as exc:
-        logger.debug("Install-method probe failed: %s", exc)
+        _log_probe_failure("Install-method probe failed", exc)
+        _mark_inventory_incomplete(plan, "install-method inventory unavailable")
 
     # --- expected code identity (pre-pull) --------------------------------
     try:
@@ -619,7 +642,8 @@ def collect_runtime_inventory() -> UpdatePlan:
         plan.expected_sha = identity.get("sha")
         plan.expected_version = identity.get("version")
     except Exception as exc:
-        logger.debug("Code-identity probe failed: %s", exc)
+        _log_probe_failure("Code-identity probe failed", exc)
+        _mark_inventory_incomplete(plan, "code-identity inventory unavailable")
 
     # --- profiles ----------------------------------------------------------
     profile_homes: list[tuple[str, Path]] = []
@@ -644,7 +668,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                     profile_homes.append((entry.name, entry))
         plan.profiles = [name for name, _ in profile_homes]
     except Exception as exc:
-        logger.debug("Profile enumeration failed: %s", exc)
+        _log_probe_failure("Profile enumeration failed", exc)
         _mark_inventory_incomplete(plan, "profile enumeration unavailable")
 
     # --- service-managed PIDs (fleet-wide) ---------------------------------
@@ -654,7 +678,7 @@ def collect_runtime_inventory() -> UpdatePlan:
 
         service_pids = _get_service_pids(all_profiles=True) or set()
     except Exception as exc:
-        logger.debug("Service-PID probe failed: %s", exc)
+        _log_probe_failure("Service-PID probe failed", exc)
         _mark_inventory_incomplete(
             plan, "service supervisor inventory unavailable"
         )
@@ -674,7 +698,7 @@ def collect_runtime_inventory() -> UpdatePlan:
             for service in find_windows_gateway_services()
         }
     except Exception as exc:
-        logger.debug("Windows SCM service-ownership probe failed: %s", exc)
+        _log_probe_failure("Windows SCM service-ownership probe failed", exc)
         _mark_inventory_incomplete(
             plan, "Windows SCM service inventory unavailable"
         )
@@ -693,7 +717,11 @@ def collect_runtime_inventory() -> UpdatePlan:
                 from gateway.control_socket import identify_gateway
 
                 identity = identify_gateway(home)
-            except Exception:
+            except Exception as exc:
+                _log_probe_failure("Gateway control-socket probe failed", exc)
+                _mark_inventory_incomplete(
+                    plan, "gateway control-socket inventory unavailable"
+                )
                 identity = None
             if identity:
                 try:
@@ -756,7 +784,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                 )
             )
     except Exception as exc:
-        logger.debug("Gateway-state inventory failed: %s", exc)
+        _log_probe_failure("Gateway-state inventory failed", exc)
         _mark_inventory_incomplete(
             plan, "gateway runtime-state inventory unavailable"
         )
@@ -782,7 +810,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                 )
             )
     except Exception as exc:
-        logger.debug("PID-file gateway inventory failed: %s", exc)
+        _log_probe_failure("PID-file gateway inventory failed", exc)
         _mark_inventory_incomplete(plan, "gateway PID inventory unavailable")
 
     # Serve/dashboard backends from the spawn ledger (#63206). These are the
@@ -823,7 +851,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                 )
             )
     except Exception as exc:
-        logger.debug("Serve/dashboard ledger inventory failed: %s", exc)
+        _log_probe_failure("Serve/dashboard ledger inventory failed", exc)
         _mark_inventory_incomplete(
             plan, "serve/dashboard runtime inventory unavailable"
         )
@@ -972,7 +1000,7 @@ def match_runtime_outcomes(
                 }
             )
     except Exception as exc:
-        logger.debug("Runtime-outcome reconciliation failed: %s", exc)
+        _log_probe_failure("Runtime-outcome reconciliation failed", exc)
     return outcomes
 
 
@@ -1013,4 +1041,4 @@ def record_plan_in_receipt(plan: UpdatePlan) -> None:
         if ur._current is not None:
             ur._current.data["plan"] = plan.to_dict()
     except Exception as exc:
-        logger.debug("Could not record plan in receipt: %s", exc)
+        _log_probe_failure("Could not record plan in receipt", exc)

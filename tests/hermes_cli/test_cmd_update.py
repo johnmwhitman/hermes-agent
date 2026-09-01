@@ -280,7 +280,7 @@ class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
     def test_inventory_acquisition_exception_aborts_before_mutation(
-        self, monkeypatch, capsys
+        self, monkeypatch, capsys, caplog
     ):
         """An unreadable fleet inventory must stop before backup/apply/restart."""
         from hermes_cli import main as hm
@@ -289,7 +289,7 @@ class TestCmdUpdateBranchFallback:
         mutation_calls = []
 
         def inventory_denied():
-            raise PermissionError("sensitive host detail must not be reported")
+            raise PermissionError(13, "sensitive host detail must not be reported")
 
         def mutation_boundary(name):
             def crossed(*_args, **_kwargs):
@@ -298,6 +298,7 @@ class TestCmdUpdateBranchFallback:
 
             return crossed
 
+        caplog.set_level("DEBUG", logger="hermes_cli.update_cmd")
         monkeypatch.setattr(update_cmd, "_capture_active_lazy_features", lambda: [])
         monkeypatch.setattr(update_cmd, "_capture_active_tool_dependencies", lambda: [])
         monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "2026.8.31")
@@ -328,6 +329,9 @@ class TestCmdUpdateBranchFallback:
         output = capsys.readouterr().out
         assert "aborted before mutation" in output
         assert "sensitive host detail" not in output
+        assert "sensitive host detail" not in caplog.text
+        assert "type=PermissionError" in caplog.text
+        assert "code=13" in caplog.text
 
 
 

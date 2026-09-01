@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -7906,7 +7907,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         _pre_update_plan = collect_runtime_inventory()
     except Exception as _plan_exc:
-        logger.debug("Update inventory acquisition failed: %s", _plan_exc)
+        _plan_type = type(_plan_exc).__name__
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _plan_type):
+            _plan_type = "Exception"
+        _plan_code = next(
+            (
+                value
+                for value in (
+                    getattr(_plan_exc, "winerror", None),
+                    getattr(_plan_exc, "errno", None),
+                    getattr(_plan_exc, "returncode", None),
+                )
+                if isinstance(value, int) and not isinstance(value, bool)
+            ),
+            "none",
+        )
+        logger.debug(
+            "Update inventory acquisition failed [type=%s code=%s]",
+            _plan_type,
+            _plan_code,
+        )
         print("✗ Update aborted before mutation: runtime inventory unavailable.")
         sys.exit(1)
 
