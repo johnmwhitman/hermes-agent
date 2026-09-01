@@ -3348,6 +3348,75 @@ def test_session_resume_actual_lazy_watch_preserves_route_pin_provenance(
         server._sessions.pop(sid, None)
 
 
+@pytest.mark.parametrize(
+    ("model_config", "expected"),
+    [
+        ({"provider": "anthropic", "fallback_disabled": False}, False),
+        ({"provider": "anthropic", "fallback_disabled": True}, True),
+        ({"provider": "anthropic"}, True),
+        ({"provider": "anthropic", "fallback_disabled": None}, True),
+        ({"provider": "anthropic", "fallback_disabled": 0}, True),
+        ({"provider": "anthropic", "fallback_disabled": "false"}, True),
+    ],
+    ids=("false", "true", "missing", "null", "zero", "string"),
+)
+def test_second_lazy_resume_live_reuse_preserves_stored_route_provenance(
+    monkeypatch, model_config, expected
+):
+    """A reconnecting watcher must see the first lazy resume's stored route.
+
+    The second ``session.resume(lazy=True)`` takes the already-live fast path;
+    it must not replace the stored model/provider/pin with gateway globals.
+    """
+    target = f"lazy-live-route-{model_config!r}"
+
+    class FakeDB:
+        def get_session(self, session_id):
+            assert session_id == target
+            return {
+                "id": target,
+                "model": "stored/model",
+                "model_config": model_config,
+            }
+
+        def reopen_session(self, session_id):
+            assert session_id == target
+
+        def get_messages_as_conversation(self, session_id, **_kwargs):
+            assert session_id == target
+            return []
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_child_run_active", lambda _target: False)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "global/default")
+    monkeypatch.setattr(
+        runtime_provider,
+        "is_routable_provider",
+        lambda provider: provider == "anthropic",
+    )
+
+    params = {
+        "session_id": target,
+        "lazy": True,
+        "omit_messages": True,
+    }
+    first = server._methods["session.resume"]("r1", params)
+    sid = first["result"]["session_id"]
+    try:
+        second = server._methods["session.resume"]("r2", params)
+
+        assert second["result"]["session_id"] == sid
+        for response in (first, second):
+            info = response["result"]["info"]
+            assert info["model"] == "stored/model"
+            assert info["provider"] == "anthropic"
+            assert info["fallback_disabled"] is expected
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_live_visible_history_prefers_db_display_with_candidate():
     """A warm/live session must serve the persisted DISPLAY lineage, not the
     collapsed in-memory model history.
@@ -19211,6 +19280,62 @@ def test_session_create_malformed_fallback_provenance_fails_closed(
     try:
         assert server._sessions[sid]["model_override"]["fallback_disabled"] is True
         assert response["result"]["info"]["fallback_disabled"] is True
+    finally:
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize(
+    ("provenance", "expected"),
+    [
+        (False, False),
+        (True, True),
+        (None, True),
+        (0, True),
+        ("false", True),
+        ({}, True),
+    ],
+    ids=("false", "true", "null", "zero", "string", "mapping"),
+)
+def test_immediate_new_chat_live_resume_preserves_route_provenance(
+    monkeypatch, provenance, expected
+):
+    """Reattaching an unpersisted draft must echo its create-time route."""
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: types.SimpleNamespace(
+            get_session=lambda _target: None,
+            get_session_by_title=lambda _target: None,
+        ),
+    )
+
+    created = server._methods["session.create"](
+        "create",
+        {
+            "model": "manual/model",
+            "provider": "anthropic",
+            "fallback_disabled": provenance,
+        },
+    )
+    sid = created["result"]["session_id"]
+    try:
+        resumed = server._methods["session.resume"](
+            "resume",
+            {
+                "session_id": created["result"]["stored_session_id"],
+                "lazy": True,
+            },
+        )
+
+        assert resumed["result"]["session_id"] == sid
+        for response in (created, resumed):
+            info = response["result"]["info"]
+            assert info["model"] == "manual/model"
+            assert info["provider"] == "anthropic"
+            assert info["fallback_disabled"] is expected
     finally:
         server._sessions.pop(sid, None)
 

@@ -488,6 +488,21 @@ def _(rid, params: dict) -> dict:
                     if not isinstance(live_model_override, dict):
                         live_model_override = {}
                     live_model = str(live_model_override.get("model") or "").strip()
+                    live_provider = str(
+                        live_model_override.get("provider") or ""
+                    ).strip()
+                    live_info = {
+                        "model": live_model or _resolve_model(),
+                        "fallback_disabled": (
+                            live_model_override.get("fallback_disabled") is not False
+                            if live_model
+                            else False
+                        ),
+                        "lazy": True,
+                        "profile_name": profile or "",
+                    }
+                    if live_provider:
+                        live_info["provider"] = live_provider
                     return _ok(
                         rid,
                         _attach_todo_state(
@@ -496,17 +511,7 @@ def _(rid, params: dict) -> dict:
                                 "stored_session_id": str(live.get("session_key") or ""),
                                 "message_count": len(history),
                                 "messages": [] if omit_messages else _history_to_messages(history),
-                                "info": {
-                                    "model": live_model or _resolve_model(),
-                                    "fallback_disabled": (
-                                        live_model_override.get("fallback_disabled")
-                                        is not False
-                                        if live_model
-                                        else False
-                                    ),
-                                    "lazy": True,
-                                    "profile_name": profile or "",
-                                },
+                                "info": live_info,
                             },
                             live,
                         ),

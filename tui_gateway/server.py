@@ -7656,8 +7656,16 @@ def _session_info(agent, session: dict | None = None) -> dict:
         else _current_profile_name(),
     }
     model_override = (session or {}).get("model_override")
-    if isinstance(model_override, dict) and "fallback_disabled" in model_override:
-        info["fallback_disabled"] = bool(model_override["fallback_disabled"])
+    if (
+        isinstance(model_override, dict)
+        and str(model_override.get("model") or "").strip()
+    ):
+        # A concrete session model is pinned unless provenance is the literal
+        # JSON boolean false. Missing/malformed legacy values must never
+        # silently enable the current profile's fallback chain.
+        info["fallback_disabled"] = (
+            model_override.get("fallback_disabled") is not False
+        )
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -10987,12 +10995,23 @@ def _fallback_session_info(session: dict) -> dict:
     # repo) so a client can clear a stale label instead of retaining it — the
     # same contract `_lazy_session_info` above already follows.
     cwd = _session_cwd(session)
-    return {
+    model_override = session.get("model_override")
+    model_override = model_override if isinstance(model_override, dict) else {}
+    session_model = str(model_override.get("model") or "").strip()
+    session_provider = str(model_override.get("provider") or "").strip()
+    info = {
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "lazy": True,
-        "model": _resolve_model(),
+        "model": session_model or _resolve_model(),
+        # Match create/stored normalization: only literal false unpins a
+        # concrete session model; unknown provenance remains fail-closed.
+        "fallback_disabled": (
+            model_override.get("fallback_disabled") is not False
+            if session_model
+            else False
+        ),
         "skills": {},
         "tools": {},
         # A lazy session (agent not built yet) is still served by *this* backend,
@@ -11002,6 +11021,9 @@ def _fallback_session_info(session: dict) -> dict:
         # session.create shape (_lazy_resume_info) already carries it (#36112).
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
     }
+    if session_provider:
+        info["provider"] = session_provider
+    return info
 
 
 def _reconcile_display_with_live(
