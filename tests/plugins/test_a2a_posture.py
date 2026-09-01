@@ -6,8 +6,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -319,6 +321,63 @@ def test_profile_home_identity_changes_when_profile_is_recreated(tmp_path):
     assert posture.profile_home_identity(str(profile_home)) != original
 
 
+def test_profile_home_identity_serializes_concurrent_first_creation(
+    monkeypatch, tmp_path
+):
+    profile_home = tmp_path / "profiles" / "research"
+    profile_home.mkdir(parents=True)
+    identity_path = profile_home / posture.PROFILE_INSTANCE_ID_FILE
+    real_open = posture.os.open
+    real_write = posture.os.write
+    creator_ready = threading.Event()
+    release_creator = threading.Event()
+    identity_fds = set()
+    results = []
+    errors = []
+
+    def tracked_open(path, flags, mode=0o777):
+        fd = real_open(path, flags, mode)
+        if Path(path) == identity_path and flags & os.O_EXCL:
+            identity_fds.add(fd)
+        return fd
+
+    def delayed_identity_write(fd, payload):
+        if fd in identity_fds and not creator_ready.is_set():
+            creator_ready.set()
+            assert release_creator.wait(timeout=2)
+        return real_write(fd, payload)
+
+    def resolve_identity():
+        try:
+            results.append(posture.profile_home_identity(str(profile_home)))
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(posture.os, "open", tracked_open)
+    monkeypatch.setattr(posture.os, "write", delayed_identity_write)
+
+    creator = threading.Thread(target=resolve_identity)
+    creator.start()
+    assert creator_ready.wait(timeout=2)
+
+    loser = threading.Thread(target=resolve_identity)
+    loser.start()
+    loser.join(timeout=0.1)
+    release_creator.set()
+    creator.join(timeout=2)
+    loser.join(timeout=2)
+
+    assert not creator.is_alive()
+    assert not loser.is_alive()
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] == results[1]
+    if os.name != "nt":
+        assert identity_path.stat().st_mode & 0o777 == 0o600
+        lock_path = profile_home / posture.PROFILE_INSTANCE_LOCK_FILE
+        assert lock_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_profile_home_identity_rejects_legacy_path_hash_binding(tmp_path):
     profile_home = tmp_path / "profiles" / "research"
     profile_home.mkdir(parents=True)
@@ -336,6 +395,109 @@ def test_profile_home_identity_rejects_legacy_path_hash_binding(tmp_path):
     }
 
     assert posture.resume_binding_status(legacy, current) == "mismatch"
+
+
+def test_forwarded_child_rejects_recreated_profile_instance(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profiles" / "research"
+    profile_home.mkdir(parents=True)
+    old_identity = posture.profile_home_identity(str(profile_home))
+    binding = _binding(
+        "alice",
+        "research",
+        "ctx-recreated-child",
+        ["terminal"],
+        profile_home_identity=old_identity,
+        mutation_enabled=True,
+    )
+    secret = b"r" * 32
+    signed = posture.sign_child_policy(
+        {
+            "authenticated": True,
+            "served_agent_slug": "research",
+            "context_id": "ctx-recreated-child",
+            "mutation_enabled": True,
+            "allowed_tool_names": ["terminal"],
+            "binding": binding,
+        },
+        secret=secret,
+    )
+
+    shutil.rmtree(profile_home)
+    profile_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv(posture.CHILD_POLICY_ENV, json.dumps(signed))
+
+    loaded = posture.load_child_policy(secret=secret)
+
+    assert loaded and "profile instance identity mismatch" in loaded["error"]
+
+
+def test_forwarded_child_rechecks_profile_instance_at_launch(monkeypatch, tmp_path):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.a2a import adapter as adapter_module
+    from plugins.platforms.a2a import protocol
+
+    adapter = adapter_module.A2AAdapter(PlatformConfig(enabled=True))
+    profile_home = tmp_path / "profiles" / "research"
+    profile_home.mkdir(parents=True)
+    identity = posture.profile_home_identity(str(profile_home))
+    binding = _binding(
+        "alice",
+        "research",
+        "ctx-launch-replacement",
+        ["terminal"],
+        served_tenant="",
+        profile_home_identity=identity,
+        mutation_enabled=True,
+    )
+    policy = {
+        "authenticated": True,
+        "served_agent_slug": "research",
+        "context_id": "ctx-launch-replacement",
+        "mutation_enabled": True,
+        "allowed_tool_names": ["terminal"],
+        "served_profile": "research",
+        "served_tenant": "",
+        "profile_home_identity": identity,
+        "binding": binding,
+    }
+    secret = b"l" * 32
+    real_sign = posture.sign_child_policy
+    child_result = {}
+
+    def sign_with_test_key(value):
+        return real_sign(value, secret=secret)
+
+    def launch_after_replacement(_cmd, _timeout, env):
+        shutil.rmtree(profile_home)
+        profile_home.mkdir()
+        with monkeypatch.context() as child_env:
+            child_env.setenv("HERMES_HOME", env["HERMES_HOME"])
+            child_env.setenv(
+                posture.CHILD_POLICY_ENV, env[posture.CHILD_POLICY_ENV]
+            )
+            child_result["policy"] = posture.load_child_policy(secret=secret)
+        return 1, "", "child rejected stale profile authority"
+
+    monkeypatch.setattr(
+        adapter_module, "_profile_home", lambda _profile: str(profile_home)
+    )
+    monkeypatch.setattr(posture, "sign_child_policy", sign_with_test_key)
+    monkeypatch.setattr(adapter, "_lookup_forward_session", lambda *_args: None)
+    monkeypatch.setattr(adapter, "_latest_a2a_session", lambda *_args: None)
+    monkeypatch.setattr(adapter, "_run_profile_command", launch_after_replacement)
+
+    reply, state = adapter._forward_to_profile(
+        {"slug": "research", "profile": "research"},
+        "alice",
+        "ctx-launch-replacement",
+        "hello",
+        posture_policy=policy,
+    )
+
+    assert state == protocol.STATE_FAILED
+    assert "profile instance identity mismatch" in child_result["policy"]["error"]
+    assert "failed rc=1" in reply
 
 
 def test_agent_cache_key_rejects_same_slug_profile_remap():
@@ -398,7 +560,16 @@ def test_binding_store_is_atomic_and_round_trips(monkeypatch, tmp_path):
 
 
 def test_forwarded_child_policy_is_consumed_before_tool_dispatch(monkeypatch, tmp_path):
-    binding = _binding("alice", "research", "ctx-1", ["read_file"])
+    secret = b"a" * 32
+    key_dir = tmp_path / "hermes-home"
+    key_dir.mkdir(mode=0o700)
+    binding = _binding(
+        "alice",
+        "research",
+        "ctx-1",
+        ["read_file"],
+        profile_home_identity=posture.profile_home_identity(str(key_dir)),
+    )
     unsigned_policy = {
         "authenticated": True,
         "served_agent_slug": "research",
@@ -407,9 +578,6 @@ def test_forwarded_child_policy_is_consumed_before_tool_dispatch(monkeypatch, tm
         "allowed_tool_names": ["read_file"],
         "binding": binding,
     }
-    secret = b"a" * 32
-    key_dir = tmp_path / "hermes-home"
-    key_dir.mkdir(mode=0o700)
     key_path = key_dir / "a2a_child_issuer.key"
     key_path.write_bytes(secret)
     key_path.chmod(0o600)
@@ -440,10 +608,16 @@ def test_forwarded_readonly_loopback_has_zero_protected_delta(monkeypatch, tmp_p
     protected.write_text("sentinel", encoding="utf-8")
     state_db = tmp_path / "state.db"
     state_db.write_bytes(b"durable-state")
-    binding = _binding("alice", "research", "ctx-zero", ["read_file"])
     secret = b"z" * 32
     key_dir = tmp_path / "hermes-home"
     key_dir.mkdir(mode=0o700)
+    binding = _binding(
+        "alice",
+        "research",
+        "ctx-zero",
+        ["read_file"],
+        profile_home_identity=posture.profile_home_identity(str(key_dir)),
+    )
     key_path = key_dir / "a2a_child_issuer.key"
     key_path.write_bytes(secret)
     key_path.chmod(0o600)

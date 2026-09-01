@@ -34,6 +34,7 @@ MUTATION_METADATA_KEY = "hermes.ai/mutationAllowed"
 CHILD_POLICY_ENV = "HERMES_A2A_POSTURE"
 CHILD_POLICY_ISSUER = "hermes-a2a-adapter-v1"
 PROFILE_INSTANCE_ID_FILE = ".a2a-profile-instance-id"
+PROFILE_INSTANCE_LOCK_FILE = ".a2a-profile-instance-id.lock"
 PROFILE_INSTANCE_ID_VERSION = "profile-instance-v1"
 
 # This is a deliberately closed initial surface.  Adding a name is a policy
@@ -213,26 +214,54 @@ def _read_profile_instance_id(path: Path) -> str:
 
 def _load_or_create_profile_instance_id(profile_home: Path) -> str:
     path = profile_home / PROFILE_INSTANCE_ID_FILE
+    lock_path = profile_home / PROFILE_INSTANCE_LOCK_FILE
+    lock_flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        lock_flags |= os.O_NOFOLLOW
+    lock_fd = os.open(lock_path, lock_flags, 0o600)
+    locked = False
     try:
-        return _read_profile_instance_id(path)
-    except FileNotFoundError:
-        value = str(uuid.uuid4())
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        lock_info = os.fstat(lock_fd)
+        uid_getter = getattr(os, "getuid", None)
+        owner_mismatch = uid_getter is not None and lock_info.st_uid != uid_getter()
+        if not stat.S_ISREG(lock_info.st_mode) or owner_mismatch:
+            raise PermissionError("unsafe A2A profile instance lock owner or type")
+        if hasattr(os, "fchmod"):
+            os.fchmod(lock_fd, 0o600)
+        if os.name != "nt" and stat.S_IMODE(os.fstat(lock_fd).st_mode) & 0o077:
+            raise PermissionError("unsafe A2A profile instance lock permissions")
+        _lock_fd(lock_fd)
+        locked = True
         try:
-            fd = os.open(path, flags, 0o600)
-        except FileExistsError:
             return _read_profile_instance_id(path)
+        except FileNotFoundError:
+            value = str(uuid.uuid4())
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(path, flags, 0o600)
+            except FileExistsError:
+                # A non-cooperating creator may have published between the
+                # locked read and create. Never replace it; validate it.
+                return _read_profile_instance_id(path)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                payload = f"{value}\n".encode("ascii")
+                written = os.write(fd, payload)
+                if written != len(payload):
+                    raise OSError("short A2A profile instance identity write")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return _read_profile_instance_id(path)
+    finally:
         try:
-            payload = f"{value}\n".encode("ascii")
-            written = os.write(fd, payload)
-            if written != len(payload):
-                raise OSError("short A2A profile instance identity write")
-            os.fsync(fd)
+            if locked:
+                _unlock_fd(lock_fd)
         finally:
-            os.close(fd)
-        return _read_profile_instance_id(path)
+            os.close(lock_fd)
 
 
 def profile_home_identity(profile_home: str) -> str:
@@ -633,6 +662,17 @@ def load_child_policy(
         return {"error": "forwarded A2A policy contains unbounded composite tools"}
     if not policy["mutation_enabled"] and not set(allowed).issubset(READONLY_TOOL_NAMES):
         return {"error": "read-only forwarded A2A policy contains mutable tools"}
+    if value is None:
+        try:
+            current_profile_identity = profile_home_identity(
+                os.environ.get("HERMES_HOME", "")
+            )
+        except Exception:
+            return {"error": "forwarded A2A profile instance identity unavailable"}
+        if not hmac.compare_digest(
+            current_profile_identity, binding.profile_home_identity
+        ):
+            return {"error": "forwarded A2A profile instance identity mismatch"}
     return {
         "issuer": CHILD_POLICY_ISSUER,
         "signature": signature,
