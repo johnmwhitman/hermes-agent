@@ -103,7 +103,12 @@ def test_forwarded_a2a_policy_filters_unbound_memory_provider_tools(
     key_path.write_bytes(secret)
     key_path.chmod(0o600)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    binding = posture.make_binding("alice", "research", "ctx-memory", [])
+    binding = posture.make_binding(
+        "alice", "research", "ctx-memory", [],
+        served_profile="research",
+        served_tenant="research",
+        profile_home_identity="test-home:research",
+    )
     policy = posture.sign_child_policy({
         "authenticated": True,
         "served_agent_slug": "research",

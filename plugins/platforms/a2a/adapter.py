@@ -151,6 +151,26 @@ def _profile_home(profile: str) -> Optional[str]:
         return os.path.expanduser(f"~/.hermes/profiles/{profile}")
 
 
+def _served_route_identity(agent: dict) -> Optional[dict[str, str]]:
+    """Resolve the immutable profile/tenant identity behind a served route."""
+    if not isinstance(agent, dict):
+        return None
+    profile = str(agent.get("profile") or "").strip()
+    tenant = str(agent.get("tenant") or "").strip()
+    home = _profile_home(profile)
+    if not profile or not home:
+        return None
+    try:
+        home_identity = posture.profile_home_identity(home)
+    except (TypeError, ValueError, OSError):
+        return None
+    return {
+        "served_profile": profile,
+        "served_tenant": tenant,
+        "profile_home_identity": home_identity,
+    }
+
+
 @contextmanager
 def _served_profile_config_scope(agent: dict):
     """Temporarily apply only the served profile's configuration home."""
@@ -1206,6 +1226,12 @@ class A2AAdapter(BasePlatformAdapter):
 
         mutable_toolsets = tuple(agent.get("mutable_toolsets") or ())
         slug = str(agent.get("slug") or "")
+        route_identity = _served_route_identity(agent)
+        if route_identity is None:
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_REJECTED,
+                "served profile identity is unavailable",
+            ), None
         allowed_peers = {
             str(value).strip()
             for value in (agent.get("mutation_allowed_peers") or ())
@@ -1275,7 +1301,9 @@ class A2AAdapter(BasePlatformAdapter):
         requested_allowed = posture.allowed_tool_names(mutable, mutable_names)
         allowed = frozenset(requested_allowed & available_names)
         binding = posture.make_binding(
-            peer, slug, context_id, allowed, mutation_enabled=mutable,
+            peer, slug, context_id, allowed,
+            **route_identity,
+            mutation_enabled=mutable,
         )
         # Peer is part of the immutable binding value, not the lookup key;
         # otherwise a second peer could establish a parallel binding for the
@@ -1311,7 +1339,7 @@ class A2AAdapter(BasePlatformAdapter):
                 task_id, context_id, protocol.STATE_REJECTED,
                 "A2A context posture binding mismatch; start a new context.",
             ), None
-        if status == "missing":
+        if status in {"missing", "legacy"}:
             mutable = False
             # A pre-existing transcript without an ownership binding cannot
             # safely expose history to whichever peer arrives next.
@@ -1320,7 +1348,9 @@ class A2AAdapter(BasePlatformAdapter):
                 & (posture.READONLY_TOOL_NAMES - {"a2a_history", "a2a_list"})
             )
             binding = posture.make_binding(
-                peer, slug, context_id, allowed, mutation_enabled=False,
+                peer, slug, context_id, allowed,
+                **route_identity,
+                mutation_enabled=False,
             )
         elif status in {"corrupt", "error"}:
             # Storage uncertainty never preserves mutable authority. Continue
@@ -1332,7 +1362,9 @@ class A2AAdapter(BasePlatformAdapter):
                 & (posture.READONLY_TOOL_NAMES - {"a2a_history", "a2a_list"})
             )
             binding = posture.make_binding(
-                peer, slug, context_id, allowed, mutation_enabled=False,
+                peer, slug, context_id, allowed,
+                **route_identity,
+                mutation_enabled=False,
             )
         elif persisted_binding is not None:
             binding = persisted_binding
@@ -1380,6 +1412,9 @@ class A2AAdapter(BasePlatformAdapter):
                 posture_policy={
                     "authenticated": True,
                     "served_agent_slug": slug,
+                    "served_profile": binding["served_profile"],
+                    "served_tenant": binding["served_tenant"],
+                    "profile_home_identity": binding["profile_home_identity"],
                     "context_id": context_id,
                     "mutation_enabled": mutable,
                     "allowed_tool_names": sorted(allowed),
@@ -1716,6 +1751,22 @@ class A2AAdapter(BasePlatformAdapter):
         """
         profile = str(agent.get("profile") or agent.get("slug") or "").strip()
         slug = str(agent.get("slug") or profile or "agent")
+        home = _profile_home(profile)
+        if posture_policy is not None:
+            # Re-resolve immediately before launch and pin this exact home into
+            # the child environment. A profile mapping changed after catalog
+            # assembly must never inherit the earlier route's authority.
+            current_identity = _served_route_identity(agent)
+            expected_identity = {
+                "served_profile": posture_policy.get("served_profile"),
+                "served_tenant": posture_policy.get("served_tenant"),
+                "profile_home_identity": posture_policy.get("profile_home_identity"),
+            }
+            if current_identity is None or current_identity != expected_identity:
+                return (
+                    "[served profile identity changed; start a new context]",
+                    protocol.STATE_FAILED,
+                )
         safe_ctx = _safe_context_slug(context_id)
         session_title = f"a2a-{slug}-{safe_ctx}"
         # Cache identity uses the raw context id; the sanitized title is only
@@ -1753,7 +1804,6 @@ class A2AAdapter(BasePlatformAdapter):
             for key in list(env):
                 if key.startswith("HERMES_KANBAN_"):
                     env.pop(key, None)
-            home = _profile_home(profile)
             if home:
                 env["HERMES_HOME"] = home
             env["HERMES_SESSION_SOURCE"] = "a2a"

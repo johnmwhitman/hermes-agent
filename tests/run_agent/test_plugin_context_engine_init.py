@@ -120,7 +120,12 @@ def test_forwarded_a2a_policy_filters_unbound_late_context_engine_tools(
     key_path.write_bytes(secret)
     key_path.chmod(0o600)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    binding = posture.make_binding("alice", "research", "ctx-1", [])
+    binding = posture.make_binding(
+        "alice", "research", "ctx-1", [],
+        served_profile="research",
+        served_tenant="research",
+        profile_home_identity="test-home:research",
+    )
     policy = posture.sign_child_policy({
         "authenticated": True,
         "served_agent_slug": "research",

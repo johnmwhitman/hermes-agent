@@ -13,6 +13,33 @@ import pytest
 from plugins.platforms.a2a import posture
 
 
+def _binding(
+    peer,
+    agent_slug,
+    context_id,
+    tool_names,
+    *,
+    served_profile=None,
+    served_tenant=None,
+    profile_home_identity=None,
+    mutation_enabled=False,
+):
+    """Build an explicitly route-bound posture value for unit fixtures."""
+    profile = served_profile or agent_slug or "default"
+    tenant = agent_slug if served_tenant is None else served_tenant
+    home_identity = profile_home_identity or f"test-home:{profile}"
+    return posture.make_binding(
+        peer,
+        agent_slug,
+        context_id,
+        tool_names,
+        served_profile=profile,
+        served_tenant=tenant,
+        profile_home_identity=home_identity,
+        mutation_enabled=mutation_enabled,
+    )
+
+
 def test_gateway_thread_metadata_tolerates_platform_enum_without_a2a(monkeypatch):
     """Narrow gateway test doubles must not crash on an absent A2A member."""
     from gateway import run as gateway_run
@@ -85,7 +112,7 @@ async def test_gateway_normalizes_raw_a2a_platform_before_ingress_side_effects()
 
 
 def test_apply_to_agent_normalizes_raw_a2a_platform_case_and_narrows_tools():
-    binding = posture.make_binding(
+    binding = _binding(
         "alice", "research", "ctx-1", ["read_file"], mutation_enabled=False,
     )
     source = SimpleNamespace(
@@ -121,7 +148,7 @@ def test_apply_to_agent_normalizes_raw_a2a_platform_case_and_narrows_tools():
 def test_session_source_serialization_normalizes_raw_a2a_and_keeps_binding():
     from gateway.session import SessionSource
 
-    binding = posture.make_binding(
+    binding = _binding(
         "alice", "research", "ctx-1", ["read_file"], mutation_enabled=False,
     )
     source = SessionSource(
@@ -244,24 +271,100 @@ def test_mutable_allowlist_excludes_unbounded_composite_tools():
 
 
 def test_resume_binding_mismatch_rejects_but_corrupt_binding_is_read_only():
-    expected = posture.make_binding("alice", "research", "ctx-1", ["read_file"])
+    expected = _binding("alice", "research", "ctx-1", ["read_file"])
     assert posture.resume_binding_status(expected, expected) == "ok"
-    other = posture.make_binding("alice", "research", "ctx-1", ["terminal"])
+    other = _binding("alice", "research", "ctx-1", ["terminal"])
     assert posture.resume_binding_status(expected, other) == "mismatch"
     assert posture.resume_binding_status({"peer": "alice"}, expected) == "corrupt"
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("served_profile", "admin"),
+        ("served_tenant", "tenant-b"),
+        ("profile_home_identity", "home-b"),
+    ],
+)
+def test_resume_binding_rejects_same_slug_route_identity_remap(
+    changed_field, changed_value,
+):
+    base = _binding(
+        "alice", "research", "ctx-remap", ["terminal"],
+        mutation_enabled=True,
+    )
+    original = {
+        **base,
+        "served_profile": "research",
+        "served_tenant": "tenant-a",
+        "profile_home_identity": "home-a",
+    }
+    remapped = {**original, changed_field: changed_value}
+
+    assert posture.resume_binding_status(original, remapped) == "mismatch"
+
+
+def test_agent_cache_key_rejects_same_slug_profile_remap():
+    original = _binding(
+        "alice", "research", "ctx-cache", ["read_file"],
+        served_profile="research",
+        served_tenant="tenant-a",
+        profile_home_identity="home-a",
+    )
+    source = SimpleNamespace(
+        a2a_binding=original,
+        a2a_peer="alice",
+        a2a_agent_slug="research",
+        a2a_context_id="ctx-cache",
+    )
+    remapped = SimpleNamespace(
+        **vars(source),
+    )
+    remapped.a2a_binding = {**original, "served_profile": "admin"}
+
+    assert posture.request_key(source) != posture.request_key(remapped)
+
+
+def test_pre_identity_binding_is_legacy_not_current(tmp_path, monkeypatch):
+    path = tmp_path / "bindings.json"
+    monkeypatch.setattr(posture, "_binding_store_path", lambda: path)
+    current = _binding(
+        "alice", "research", "ctx-legacy", ["terminal"],
+        mutation_enabled=True,
+    )
+    legacy = {
+        key: value
+        for key, value in current.items()
+        if key not in {"served_profile", "served_tenant", "profile_home_identity"}
+    }
+    path.write_text(
+        json.dumps({"research\u001fctx-legacy": legacy}),
+        encoding="utf-8",
+    )
+    candidate = current
+
+    status, persisted = posture.claim_persisted_binding(
+        "research", "ctx-legacy", candidate,
+    )
+
+    assert status == "legacy"
+    assert persisted == legacy
+    assert json.loads(path.read_text(encoding="utf-8"))[
+        "research\u001fctx-legacy"
+    ] == legacy
 
 
 def test_binding_store_is_atomic_and_round_trips(monkeypatch, tmp_path):
     path = tmp_path / "bindings.json"
     monkeypatch.setattr(posture, "_binding_store_path", lambda: path)
-    binding = posture.make_binding("alice", "research", "ctx-1", ["read_file"])
+    binding = _binding("alice", "research", "ctx-1", ["read_file"])
     posture.persist_bindings({("research", "ctx-1"): binding})
     loaded = posture.load_persisted_bindings()
     assert loaded[("research", "ctx-1")] == binding
 
 
 def test_forwarded_child_policy_is_consumed_before_tool_dispatch(monkeypatch, tmp_path):
-    binding = posture.make_binding("alice", "research", "ctx-1", ["read_file"])
+    binding = _binding("alice", "research", "ctx-1", ["read_file"])
     unsigned_policy = {
         "authenticated": True,
         "served_agent_slug": "research",
@@ -303,7 +406,7 @@ def test_forwarded_readonly_loopback_has_zero_protected_delta(monkeypatch, tmp_p
     protected.write_text("sentinel", encoding="utf-8")
     state_db = tmp_path / "state.db"
     state_db.write_bytes(b"durable-state")
-    binding = posture.make_binding("alice", "research", "ctx-zero", ["read_file"])
+    binding = _binding("alice", "research", "ctx-zero", ["read_file"])
     secret = b"z" * 32
     key_dir = tmp_path / "hermes-home"
     key_dir.mkdir(mode=0o700)
@@ -376,7 +479,7 @@ def test_forwarded_policy_rejects_decision_and_readonly_surface_mismatch():
     assert posture.load_child_policy(
         {"authenticated": True}, secret=secret,
     ).get("error")
-    mutable_binding = posture.make_binding(
+    mutable_binding = _binding(
         "alice", "research", "ctx-1", ["terminal"], mutation_enabled=False,
     )
     bad_surface = {
@@ -395,7 +498,7 @@ def test_forwarded_policy_rejects_decision_and_readonly_surface_mismatch():
     signed_bad_decision = posture.sign_child_policy(bad_decision, secret=secret)
     assert posture.load_child_policy(signed_bad_decision, secret=secret).get("error")
 
-    valid_binding = posture.make_binding(
+    valid_binding = _binding(
         "alice", "research", "ctx-1", ["read_file"], mutation_enabled=False,
     )
     valid_policy = {
@@ -412,12 +515,76 @@ def test_forwarded_policy_rejects_decision_and_readonly_surface_mismatch():
     assert not posture.child_policy_matches_tools(normalized, [])
 
 
+def test_forwarded_policy_rejects_route_identity_mismatch():
+    secret = b"r" * 32
+    binding = {
+        **_binding(
+            "alice", "research", "ctx-route", ["read_file"],
+        ),
+        "served_profile": "research",
+        "served_tenant": "tenant-a",
+        "profile_home_identity": "home-a",
+    }
+    policy = posture.sign_child_policy(
+        {
+            "authenticated": True,
+            "served_agent_slug": "research",
+            "served_profile": "admin",
+            "served_tenant": "tenant-a",
+            "profile_home_identity": "home-a",
+            "context_id": "ctx-route",
+            "mutation_enabled": False,
+            "allowed_tool_names": ["read_file"],
+            "binding": binding,
+        },
+        secret=secret,
+    )
+
+    assert posture.load_child_policy(policy, secret=secret).get("error")
+
+
+def test_forwarded_child_rejects_profile_home_remap_before_launch(monkeypatch):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.a2a import adapter as adapter_module
+    from plugins.platforms.a2a import protocol
+
+    adapter = adapter_module.A2AAdapter(PlatformConfig(enabled=True))
+    agent = {"slug": "research", "profile": "research", "tenant": "tenant-a"}
+    old_home_identity = posture.profile_home_identity("/profiles/old-research")
+    binding = _binding(
+        "alice", "research", "ctx-route", ["read_file"],
+        served_profile="research",
+        served_tenant="tenant-a",
+        profile_home_identity=old_home_identity,
+    )
+    policy = {
+        "served_profile": "research",
+        "served_tenant": "tenant-a",
+        "profile_home_identity": old_home_identity,
+        "binding": binding,
+    }
+    monkeypatch.setattr(
+        adapter_module, "_profile_home", lambda _profile: "/profiles/new-research",
+    )
+    monkeypatch.setattr(
+        adapter, "_run_profile_command",
+        lambda *_args, **_kwargs: pytest.fail("remapped child must not launch"),
+    )
+
+    reply, state = adapter._forward_to_profile(
+        agent, "alice", "ctx-route", "hello", posture_policy=policy,
+    )
+
+    assert state == protocol.STATE_FAILED
+    assert "identity changed" in reply
+
+
 @pytest.mark.parametrize(
     "forbidden_name", ["execute_code", "delegate_task", "tool_call"],
 )
 def test_forwarded_policy_rejects_unbounded_composite_tools(forbidden_name):
     secret = b"c" * 32
-    binding = posture.make_binding(
+    binding = _binding(
         "alice", "research", "ctx-1", [forbidden_name], mutation_enabled=True,
     )
     signed = posture.sign_child_policy(
@@ -481,7 +648,7 @@ def test_empty_direct_posture_denies_before_dispatch():
 
 
 def test_source_binding_requires_exact_transport_fields():
-    binding = posture.make_binding("alice", "research", "ctx-1", ["read_file"])
+    binding = _binding("alice", "research", "ctx-1", ["read_file"])
     source = SimpleNamespace(
         platform="a2a",
         chat_id="ctx-1",
@@ -511,7 +678,7 @@ def test_source_binding_requires_exact_transport_fields():
     "forbidden_name", ["execute_code", "delegate_task", "tool_call"],
 )
 def test_source_binding_rejects_unbounded_composite_tools(forbidden_name):
-    binding = posture.make_binding(
+    binding = _binding(
         "alice", "research", "ctx-1", [forbidden_name], mutation_enabled=True,
     )
     source = SimpleNamespace(
@@ -538,7 +705,7 @@ def test_only_a_live_adapter_can_stamp_a_valid_ingress_source():
     from plugins.platforms.a2a.adapter import A2AAdapter
 
     adapter = A2AAdapter(PlatformConfig(enabled=True))
-    binding = posture.make_binding("alice", "", "ctx-1", ["read_file"])
+    binding = _binding("alice", "", "ctx-1", ["read_file"])
     source = replace(
         adapter.build_source(
             chat_id="ctx-1", user_id="alice", user_name="alice",
@@ -577,7 +744,7 @@ def test_gateway_accepts_only_capability_from_its_registered_adapter():
 
     registered = A2AAdapter(PlatformConfig(enabled=True))
     foreign = A2AAdapter(PlatformConfig(enabled=True))
-    binding = posture.make_binding("alice", "", "ctx-live", ["read_file"])
+    binding = _binding("alice", "", "ctx-live", ["read_file"])
 
     def source_for(adapter):
         source = replace(
@@ -610,7 +777,7 @@ def test_adapter_readonly_rebind_mints_a_fresh_valid_capability():
     from plugins.platforms.a2a.adapter import A2AAdapter
 
     adapter = A2AAdapter(PlatformConfig(enabled=True))
-    binding = posture.make_binding(
+    binding = _binding(
         "alice", "", "ctx-1", ["read_file", "terminal"],
         mutation_enabled=True,
     )
@@ -645,7 +812,7 @@ def test_adapter_readonly_rebind_mints_a_fresh_valid_capability():
 def test_remote_a2a_history_and_list_are_limited_to_bound_context(monkeypatch):
     from plugins.platforms.a2a import tools as a2a_tools
 
-    binding = posture.make_binding("alice", "research", "ctx-own", ["a2a_history"])
+    binding = _binding("alice", "research", "ctx-own", ["a2a_history"])
     monkeypatch.setattr(a2a_tools, "_load_config", lambda: {})
     monkeypatch.setattr(
         a2a_tools.protocol, "list_conversations", lambda **_kwargs: ["ctx-own", "ctx-other"]
@@ -682,10 +849,10 @@ def test_remote_history_is_scoped_by_peer_route_and_context(monkeypatch, tmp_pat
         "ctx-shared", "user", "dev secret", "task-d",
         peer="alice", agent_slug="dev",
     )
-    research = posture.make_binding(
+    research = _binding(
         "alice", "research", "ctx-shared", ["a2a_history"],
     )
-    dev = posture.make_binding(
+    dev = _binding(
         "alice", "dev", "ctx-shared", ["a2a_history"],
     )
 
@@ -1180,10 +1347,10 @@ def test_invalid_mutation_metadata_has_no_adapter_side_effects(monkeypatch, tmp_
 
 
 def test_binding_claim_is_cross_process_compare_and_set(tmp_path):
-    candidate_a = posture.make_binding(
+    candidate_a = _binding(
         "alice", "research", "ctx-race", ["read_file"],
     )
-    candidate_b = posture.make_binding(
+    candidate_b = _binding(
         "mallory", "research", "ctx-race", ["read_file"],
     )
     script = """
@@ -1219,7 +1386,7 @@ def test_child_issuer_key_creation_is_cross_process_safe(tmp_path):
         "context_id": "ctx-key-race",
         "mutation_enabled": False,
         "allowed_tool_names": ["read_file"],
-        "binding": posture.make_binding(
+        "binding": _binding(
             "alice", "research", "ctx-key-race", ["read_file"],
         ),
     }

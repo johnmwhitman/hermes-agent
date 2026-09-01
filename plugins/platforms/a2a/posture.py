@@ -75,6 +75,9 @@ class PostureBinding:
     peer: str
     agent_slug: str
     context_id: str
+    served_profile: str
+    served_tenant: str
+    profile_home_identity: str
     toolset_fingerprint: str
     mutation_enabled: bool = False
 
@@ -83,6 +86,9 @@ class PostureBinding:
             "peer": self.peer,
             "agent_slug": self.agent_slug,
             "context_id": self.context_id,
+            "served_profile": self.served_profile,
+            "served_tenant": self.served_tenant,
+            "profile_home_identity": self.profile_home_identity,
             "toolset_fingerprint": self.toolset_fingerprint,
             "mutation_enabled": self.mutation_enabled,
         }
@@ -91,12 +97,15 @@ class PostureBinding:
     def from_value(cls, value: Any) -> "PostureBinding | None":
         if not isinstance(value, dict):
             return None
-        fields = ("peer", "agent_slug", "context_id", "toolset_fingerprint")
+        fields = (
+            "peer", "agent_slug", "context_id", "served_profile",
+            "served_tenant", "profile_home_identity", "toolset_fingerprint",
+        )
         # The default/root served agent has an intentionally empty slug.  All
         # identity and binding material other than that URL slug is mandatory.
         if any(
             not isinstance(value.get(name), str)
-            or (name != "agent_slug" and not value.get(name))
+            or (name not in {"agent_slug", "served_tenant"} and not value.get(name))
             for name in fields
         ):
             return None
@@ -174,18 +183,33 @@ def toolset_fingerprint(tool_names: Iterable[str]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def profile_home_identity(profile_home: str) -> str:
+    """Return a stable, non-disclosing identity for a served profile home."""
+    raw = str(profile_home or "").strip()
+    if not raw:
+        raise ValueError("served profile home is required")
+    canonical = str(Path(raw).expanduser().resolve(strict=False))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def make_binding(
     peer: str,
     agent_slug: str,
     context_id: str,
     tool_names: Iterable[str],
     *,
+    served_profile: str,
+    served_tenant: str,
+    profile_home_identity: str,
     mutation_enabled: bool = False,
 ) -> dict[str, Any]:
     return PostureBinding(
         peer=str(peer),
         agent_slug=str(agent_slug),
         context_id=str(context_id),
+        served_profile=str(served_profile),
+        served_tenant=str(served_tenant),
+        profile_home_identity=str(profile_home_identity),
         toolset_fingerprint=toolset_fingerprint(tool_names),
         mutation_enabled=bool(mutation_enabled),
     ).to_dict()
@@ -260,6 +284,9 @@ def readonly_source_updates(source: Any) -> dict[str, Any] | None:
         current.agent_slug,
         current.context_id,
         allowed,
+        served_profile=current.served_profile,
+        served_tenant=current.served_tenant,
+        profile_home_identity=current.profile_home_identity,
         mutation_enabled=False,
     )
     return {
@@ -374,6 +401,7 @@ def apply_to_agent(agent: Any, source: Any) -> frozenset[str] | None:
 def request_key(source: Any) -> tuple[Any, ...]:
     """Stable cache key for all posture inputs that can widen/narrow tools."""
     mutable_toolsets = getattr(source, "a2a_mutable_toolsets", ()) or ()
+    binding = PostureBinding.from_value(getattr(source, "a2a_binding", None))
     return (
         getattr(source, "a2a_mutation_requested", False) if type(getattr(source, "a2a_mutation_requested", False)) is bool else False,
         getattr(source, "a2a_mutation_enabled", False) if type(getattr(source, "a2a_mutation_enabled", False)) is bool else False,
@@ -384,6 +412,9 @@ def request_key(source: Any) -> tuple[Any, ...]:
         str(getattr(source, "a2a_peer", "")),
         str(getattr(source, "a2a_agent_slug", "")),
         str(getattr(source, "a2a_context_id", "")),
+        binding.served_profile if binding is not None else "",
+        binding.served_tenant if binding is not None else "",
+        binding.profile_home_identity if binding is not None else "",
     )
 
 
@@ -481,6 +512,11 @@ def sign_child_policy(policy: Any, *, secret: bytes | None = None) -> dict[str, 
     if not isinstance(policy, dict):
         raise ValueError("invalid forwarded A2A posture policy")
     payload = dict(policy)
+    binding = PostureBinding.from_value(payload.get("binding"))
+    if binding is not None:
+        payload.setdefault("served_profile", binding.served_profile)
+        payload.setdefault("served_tenant", binding.served_tenant)
+        payload.setdefault("profile_home_identity", binding.profile_home_identity)
     payload["issuer"] = CHILD_POLICY_ISSUER
     payload.pop("signature", None)
     key = secret if secret is not None else _load_or_create_child_issuer_key()
@@ -530,6 +566,9 @@ def load_child_policy(
         or policy.get("authenticated") is not True
         or policy.get("served_agent_slug") != binding.agent_slug
         or policy.get("context_id") != binding.context_id
+        or policy.get("served_profile") != binding.served_profile
+        or policy.get("served_tenant") != binding.served_tenant
+        or policy.get("profile_home_identity") != binding.profile_home_identity
     ):
         return {"error": "invalid forwarded A2A posture policy"}
     if binding.mutation_enabled is not policy["mutation_enabled"]:
@@ -544,6 +583,9 @@ def load_child_policy(
         "authenticated": True,
         "served_agent_slug": policy["served_agent_slug"],
         "context_id": policy["context_id"],
+        "served_profile": policy["served_profile"],
+        "served_tenant": policy["served_tenant"],
+        "profile_home_identity": policy["profile_home_identity"],
         "mutation_enabled": policy["mutation_enabled"],
         "allowed_tool_names": sorted(set(allowed)),
         "binding": binding.to_dict(),
@@ -570,6 +612,24 @@ def _binding_store_path() -> Path:
     return home / "a2a_posture_bindings.json"
 
 
+def _legacy_binding_valid(value: Any) -> bool:
+    """Recognize pre-route-identity bindings only as fail-closed tombstones."""
+    if not isinstance(value, dict) or all(
+        name in value
+        for name in ("served_profile", "served_tenant", "profile_home_identity")
+    ):
+        return False
+    fields = ("peer", "agent_slug", "context_id", "toolset_fingerprint")
+    return bool(
+        all(
+            isinstance(value.get(name), str)
+            and (name == "agent_slug" or bool(value.get(name)))
+            for name in fields
+        )
+        and type(value.get("mutation_enabled")) is bool
+    )
+
+
 def _read_bindings_unlocked(path: Path) -> tuple[str, dict[tuple[str, str], dict[str, Any]]]:
     if not path.exists():
         return "ok", {}
@@ -584,7 +644,9 @@ def _read_bindings_unlocked(path: Path) -> tuple[str, dict[tuple[str, str], dict
         if not isinstance(key, str) or "\x00" in key or not isinstance(value, dict):
             return "corrupt", {}
         slug, sep, context = key.partition("\x1f")
-        if not sep or not context or PostureBinding.from_value(value) is None:
+        if not sep or not context or (
+            PostureBinding.from_value(value) is None and not _legacy_binding_valid(value)
+        ):
             return "corrupt", {}
         out[(slug, context)] = value
     return "ok", out
@@ -596,7 +658,7 @@ def _write_bindings_unlocked(
     payload = {
         f"{slug}\x1f{context}": value
         for (slug, context), value in bindings.items()
-        if PostureBinding.from_value(value) is not None
+        if PostureBinding.from_value(value) is not None or _legacy_binding_valid(value)
     }
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
@@ -657,6 +719,8 @@ def claim_persisted_binding(
         key = (str(slug), str(context_id))
         existing = bindings.get(key)
         if existing is not None:
+            if _legacy_binding_valid(existing):
+                return "legacy", existing
             comparison = resume_binding_status(existing, parsed.to_dict())
             return comparison, existing
         if not create_if_missing:
