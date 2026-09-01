@@ -211,6 +211,47 @@ class TestReadFileSchemaStatic(unittest.TestCase):
                     config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
                     managed_scope.invalidate_managed_cache()
 
+    def test_strict_current_read_rejects_nonmapping_managed_config(self):
+        from hermes_cli import config as config_mod
+        from hermes_cli import managed_scope
+        from tools import read_extract as rx
+
+        with tempfile.TemporaryDirectory(prefix="hosted-ocr-managed-shape-") as temp:
+            root = Path(temp)
+            home = root / "profile"
+            managed = root / "managed"
+            home.mkdir()
+            managed.mkdir()
+            (home / "config.yaml").write_text(
+                "file_tools:\n  hosted_ocr: true\n",
+                encoding="utf-8",
+            )
+            (managed / "config.yaml").write_text(
+                "- invalid\n- managed-policy-root\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(home),
+                    "HERMES_MANAGED_DIR": str(managed),
+                    "FIRECRAWL_API_KEY": "fc-test",
+                },
+                clear=False,
+            ):
+                config_mod._LOAD_CONFIG_CACHE.clear()
+                config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+                managed_scope.invalidate_managed_cache()
+                try:
+                    with self.assertRaises(config_mod.CurrentConfigReadError):
+                        config_mod.load_config_readonly_strict()
+                    self.assertFalse(rx.hosted_ocr_available())
+                finally:
+                    config_mod._LOAD_CONFIG_CACHE.clear()
+                    config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+                    managed_scope.invalidate_managed_cache()
+
     def test_runtime_route_is_direct_key_only(self):
         """Runtime route requires explicit opt-in and never uses Nous."""
         import tools.read_extract as rx

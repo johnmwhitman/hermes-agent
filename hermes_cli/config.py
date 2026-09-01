@@ -4088,15 +4088,23 @@ def _load_config_impl(
         if require_current and managed_cfg_path is not None:
             try:
                 with open(managed_cfg_path, encoding="utf-8") as f:
-                    managed_config = yaml.safe_load(f) or {}
+                    current_managed = yaml.safe_load(f)
             except FileNotFoundError:
-                managed_config = {}
+                current_managed = None
             except Exception as e:
                 raise CurrentConfigReadError(
                     "managed config is not currently readable"
                 ) from e
-            if not isinstance(managed_config, dict):
+            if current_managed is None:
+                # Missing, empty, and explicit YAML null retain the existing
+                # managed-config contract: a valid empty overlay.
                 managed_config = {}
+            elif not isinstance(current_managed, dict):
+                raise CurrentConfigReadError(
+                    "managed config root is not a mapping"
+                )
+            else:
+                managed_config = current_managed
         else:
             managed_config = managed_scope.load_managed_config()
         if managed_config:
