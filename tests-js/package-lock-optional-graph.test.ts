@@ -20,6 +20,7 @@ type LockPackage = {
   resolved?: string
   integrity?: string
   dependencies?: Record<string, string>
+  devDependencies?: Record<string, string>
   optionalDependencies?: Record<string, string>
 }
 
@@ -27,11 +28,27 @@ type Lockfile = {
   packages: Record<string, LockPackage>
 }
 
+type RootPackage = {
+  allowScripts?: Record<string, boolean>
+}
+
+type DesktopPackage = {
+  devDependencies?: Record<string, string>
+}
+
 const REPO_ROOT = path.resolve(__dirname, '..')
 
 const lock = JSON.parse(
   fs.readFileSync(path.join(REPO_ROOT, 'package-lock.json'), 'utf-8')
 ) as Lockfile
+
+const rootPackage = JSON.parse(
+  fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf-8')
+) as RootPackage
+
+const desktopPackage = JSON.parse(
+  fs.readFileSync(path.join(REPO_ROOT, 'apps', 'desktop', 'package.json'), 'utf-8')
+) as DesktopPackage
 
 function agentVersion(): string {
   const pyproject = fs.readFileSync(path.join(REPO_ROOT, 'pyproject.toml'), 'utf-8')
@@ -130,6 +147,23 @@ test('optional WASI bindings resolve complete semver-compatible dependency subtr
   assertCompleteDependencies('node_modules/@rolldown/binding-wasm32-wasi')
   assertCompleteDependencies('node_modules/@tailwindcss/oxide-wasm32-wasi')
   assertCompleteDependencies('node_modules/@napi-rs/wasm-runtime')
+})
+
+test('Desktop Electron security floor uses the internal extractor graph', () => {
+  const electronVersion = '41.10.3'
+  const electron = lock.packages['node_modules/electron']
+
+  assert.equal(desktopPackage.devDependencies?.electron, electronVersion)
+  assert.equal(lock.packages['apps/desktop']?.devDependencies?.electron, electronVersion)
+  assert.equal(electron?.version, electronVersion)
+  assert.equal(electron?.dependencies?.['@electron-internal/extract-zip'], '^1.0.1')
+  assert.equal(electron?.dependencies?.['@electron/get'], '^5.0.0')
+  assert.equal(electron?.dependencies?.['extract-zip'], undefined)
+  assert.equal(lock.packages['node_modules/extract-zip'], undefined)
+  assertCompleteDependencies('node_modules/electron')
+  assertCompleteDependencies('node_modules/@electron-internal/extract-zip')
+  assert.equal(rootPackage.allowScripts?.[`electron@${electronVersion}`], true)
+  assert.equal(rootPackage.allowScripts?.['electron@40.10.2'], undefined)
 })
 
 test('Desktop package and workspace lock metadata match the Agent release version', () => {
