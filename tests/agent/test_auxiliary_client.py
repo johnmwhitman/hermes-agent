@@ -2574,9 +2574,10 @@ class TestAuxiliaryAuthRefreshRetry:
 
 
 
-    def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
+    def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch, tmp_path):
         stale_client = MagicMock()
         cache_key = ("anthropic", False, None, None, None)
+        credentials_path = tmp_path / ".credentials.json"
 
         monkeypatch.setenv("ANTHROPIC_TOKEN", "")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
@@ -2587,6 +2588,9 @@ class TestAuxiliaryAuthRefreshRetry:
             # Anthropic credential sourcing lives in agent/anthropic_credentials.py;
             # patch it at that definition site so both the direct call here and
             # the re-read inside ``_refresh_oauth_token`` see the same stub.
+            # The refresh transaction also locks and checks a sidecar beside
+            # this authoritative path, so keep those real operations hermetic.
+            patch("agent.anthropic_credentials.claude_code_credentials_path", return_value=credentials_path),
             patch("agent.anthropic_credentials.read_claude_code_credentials", return_value={
                 "accessToken": "expired-token",
                 "refreshToken": "refresh-token",
