@@ -12,7 +12,29 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from hermes_cli import main as hermes_main
+from hermes_cli import update_inventory, update_receipt
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _idle_update_fleet(monkeypatch):
+    """Keep prompt tests independent of the host's running Hermes fleet."""
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(update_inventory, "collect_runtime_inventory", update_inventory.UpdatePlan)
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **kw: [])
+
+    import hermes_cli.gateway as hermes_gateway
+
+    monkeypatch.setattr(hermes_gateway, "find_gateway_pids", lambda **kw: [])
+    monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(hermes_gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(hermes_gateway, "is_windows", lambda: False)
+    monkeypatch.setattr(
+        hermes_gateway, "find_profile_gateway_processes", lambda *a, **kw: []
+    )
 
 
 def _make_run_side_effect(
