@@ -2365,6 +2365,91 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+# ---------------------------------------------------------------------------
+# Production-board trap for test contexts (t_658c6048)
+# ---------------------------------------------------------------------------
+
+def _production_board_paths() -> "tuple[Path, ...]":
+    """Symlink-free resolved paths of every production kanban board DB on
+    THIS host: ``~/.hermes/kanban.db`` plus ``kanban/boards/*/kanban.db``."""
+    paths: list[Path] = []
+    try:
+        real_home = Path.home() / ".hermes"
+        paths.append((real_home / "kanban.db").resolve())
+        boards = real_home / "kanban" / "boards"
+        if boards.is_dir():
+            for entry in boards.iterdir():
+                db_file = entry / "kanban.db"
+                try:
+                    paths.append(db_file.resolve())
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return tuple(paths)
+
+
+_PRODUCTION_BOARD_PATHS: "tuple[Path, ...] | None" = None
+
+
+def _is_production_board_path(path: Path) -> bool:
+    """True when *path* resolves (through symlinks) to a real production
+    kanban board DB on this host.
+
+    Resolution is the whole point: ``~/.hermes/kanban.db`` is routinely a
+    SYMLINK to a board anchored outside ``~/.hermes`` (e.g. under a lane
+    data root). Prefix checks against the literal home path miss that; this
+    compares fully-resolved targets instead.
+    """
+    global _PRODUCTION_BOARD_PATHS
+    if _PRODUCTION_BOARD_PATHS is None:
+        _PRODUCTION_BOARD_PATHS = _production_board_paths()
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        return False
+    # Tests legitimately monkeypatch Path.home() to pytest's tmp tree; a
+    # resolved path under that tree is a sandbox, never production — even
+    # though it textually ends with /.hermes/kanban.db.
+    try:
+        import tempfile
+        tmp_root = Path(tempfile.gettempdir()).resolve()
+        if resolved.is_relative_to(tmp_root):
+            return False
+    except Exception:
+        pass
+    return any(resolved == prod for prod in _PRODUCTION_BOARD_PATHS)
+
+
+def _refuse_production_board_under_pytest(path: Path) -> None:
+    """Fail closed when a pytest process tries to OPEN the real board.
+
+    Independent of how the path was produced: a leaked ``HERMES_KANBAN_DB``,
+    a rebuilt child env that lost the ``HERMES_HOME`` redirect, or a
+    memoised default root all funnel through :func:`connect`, and every one
+    of those escape vectors has landed fixture rows (``racer N``, ``ro
+    task``, ``Task A``) in the live board. Cheap: no-ops the moment the
+    resolved path is anything else.
+    """
+    try:
+        from hermes_state import _running_under_pytest
+    except Exception:
+        return
+    try:
+        under_pytest = _running_under_pytest()
+    except Exception:
+        under_pytest = False
+    if not under_pytest:
+        return
+    if _is_production_board_path(path):
+        raise RuntimeError(
+            f"kanban_db.connect: refusing to open the REAL production board "
+            f"({path}) under pytest. Redirect HERMES_HOME / HERMES_KANBAN_DB "
+            f"to a tmp path, or pass an explicit test db_path. "
+            f"(t_658c6048: fixture cards must never reach the live board)"
+        )
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -2387,11 +2472,19 @@ def connect(
     * Neither → :func:`kanban_db_path` resolves via
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
+
+    Test-context trap (t_658c6048): under pytest, a resolved path that
+    still lands on the REAL production board is refused before any open —
+    even for writes a test author believes are sandboxed. Path-env and
+    HERMES_HOME redirects fail closed the moment they silently stop
+    applying (env rebuild in a subprocess, memoised root, leaked
+    ``HERMES_KANBAN_DB``); this check does not depend on any of them.
     """
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    _refuse_production_board_under_pytest(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive

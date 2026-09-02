@@ -610,6 +610,8 @@ markers = [
     "linux_only: exercises Linux-specific behaviour; skipped on other hosts",
     "macos_only: exercises macOS-specific behaviour; skipped on other hosts",
     "windows_only: exercises native-Windows behaviour; skipped on other hosts",
+    "live_kanban_board: opt out of the autouse closed-world kanban sandbox (test touches the real board on purpose)",
+    "live_system_guard_bypass: opt out of the live state.db write guard",
 ]
 # integration tests take way too long to run in the normal CI environments
 addopts = "-m 'not integration'"
