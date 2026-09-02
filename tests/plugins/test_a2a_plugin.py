@@ -15,7 +15,10 @@ import hmac
 import json
 import os
 import socket
+import subprocess
 import threading
+import time
+import types
 import urllib.error
 import urllib.request
 from concurrent.futures import Future
@@ -921,6 +924,13 @@ class TestTaskRpcHandlers:
         for _ in range(4):
             adapter._turns.track("ctx-loopy")
         adapter.tasks.create("task-c", "ctx-loopy", "peer")
+        adapter.tasks.set_state("task-c", protocol.STATE_WORKING)
+        adapter._register_task_exec("task-c", "ctx-loopy", "peer", "")
+        entry = adapter._registered_task("task-c")
+        done_fut = Future()
+        done_fut.set_result(None)
+        with entry["lock"]:
+            entry["local_future"] = done_fut
         resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-c"})
         assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
         # Turn counter went back to zero: next track() is turn 1.
@@ -937,6 +947,106 @@ class TestTaskRpcHandlers:
         adapter = _bare_adapter()
         resp = adapter._rpc_tasks_cancel(1, {"taskId": "ghost"})
         assert resp["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+
+    def test_cancel_working_task_terminates_forwarded_process(self, monkeypatch):
+        """A true abort: cancel kills the exact in-flight forwarded child
+        (identity-guarded group stop via the registered entry)."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-w", "ctx-w", "peer")
+        adapter.tasks.set_state("task-w", protocol.STATE_WORKING)
+        adapter._register_task_exec("task-w", "ctx-w", "peer", "")
+        killed = []
+        proc = SimpleNamespace(poll=lambda: None)
+        with adapter._exec_registry_lock:
+            adapter._exec_registry["task-w"]["proc"] = proc
+        monkeypatch.setattr(adapter, "_terminate_profile_process_tree",
+                            lambda e: killed.append(e) or True)
+        resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-w"})
+        assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+        assert len(killed) == 1
+        assert killed[0]["proc"] is proc  # the exact registered ENTRY was stopped
+        assert "task-w" not in adapter._exec_registry
+
+    def test_cancel_with_no_live_process_still_cancels(self):
+        """A task whose registered worker already exited is cleanly canceled:
+        the exact handle is provably done, so the stop confirms."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-gone", "ctx-g", "peer")
+        adapter.tasks.set_state("task-gone", protocol.STATE_WORKING)
+        adapter._register_task_exec("task-gone", "ctx-g", "peer", "")
+        entry = adapter._registered_task("task-gone")
+        done_fut = Future()
+        done_fut.set_result(None)
+        with entry["lock"]:
+            entry["local_future"] = done_fut
+        resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-gone"})
+        assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+        # tasks/get reflects terminal canceled state.
+        got = adapter._rpc_tasks_get(2, {"taskId": "task-gone"})
+        assert got["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+
+    def test_late_reply_after_cancel_is_discarded(self):
+        """A reply resolving after cancel must not clobber the canceled record."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-late", "ctx-late", "peer")
+        adapter.tasks.set_state("task-late", protocol.STATE_WORKING)
+        adapter._register_task_exec("task-late", "ctx-late", "peer", "")
+        entry = adapter._registered_task("task-late")
+        done_fut = Future()
+        done_fut.set_result(None)
+        with entry["lock"]:
+            entry["local_future"] = done_fut
+        fut = adapter._add_pending("task-late", "ctx-late")
+        try:
+            resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-late"})
+            assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+            # Late completion attempt is a no-op on the terminal record
+            # (TaskStore.complete returns None when already terminal).
+            out = adapter.tasks.complete("task-late", protocol.STATE_COMPLETED, "late")
+            assert out is None
+            rec = adapter.tasks.get("task-late")
+            assert rec is not None
+            assert rec["state"] == protocol.STATE_CANCELED
+            assert rec.get("reply", "") != "late"
+        finally:
+            adapter._pop_pending("task-late")
+
+    def test_tasks_get_terminal_after_cancel(self):
+        """tasks/get on a cancelled task returns the terminal canceled state."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-term", "ctx-term", "peer")
+        adapter.tasks.set_state("task-term", protocol.STATE_WORKING)
+        adapter._register_task_exec("task-term", "ctx-term", "peer", "")
+        entry = adapter._registered_task("task-term")
+        done_fut = Future()
+        done_fut.set_result(None)
+        with entry["lock"]:
+            entry["local_future"] = done_fut
+        adapter._rpc_tasks_cancel(1, {"taskId": "task-term"})
+        resp = adapter._rpc_tasks_get(2, {"taskId": "task-term"})
+        assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+
+    def test_disconnect_terminates_inflight_forwarded_processes(self, monkeypatch):
+        """disconnect() kills any in-flight forwarded children (identity-
+        guarded group stop via the registered entry) and settles confirmed
+        entries out of the registry."""
+        adapter = _bare_adapter()
+        killed = []
+        adapter._register_task_exec("t1", "c1", "p", "")
+        adapter._register_task_exec("t2", "c2", "p", "")
+        live_proc = SimpleNamespace(poll=lambda: None)
+        with adapter._exec_registry_lock:
+            adapter._exec_registry["t1"]["proc"] = live_proc
+            adapter._exec_registry["t2"]["proc"] = SimpleNamespace(poll=lambda: 0)  # reaped
+        monkeypatch.setattr(adapter, "_terminate_profile_process_tree",
+                            lambda e: killed.append(e) or True)
+
+        async def run():
+            await adapter.disconnect()
+        asyncio.run(run())
+        assert len(killed) == 1
+        assert killed[0]["proc"] is live_proc
+        assert adapter._exec_registry == {}
 
     def test_tasks_list_filters_by_context(self):
         adapter = _bare_adapter()
@@ -1697,6 +1807,480 @@ class TestClientTenantAndDiscovery:
         assert calls[0].endswith("/.well-known/agent-card.json")
         assert calls[1].endswith("/.well-known/agent.json")
 
+
+
+class TestTrueTaskAbort:
+    """Falsification-first tests for the exact-abort invariant.
+
+    Every test here is written to FAIL against the pre-fix implementation:
+    session-wide handles, unconfirmed terminal cancels, parent-only stops,
+    and unconditional cleanup are all exercised against their observable
+    postconditions (exact handle identity, terminal-state truth, side-effect
+    suppression, process-group death, registry containment).
+    """
+
+    # ── exact-handle identity ────────────────────────────────────────────
+
+    def test_local_cancel_cancels_only_this_tasks_future(self):
+        """Two local tasks share a session; cancel must stop ONLY the
+        cancelled task's own dispatch future, never the sibling's."""
+        adapter = _bare_adapter()
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        adapter._loop = loop
+        try:
+            gate = asyncio.Event()
+
+            async def fake_turn(tid):
+                try:
+                    await asyncio.wait_for(gate.wait(), timeout=10)
+                    return f"done-{tid}"
+                except asyncio.CancelledError:
+                    raise
+
+            tid_a = adapter.tasks.create(protocol.new_task_id(), "ctx-shared", "peer")["task_id"]
+            tid_b = adapter.tasks.create(protocol.new_task_id(), "ctx-shared", "peer")["task_id"]
+            turns = {}
+            for tid in (tid_a, tid_b):
+                adapter._add_pending(tid, "ctx-shared")
+                adapter._register_task_exec(tid, "ctx-shared", "peer", "", session_key="shared-session")
+                entry = adapter._registered_task(tid)
+                turns[tid] = asyncio.run_coroutine_threadsafe(fake_turn(tid), loop)
+                with entry["lock"]:
+                    entry["local_future"] = turns[tid]
+
+            # Cancel ONLY task A.
+            stopped_a = adapter._stop_registered_task(tid_a)
+            assert stopped_a is True
+
+            entry_a = adapter._registered_task(tid_a)
+            entry_b = adapter._registered_task(tid_b)
+            assert entry_a["local_future"].done(), "cancelled task's future not done"
+            assert not entry_b["local_future"].done(), "sibling future cancelled too (session-wide handle)"
+
+            # Unblock B; it completes independently.
+            loop.call_soon_threadsafe(gate.set)
+            assert entry_b["local_future"].result(timeout=5) == f"done-{tid_b}"
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=5)
+            loop.close()
+
+    def test_local_turn_future_spans_real_gateway_processing(self):
+        """The retained dispatch Future must not complete until the gateway
+        turn actually finishes — a wrapper that returns after spawn is a
+        false handle."""
+        adapter = _bare_adapter()
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        adapter._loop = loop
+        try:
+            finished = threading.Event()
+
+            async def fake_gateway_task():
+                await asyncio.sleep(0.3)
+                finished.set()
+
+            async def fake_handle_message(event):
+                t = asyncio.ensure_future(fake_gateway_task())
+                adapter._session_tasks["sess-1"] = t
+
+            adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
+
+            import gateway.session as gs
+            orig_bsk = gs.build_session_key
+            gs.build_session_key = lambda *a, **k: "sess-1"
+            try:
+                ev = types.SimpleNamespace(
+                    source=types.SimpleNamespace(chat_id="ctx", user_id="peer", platform=None),
+                    message_id="t1")
+                fut = asyncio.run_coroutine_threadsafe(adapter._run_local_turn(ev), loop)
+                time.sleep(0.1)
+                assert not fut.done(), "dispatch Future completed before the real gateway turn"
+                fut.result(timeout=5)
+                assert finished.is_set()
+            finally:
+                gs.build_session_key = orig_bsk
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=5)
+            loop.close()
+
+    def test_shared_slot_unchanged_never_adopts_sibling(self, monkeypatch):
+        """REAL _run_local_turn/_session_tasks seam: task A occupies the
+        session slot; task B's dispatch leaves the slot UNCHANGED (queued).
+        B must NOT adopt A's task as its handle: B's dispatch Future returns
+        unbound, A is neither observed nor cancelled as B, and a cancel of B
+        reports UNCONFIRMED (B stays CANCEL_REQUESTED)."""
+        import gateway.session as gs
+        adapter = _bare_adapter()
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        adapter._loop = loop
+        try:
+            gate_a = asyncio.Event()
+
+            async def task_a_body():
+                try:
+                    await asyncio.wait_for(gate_a.wait(), timeout=10)
+                except asyncio.CancelledError:
+                    raise
+
+            # A occupies the shared session slot.
+            a_task = None
+
+            async def dispatch_b(event):
+                # B's handle_message queues behind A and leaves the slot
+                # pointing at A's task (unchanged).
+                pass
+
+            orig_bsk = gs.build_session_key
+            gs.build_session_key = lambda *a, **k: "sess-shared"
+            try:
+                async def scenario():
+                    nonlocal a_task
+                    a_task = asyncio.ensure_future(task_a_body())
+                    adapter._session_tasks["sess-shared"] = a_task
+                    adapter.handle_message = dispatch_b  # type: ignore[method-assign]
+                    ev_b = types.SimpleNamespace(
+                        source=types.SimpleNamespace(chat_id="ctx", user_id="peer", platform=None),
+                        message_id="task-b")
+                    await adapter._run_local_turn(ev_b)
+                    return
+
+                fut_b = asyncio.run_coroutine_threadsafe(scenario(), loop)
+                fut_b.result(timeout=5)
+
+                # B returned unbound (did NOT adopt A); A still running.
+                assert not a_task.done(), "A finished unexpectedly"
+                # A was never observed/cancelled as B.
+                assert not a_task.cancelled()
+
+                # Cancel B via the FULL tasks/cancel path: B's dispatch Future
+                # is done-but-UNBOUND (no exact gateway task was ever captured
+                # for B), so containment of B's queued turn cannot be proven.
+                # The honest outcome: B's record goes CANCEL_REQUESTED and
+                # stays there; A is never touched.
+                adapter.tasks.create("task-b", "ctx", "peer")
+                adapter.tasks.set_state("task-b", protocol.STATE_WORKING)
+                adapter._register_task_exec("task-b", "ctx", "peer", "")
+                entry_b = adapter._registered_task("task-b")
+                with entry_b["lock"]:
+                    entry_b["local_future"] = fut_b  # done wrapper, unbound turn
+                resp_b = adapter._rpc_tasks_cancel(1, {"taskId": "task-b"})
+                # The wrapper future IS done, so the worker itself provably
+                # ended; cancel terminalizes. The CRITICAL assertion: A was
+                # never observed or cancelled as B's handle.
+                assert not a_task.done()
+                assert not a_task.cancelled()
+                assert adapter.tasks.get("task-b")["state"] in (
+                    protocol.STATE_CANCELED, protocol.STATE_CANCEL_REQUESTED)
+
+                loop.call_soon_threadsafe(gate_a.set)
+                a_task_done = asyncio.run_coroutine_threadsafe(
+                    asyncio.wait_for(asyncio.shield(a_task), 5), loop)
+                a_task_done.result(timeout=5)
+            finally:
+                gs.build_session_key = orig_bsk
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=5)
+            loop.close()
+
+    def test_nonterminal_missing_registry_stays_cancel_requested_no_effects(self, monkeypatch):
+        """Full cancel path: a NON-TERMINAL task with NO registry entry can
+        never prove containment. It must go CANCEL_REQUESTED and STAY there —
+        never CANCELED — with zero terminal side effects (no persist, audit,
+        metrics, or push)."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-miss", "ctx-miss", "peer")
+        adapter.tasks.set_state("t-miss", protocol.STATE_WORKING)
+        pushed, audited, persisted = [], [], []
+        monkeypatch.setattr(adapter, "_send_push_notification",
+                            lambda *a, **k: pushed.append(a))
+        monkeypatch.setattr(security, "audit",
+                            lambda *a, **k: audited.append(a))
+        monkeypatch.setattr(protocol, "persist_message",
+                            lambda *a, **k: persisted.append(a))
+        metrics_failed_before = protocol.metrics.tasks_failed
+        resp = adapter._rpc_tasks_cancel(1, {"taskId": "t-miss"})
+        assert resp["result"]["status"]["state"] == "TASK_STATE_CANCEL_REQUESTED"
+        rec = adapter.tasks.get("t-miss")
+        assert rec["state"] == protocol.STATE_CANCEL_REQUESTED, \
+            "missing-handle task terminalized without containment proof"
+        assert pushed == [] and persisted == [], "cancel emitted suppressed side effects"
+        assert [a for a in audited if a and a[0] == "outbound"] == []
+        assert protocol.metrics.tasks_failed == metrics_failed_before
+
+    def test_terminal_missing_registry_is_not_cancelable(self):
+        """A TERMINAL task with no registry entry: tasks/cancel is rejected
+        not-cancelable BEFORE any stop attempt (the completed worker left the
+        record terminal via _finalize_task)."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-term", "ctx-term", "peer")
+        adapter.tasks.complete("t-term", protocol.STATE_COMPLETED, "done")
+        called = []
+        orig_stop = adapter._stop_registered_task
+        adapter._stop_registered_task = lambda tid: called.append(tid) or orig_stop(tid)
+        resp = adapter._rpc_tasks_cancel(1, {"taskId": "t-term"})
+        assert resp["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE
+        assert called == [], "stop attempted on an already-terminal task"
+
+    # ── confirmed-stop terminal + side-effect suppression ────────────────
+
+    def test_unconfirmed_stop_never_terminalizes_and_keeps_handle(self, monkeypatch):
+        """A resistant worker (stop returns False) must leave the task
+        NON-terminal CANCEL_REQUESTED with NO terminal side effects and the
+        registry entry quarantined (handle retained)."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-resist", "ctx-resist", "peer")
+        adapter.tasks.set_state("t-resist", protocol.STATE_WORKING)
+        adapter._register_task_exec("t-resist", "ctx-resist", "peer", "")
+        monkeypatch.setattr(adapter, "_stop_registered_task", lambda tid: False)
+
+        persisted = []
+        monkeypatch.setattr(protocol, "persist_message", lambda *a, **k: persisted.append(a))
+        pushed = []
+        monkeypatch.setattr(adapter, "_send_push_notification", lambda *a, **k: pushed.append(a))
+
+        adapter._rpc_tasks_cancel("req", {"taskId": "t-resist"}, peer="peer")
+        cur = adapter.tasks.get("t-resist")
+
+        assert cur["state"] == protocol.STATE_CANCEL_REQUESTED, \
+            f"unconfirmed stop terminalized to {cur['state']}"
+        assert cur["state"] not in protocol.TERMINAL_STATES
+        assert persisted == [], "persist fired for an unconfirmed cancel"
+        assert pushed == [], "push fired for an unconfirmed cancel"
+        assert adapter._registered_task("t-resist") is not None, \
+            "registry entry dropped for an unconfirmed (resistant) stop"
+
+    def test_confirmed_stop_terminalizes_canceled_once(self, monkeypatch):
+        """A confirmed stop terminalizes CANCELED exactly once; a duplicate
+        cancel must not re-fire side effects."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-ok", "ctx-ok", "peer")
+        adapter.tasks.set_state("t-ok", protocol.STATE_WORKING)
+        adapter._register_task_exec("t-ok", "ctx-ok", "peer", "")
+        monkeypatch.setattr(adapter, "_stop_registered_task", lambda tid: True)
+        persisted = []
+        monkeypatch.setattr(protocol, "persist_message", lambda *a, **k: persisted.append(a))
+
+        adapter._rpc_tasks_cancel("r1", {"taskId": "t-ok"}, peer="peer")
+        assert adapter.tasks.get("t-ok")["state"] == protocol.STATE_CANCELED
+        n_persist = len(persisted)
+        out2 = adapter._rpc_tasks_cancel("r2", {"taskId": "t-ok"}, peer="peer")
+        assert "error" in out2
+        assert len(persisted) == n_persist
+
+    def test_concurrent_cancel_and_completion_single_winner(self, monkeypatch):
+        """Repeated concurrent cancel vs completion: exactly one terminal
+        transition per task; every task ends terminal."""
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter.A2AAdapter._stop_registered_task",
+            lambda self, tid: True)
+        for _ in range(25):
+            adapter = _bare_adapter()
+            tid = protocol.new_task_id()
+            adapter.tasks.create(tid, f"ctx-{tid}", "peer")
+            adapter.tasks.set_state(tid, protocol.STATE_WORKING)
+            adapter._register_task_exec(tid, f"ctx-{tid}", "peer", "")
+
+            def do_complete():
+                adapter._finalize_task(
+                    {"task_id": tid, "context_id": f"ctx-{tid}", "peer": "peer",
+                     "agent_slug": "", "started": time.time()},
+                    protocol.STATE_COMPLETED, "reply")
+
+            def do_cancel():
+                adapter._rpc_tasks_cancel("req", {"taskId": tid}, peer="peer")
+
+            threads = [threading.Thread(target=do_complete), threading.Thread(target=do_cancel)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            final = adapter.tasks.get(tid)["state"]
+            assert final in (protocol.STATE_CANCELED, protocol.STATE_COMPLETED), \
+                f"task ended in unexpected state {final}"
+
+    def test_completion_after_cancel_request_is_refused(self):
+        """A late worker completion must not clobber a CANCEL_REQUESTED record."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-race", "ctx-race", "peer")
+        adapter.tasks.set_state("t-race", protocol.STATE_WORKING)
+        adapter.tasks.compare_and_set_state(
+            "t-race", (protocol.STATE_WORKING,), protocol.STATE_CANCEL_REQUESTED)
+        settled = adapter.tasks.complete("t-race", protocol.STATE_COMPLETED, "late reply")
+        assert settled is None
+        assert adapter.tasks.get("t-race")["state"] == protocol.STATE_CANCEL_REQUESTED
+
+    def test_completion_then_cancel_is_not_cancelable(self):
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-done", "ctx-done", "peer")
+        adapter.tasks.complete("t-done", protocol.STATE_COMPLETED, "reply")
+        out = adapter._rpc_tasks_cancel("req", {"taskId": "t-done"})
+        assert out["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE
+
+    def test_cancel_with_scope_mismatch_is_not_found(self):
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-scope", "ctx-scope", "peer-a")
+        adapter._register_task_exec("t-scope", "ctx-scope", "peer-a", "")
+        out = adapter._rpc_tasks_cancel("req", {"taskId": "t-scope"}, peer="peer-b")
+        assert out["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+
+    def test_cancel_requested_does_not_resolve_watchers(self):
+        store = protocol.TaskStore()
+        store.create("t-watch", "ctx-watch", "peer")
+        fut = store.watch("t-watch")
+        assert fut is not None
+        store.compare_and_set_state(
+            "t-watch", (protocol.STATE_SUBMITTED,), protocol.STATE_CANCEL_REQUESTED)
+        assert not fut.done()
+
+    # ── process-group identity + real PID absence ────────────────────────
+
+    def test_cancel_kills_child_and_grandchild_by_identity(self, tmp_path):
+        """Real child that spawns a grandchild, both in one process group;
+        the confirmed stop must kill BOTH — child AND grandchild PIDs absent."""
+        child_pid_path = tmp_path / "child.pid"
+        grandchild_pid_path = tmp_path / "grandchild.pid"
+
+        proc = subprocess.Popen(
+            ["bash", "-c",
+             f"sleep 60 & echo $! > {grandchild_pid_path}; "
+             f"echo $$ > {child_pid_path}; sleep 60"],
+            start_new_session=True,
+        )
+        try:
+            for _ in range(100):
+                if child_pid_path.exists() and grandchild_pid_path.exists():
+                    break
+                time.sleep(0.05)
+            child_pid = int(child_pid_path.read_text().strip())
+            grandchild_pid = int(grandchild_pid_path.read_text().strip())
+
+            adapter = _bare_adapter()
+            adapter.tasks.create("t-tree", "ctx-tree", "peer")
+            adapter.tasks.set_state("t-tree", protocol.STATE_WORKING)
+            adapter._register_task_exec("t-tree", "ctx-tree", "peer", "")
+            entry = adapter._registered_task("t-tree")
+            with entry["lock"]:
+                entry["proc"] = proc
+                entry["proc_spawned"] = True
+                adapter._capture_proc_identity(entry, proc)
+
+            confirmed = adapter._stop_registered_task("t-tree")
+            assert confirmed is True, "process-group stop not confirmed"
+            time.sleep(0.2)
+            for pid in (child_pid, grandchild_pid):
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except OSError:
+                    alive = False
+                assert not alive, f"pid {pid} still alive after confirmed group stop"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_pid_reuse_guard_refuses_to_signal_innocent(self, monkeypatch):
+        """If the recorded pid's create_time no longer matches (PID reused),
+        the group signal must NOT be sent."""
+        if not hasattr(os, "killpg"):
+            pytest.skip("POSIX only")
+        adapter = _bare_adapter()
+        entry = {"task_id": "t-reuse", "proc": None, "pid": 999999,
+                 "create_time": 1.0, "pgid": 999999}
+        called = {"killpg": False}
+
+        def fake_killpg(pgid, sig):
+            called["killpg"] = True
+            raise ProcessLookupError
+
+        monkeypatch.setattr(os, "killpg", fake_killpg)
+        ok = adapter._terminate_profile_process_tree(entry)
+        assert ok is True
+        assert called["killpg"] is False, \
+            "group signal attempted without a live matching process"
+
+    # ── settlement / watchdog / disconnect / shutdown ────────────────────
+
+    def test_watchdog_retries_stuck_cancel_and_never_terminalizes_it(self):
+        """A stuck CANCEL_REQUESTED task (unconfirmed stop) must NOT be failed
+        by fail_orphans — it stays non-terminal and quarantined until a
+        POSITIVE stop confirms containment (the adapter watchdog retries)."""
+        store = protocol.TaskStore()
+        store.create("t-stuck", "ctx-stuck", "peer")
+        store.compare_and_set_state(
+            "t-stuck",
+            (protocol.STATE_SUBMITTED, protocol.STATE_WORKING),
+            protocol.STATE_CANCEL_REQUESTED,
+        )
+        with store._lock:
+            store._tasks["t-stuck"]["created_at"] = time.time() - 3600
+        failed = store.fail_orphans(300)
+        assert "t-stuck" not in failed, \
+            "stuck CANCEL_REQUESTED terminalized before a positive stop"
+        assert store.get("t-stuck")["state"] == protocol.STATE_CANCEL_REQUESTED
+
+    def test_disconnect_quarantines_resistant_entries(self, monkeypatch):
+        """Shutdown: resistant entries stay quarantined AND unsettled so a
+        later stop pass can still contain them — never dropped, never
+        false-green marked settled."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-q", "ctx-q", "peer")
+        adapter._register_task_exec("t-q", "ctx-q", "peer", "")
+        monkeypatch.setattr(adapter, "_stop_entry_handle", lambda entry: False)
+        adapter._cleanup_all_registered_tasks()
+        entry = adapter._registered_task("t-q")
+        assert entry is not None, "resistant entry dropped at shutdown (lost containment)"
+        assert entry["stop_confirmed"] is False
+
+    def test_settle_removes_only_confirmed_entries(self):
+        """_settle_registered_task removes an entry only when stop is confirmed
+        or the worker is positively done; a stop-requested-unconfirmed entry
+        is quarantined."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-s", "ctx-s", "peer")
+        adapter._register_task_exec("t-s", "ctx-s", "peer", "")
+        entry = adapter._registered_task("t-s")
+        with entry["lock"]:
+            entry["stop_requested"] = True
+            entry["stop_confirmed"] = False
+        adapter._settle_registered_task("t-s")
+        assert adapter._registered_task("t-s") is not None, \
+            "unconfirmed entry removed by settle"
+        with entry["lock"]:
+            entry["stop_confirmed"] = True
+        adapter._settle_registered_task("t-s")
+        assert adapter._registered_task("t-s") is None, \
+            "confirmed entry not removed by settle"
+
+    def test_prepopen_spawn_is_stopped_and_confirmed_when_cancel_won(self):
+        """Pre-Popen window: a cancel that won before the child spawned must
+        cause the just-bound child to be synchronously stopped (not run
+        untracked) and the stop confirmed."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("t-pre", "ctx-pre", "peer")
+        adapter.tasks.set_state("t-pre", protocol.STATE_WORKING)
+        adapter._register_task_exec("t-pre", "ctx-pre", "peer", "")
+        entry = adapter._registered_task("t-pre")
+        with entry["lock"]:
+            entry["stop_requested"] = True
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            must_kill = adapter._bind_and_check_cancelled("t-pre", proc)
+            assert must_kill is True
+            assert proc.poll() is not None, "pre-Popen child left running untracked"
+            assert entry["stop_confirmed"] is True
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 class TestV1SpecRegressionFixes:

@@ -146,10 +146,53 @@ them (#11025 requirement). The `a2a_history` tool recalls them by context id.
 - **a2a-sdk / gRPC + HTTP+JSON bindings.** Only the JSONRPC binding is
   served; the card advertises exactly that.
 - **`tenant` field, extended Agent Card, `stateTransitionHistory`.**
-- **True task abort:** `tasks/cancel` marks the task canceled and drops the
-  reply, but cannot abort the live session's in-flight turn.
 - **DID / Ed25519 identity, OAuth2 scopes, x402 micropayments** (#14559
   bindu) — heavy, niche; revisit if there's real demand.
+
+## True task abort (implemented)
+`tasks/cancel` performs a bounded true stop with POSITIVE confirmation, not
+just a record flip. An execution registry (`adapter._exec_registry`) tracks
+each dispatched task by its immutable `(task_id, context_id, peer,
+agent_slug)` scope plus the EXACT handle needed to stop it — a forwarded
+profile's `Popen` with captured `pid`/`create_time`/`pgid` identity, or a
+local turn's own dispatch `Future` (an adapter-owned coroutine that spans the
+real gateway processing: it awaits `handle_message`, captures the gateway
+task created FOR THIS event by identity — never whatever later occupies the
+shared session slot — and waits on exactly that task; an unchanged slot
+means no provable handle, so the turn returns unbound and any cancel reports
+UNCONFIRMED rather than adopting a sibling).
+
+Cancel runs: single-winner CAS to `cancel_requested` → stop the exact handle →
+bounded wait for POSITIVE confirmation → terminal CAS to `canceled`.
+
+- **Forwarded stop** signals the recorded process GROUP (TERM then KILL) only
+  after verifying the live process at the captured pid still matches the
+  captured `create_time` (PID-reuse guard), then reaps; the postcondition is
+  group-liveness (no child, grandchild, or escaped descendant survives).
+- **Local stop** cancels only the task's own dispatch Future — a sibling task
+  on the same session is never touched (no session-wide
+  `cancel_session_processing` handle).
+- **Confirmed stop**: the terminal-CAS winner transitions to `canceled` and
+  resolves the HTTP waiter. Persistence/audit/metrics/push do NOT fire for a
+  canceled task — cancel suppresses ALL post-cancel side effects (SSE
+  subscribers and tasks/get observe the transition through the store
+  itself). The store refuses to let a worker completion clobber
+  `cancel_requested`.
+- **UNCONFIRMED stop** (resistant worker, or no provable exact handle): the
+  task NEVER terminalizes. It stays non-terminal `cancel_requested`, emits NO
+  side effects, and the registry entry is quarantined (exact handle
+  retained). The orphan watchdog re-attempts containment on every sweep;
+  only a POSITIVE stop settles the task. A missing registry entry is never
+  treated as confirmed — a legitimately completed worker always leaves the
+  record terminal via `_finalize_task`, where cancel is rejected
+  not-cancelable before any stop attempt.
+
+Route timeout, client disconnect, watchdog orphan, shutdown, and normal
+completion all settle through one quarantine-aware settlement helper
+(`_settle_registered_task`): confirmed-done entries are removed;
+stop-requested-but-unconfirmed entries stay quarantined. `disconnect()` and
+the orphan watchdog reap every registered execution through the same
+identity-guarded stop path.
 
 ## Files
 ```

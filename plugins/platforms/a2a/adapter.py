@@ -69,6 +69,7 @@ _ORPHAN_GRACE = 60  # slack added on top of a served agent's configured route ti
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
+_CANCEL_CONFIRM_TIMEOUT = 5.0  # bounded wait for a cancelled worker to confirm stop
 
 
 @dataclass(frozen=True)
@@ -154,10 +155,15 @@ def _profile_home(profile: str) -> Optional[str]:
 def _served_route_identity(
     agent: dict, *, profile_home: Optional[str] = None,
 ) -> Optional[dict[str, str]]:
-    """Resolve the immutable profile/tenant identity behind a served route."""
+    """Resolve the immutable profile/tenant identity behind a served route.
+
+    Falls back to the active profile when the route has no explicit
+    ``profile`` key (the default/local served agent is the gateway's own
+    profile), so every served route still gets an identity binding.
+    """
     if not isinstance(agent, dict):
         return None
-    profile = str(agent.get("profile") or "").strip()
+    profile = str(agent.get("profile") or "").strip() or _active_profile_name()
     tenant = str(agent.get("tenant") or "").strip()
     home = profile_home if profile_home is not None else _profile_home(profile)
     if not profile or not home:
@@ -175,8 +181,16 @@ def _served_route_identity(
 
 @contextmanager
 def _served_profile_config_scope(agent: dict):
-    """Temporarily apply only the served profile's configuration home."""
-    profile = str(agent.get("profile") or "").strip() if isinstance(agent, dict) else ""
+    """Temporarily apply only the served profile's configuration home.
+
+    A route with no explicit ``profile`` (the default/local served agent)
+    scopes to the gateway's own active profile home.
+    """
+    profile = (
+        (str(agent.get("profile") or "").strip() or _active_profile_name())
+        if isinstance(agent, dict)
+        else ""
+    )
     home = _profile_home(profile)
     if not home:
         yield False
@@ -204,9 +218,12 @@ def _served_profile_config_scope(agent: dict):
 @contextmanager
 def _served_profile_secret_scope(agent: dict):
     """Apply secrets only after the served profile policy has validated."""
-    home = _profile_home(
-        str(agent.get("profile") or "").strip() if isinstance(agent, dict) else ""
+    profile = (
+        (str(agent.get("profile") or "").strip() or _active_profile_name())
+        if isinstance(agent, dict)
+        else ""
     )
+    home = _profile_home(profile)
     if not home:
         yield False
         return
@@ -250,7 +267,7 @@ def _served_profile_toolset_scope(
     """
     if not isinstance(agent, dict):
         return None
-    profile = str(agent.get("profile") or "").strip()
+    profile = str(agent.get("profile") or "").strip() or _active_profile_name()
     home = _profile_home(profile)
     if not home:
         return None
@@ -626,6 +643,12 @@ class A2AAdapter(BasePlatformAdapter):
         self._pending_order: Dict[tuple[str, str, str], deque[str]] = {}
         self._pending_lock = threading.Lock()
 
+        # Execution registry for true task abort: task_id -> immutable scope +
+        # exact execution handle (forwarded Popen + descendant PIDs, or local
+        # dispatch Future) + stop latch. See _register_task_exec.
+        self._exec_registry: Dict[str, dict] = {}
+        self._exec_registry_lock = threading.Lock()
+
         # Orphaned task watchdog
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
@@ -765,8 +788,6 @@ class A2AAdapter(BasePlatformAdapter):
             "A2A: serving Agent Card + JSON-RPC on http://%s:%s (%s) as %r; %d routed agent(s)",
             self.host, self.port, exposure, self.agent_name, len(self._agents),
         )
-        # Plugin-registered native handlers (ctx.register_platform_handler).
-        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
@@ -779,6 +800,12 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._httpd = None
+        # Stop registered in-flight executions FIRST so no worker keeps
+        # running (and potentially emitting late side effects) after we fail
+        # the blocked reply futures below.
+        stopped = self._cleanup_all_registered_tasks()
+        if stopped:
+            logger.info("A2A: stopped %d in-flight task execution(s) on disconnect", stopped)
         # Fail any in-flight replies so blocked HTTP threads don't hang.
         with self._pending_lock:
             for _ctx, fut in self._pending.values():
@@ -807,12 +834,34 @@ class A2AAdapter(BasePlatformAdapter):
         """Background thread that fails orphaned tasks (keeps them queryable)."""
         while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
             try:
-                for tid in self.tasks.fail_orphans(
+                failed_ids = self.tasks.fail_orphans(
                     _ORPHAN_TIMEOUT,
                     timeout_for=lambda rec: self._orphan_timeout_for(rec.get("agent_slug", "")),
-                ):
+                )
+                for tid in failed_ids:
                     logger.warning("A2A: orphaned task %s marked failed", tid)
+                    # Stop the registered handle (kill child / abort local turn)
+                    # BEFORE settling the registry entry, so an orphaned worker
+                    # doesn't keep running untracked. Settle only on confirmed
+                    # stop (resistant entries stay quarantined).
+                    if self._stop_registered_task(tid):
+                        self._settle_registered_task(tid)
                     protocol.metrics.tasks_failed += 1
+                # Quarantine sweep: re-attempt containment on every task stuck
+                # in CANCEL_REQUESTED (unconfirmed stop). Only a POSITIVE stop
+                # settles the task terminal-canceled; resistant workers stay
+                # non-terminal and quarantined until containment succeeds.
+                for tid in self.tasks.tasks_in_state(protocol.STATE_CANCEL_REQUESTED):
+                    rec = self.tasks.get(tid)
+                    if rec is None:
+                        continue
+                    logger.warning(
+                        "A2A: retrying containment for stuck cancel task %s", tid)
+                    if self._stop_registered_task(tid):
+                        self._finalize_cancel(
+                            tid, rec, peer=str(rec.get("peer") or ""),
+                            scope=(str(rec.get("agent_slug") or ""), str(rec.get("tenant") or "")),
+                            stopped=True)
             except Exception:
                 logger.debug("A2A: watchdog error", exc_info=True)
 
@@ -1148,6 +1197,309 @@ class A2AAdapter(BasePlatformAdapter):
                     return True
         return False
 
+    # ── Execution registry (true task abort) ──────────────────────────────
+    #
+    # One entry per dispatched task, holding the immutable (task_id,
+    # context_id, peer, agent_slug) scope plus the EXACT execution handle for
+    # that task — a forwarded child's Popen (+ captured descendant PIDs) or a
+    # local turn's run_coroutine_threadsafe Future — plus a stop latch used to
+    # confirm a bounded stop. Registering the exact handle (not a derived
+    # session key) means a cancel targets only this task and cannot hit or
+    # miss concurrent work sharing a session.
+    #
+    # Entries are removed on every exit: normal completion, timeout,
+    # cancellation, and adapter disconnect/shutdown.
+
+    def _register_task_exec(self, task_id: str, context_id: str, peer: str,
+                            agent_slug: str, *, proc=None, session_key: str = "",
+                            tenant: str = "") -> None:
+        if not task_id:
+            return
+        entry = {
+            "task_id": task_id,
+            "context_id": context_id,
+            "peer": peer,
+            "agent_slug": agent_slug,
+            "tenant": tenant,
+            "proc": proc,
+            "pid": None,
+            "create_time": None,
+            "pgid": None,
+            "local_future": None,
+            "session_key": session_key,
+            "stop_latch": threading.Event(),
+            "lock": threading.Lock(),
+            "stop_requested": False,
+            "stop_confirmed": False,
+            "settled": False,
+        }
+        with self._exec_registry_lock:
+            self._exec_registry[task_id] = entry
+
+    def _registered_task(self, task_id: str) -> Optional[dict]:
+        with self._exec_registry_lock:
+            return self._exec_registry.get(task_id)
+
+    def _worker_done(self, entry: dict) -> bool:
+        """Positive evidence that the exact registered worker has finished:
+        a proc that has exited, or a local future that is done/cancelled."""
+        try:
+            proc = entry.get("proc")
+            if proc is not None:
+                return proc.poll() is not None
+            local_future = entry.get("local_future")
+            if local_future is not None:
+                return bool(
+                    local_future.done()
+                    or getattr(local_future, "cancelled", lambda: False)()
+                )
+            # No handle bound yet: done only if the spawn already came and went.
+            return bool(entry.get("proc_spawned")) and entry.get("proc") is None
+        except Exception:
+            return False
+
+    def _bind_forward_proc(self, task_id: str, proc) -> None:
+        """Bind the spawned forwarded child to its registry entry so cancel can
+        stop THIS task's exact process. Marks proc_spawned to close the
+        pre-Popen window: a cancel that landed before Popen must not mistake
+        "no handle yet" for "stopped" and then let an untracked child spawn."""
+        if not task_id:
+            return
+        with self._exec_registry_lock:
+            entry = self._exec_registry.get(task_id)
+            if entry is not None:
+                with entry["lock"]:
+                    entry["proc"] = proc
+                    entry["proc_spawned"] = True
+                    self._capture_proc_identity(entry, proc)
+
+    @staticmethod
+    def _capture_proc_identity(entry: dict, proc) -> None:
+        """Record pid/create_time/pgid for PID-reuse-safe signalling."""
+        entry["pid"] = getattr(proc, "pid", None)
+        try:
+            import psutil
+            entry["create_time"] = psutil.Process(proc.pid).create_time()
+        except Exception:
+            entry["create_time"] = None
+        try:
+            entry["pgid"] = os.getpgid(proc.pid)
+        except Exception:
+            entry["pgid"] = None
+
+    def _bind_and_check_cancelled(self, task_id: str, proc) -> bool:
+        """Atomically bind the spawned child AND check whether a cancel already
+        won (task terminal / cancel_requested / stop requested). Returns True
+        when the caller must kill this child immediately — closing the
+        pre-Popen window where a cancel lands before Popen binds, which would
+        otherwise spawn an untracked worker. The registry lock is held across
+        bind+check so no cancel can slip between them. When a stop was
+        requested before the bind, this synchronously stops the just-bound
+        child (identity-guarded group TERM/KILL + reap) and confirms the stop
+        for the in-flight cancel ONLY when the reap actually succeeded."""
+        if not task_id:
+            return False
+        with self._exec_registry_lock:
+            entry = self._exec_registry.get(task_id)
+            if entry is not None:
+                with entry["lock"]:
+                    entry["proc"] = proc
+                    entry["proc_spawned"] = True
+                    self._capture_proc_identity(entry, proc)
+                if entry["stop_requested"]:
+                    confirmed = bool(self._terminate_profile_process_tree(entry))
+                    with entry["lock"]:
+                        if confirmed:
+                            entry["stop_confirmed"] = True
+                            entry["stop_latch"].set()
+                        else:
+                            logger.warning(
+                                "A2A: pre-Popen child for task %s resisted the stop; "
+                                "stop stays unconfirmed (quarantined)", task_id)
+                    return True
+            rec = self.tasks.get(task_id)
+            if rec is None or rec["state"] in protocol.TERMINAL_STATES:
+                return True
+            if rec["state"] == protocol.STATE_CANCEL_REQUESTED:
+                if entry is not None and entry["stop_latch"].wait(timeout=_CANCEL_CONFIRM_TIMEOUT):
+                    return True
+                if entry is not None:
+                    confirmed = bool(self._terminate_profile_process_tree(entry))
+                    with entry["lock"]:
+                        if confirmed:
+                            entry["stop_confirmed"] = True
+                            entry["stop_latch"].set()
+                return True
+        return False
+
+    def _stop_registered_task(self, task_id: str) -> bool:
+        """Request stop for the exact registered handle and wait (bounded) for
+        POSITIVE confirmation.
+
+        Forwarded: kill the recorded process GROUP (TERM then KILL) for the
+        exact captured pid/create_time/pgid identity, then reap — PID reuse
+        can never route the signal to an innocent process. Local: cancel the
+        task's OWN retained dispatch Future, which spans the real gateway
+        processing for this task only (same-session siblings keep running).
+
+        Returns True only when stop is confirmed within the bounded window.
+        False means the stop is UNCONFIRMED: the entry is left quarantined
+        (stop_requested set, handle retained) and the caller must NOT claim
+        containment or emit terminal side effects. A MISSING entry is NOT
+        confirmed: a non-terminal record does not prove the worker is done —
+        a legitimately completed worker always leaves the record TERMINAL via
+        _finalize_task, in which case tasks/cancel is rejected before this
+        stop is ever attempted."""
+        entry = self._registered_task(task_id)
+        if entry is None:
+            return False  # no exact handle: containment cannot be proven
+        try:
+            with entry["lock"]:
+                if self._worker_done(entry):
+                    return True  # worker positively done (settled or not)
+                entry["stop_requested"] = True
+            confirmed = self._stop_entry_handle(entry)
+            with entry["lock"]:
+                if confirmed:
+                    entry["stop_confirmed"] = True
+                    entry["stop_latch"].set()
+                else:
+                    logger.warning(
+                        "A2A: task %s stop UNCONFIRMED; entry quarantined (handle retained)",
+                        task_id,
+                    )
+            return confirmed
+        except Exception as e:
+            logger.warning("A2A: stop failed for task %s: %s", task_id, e)
+            return False
+
+    def _stop_entry_handle(self, entry: dict) -> bool:
+        """Stop the exact handle bound to an entry. Positive confirmation only."""
+        proc = entry.get("proc")
+        local_future = entry.get("local_future")
+        if proc is not None:
+            if proc.poll() is None:
+                return bool(self._terminate_profile_process_tree(entry))
+            return True  # already exited
+        if local_future is not None:
+            return self._abort_local_turn(entry)
+        # No handle bound yet. If the child was never spawned nothing can be
+        # running — confirmed stop. If a spawn is expected but not yet bound
+        # (pre-Popen window), the worker may be about to run; wait the bounded
+        # window for the spawner to bind, then stop that exact child.
+        if entry.get("proc_spawned"):
+            return True  # spawned but already exited/reaped
+        if entry["stop_latch"].wait(timeout=_CANCEL_CONFIRM_TIMEOUT):
+            proc = entry.get("proc")
+            if proc is not None and proc.poll() is None:
+                return bool(self._terminate_profile_process_tree(entry))
+            return True
+        return False
+
+    def _abort_local_turn(self, entry: dict) -> bool:
+        """Cancel THIS task's retained dispatch Future and wait (bounded) for
+        the turn to positively finish (done or cancelled).
+
+        The Future spans the real gateway processing for this task only, so a
+        sibling task on the same session is never touched. Returns True only
+        on positive confirmation — the future actually done/cancelled within
+        the bounded window. Never sets the registry stop latch (that latch
+        belongs to the gateway's CANCELLED processing hook and is only set
+        when a stop was genuinely requested)."""
+        local_future = entry.get("local_future")
+        if local_future is None or not hasattr(local_future, "cancel"):
+            return False
+        try:
+            if local_future.done() or getattr(local_future, "cancelled", lambda: False)():
+                return True  # turn already finished — nothing to stop
+        except Exception:
+            return False
+        try:
+            local_future.cancel()
+        except Exception as e:
+            logger.debug(
+                "A2A: local future cancel failed for task %s: %s",
+                entry.get("task_id"), e,
+            )
+            return False
+        deadline = time.monotonic() + _CANCEL_CONFIRM_TIMEOUT
+        while time.monotonic() < deadline:
+            try:
+                if local_future.done() or getattr(local_future, "cancelled", lambda: False)():
+                    return True
+            except Exception:
+                return False
+            time.sleep(0.01)
+        return False
+
+    def _settle_registered_task(self, task_id: str) -> None:
+        """Mark a registry entry settled and remove it.
+
+        Removal is allowed ONLY on positive confirmation that the exact handle
+        is done: a stop that was confirmed, or direct evidence the worker
+        finished (proc exited / local future done). A stop-requested but
+        unconfirmed entry is quarantined (retained, observable, NOT removed)
+        so nothing drops containment while a resistant process may still be
+        alive."""
+        if not task_id:
+            return
+        with self._exec_registry_lock:
+            entry = self._exec_registry.get(task_id)
+            if entry is None:
+                return
+            with entry["lock"]:
+                confirmed_done = entry["stop_confirmed"] or (
+                    not entry["stop_requested"] and self._worker_done(entry)
+                )
+                if not confirmed_done:
+                    entry["settled"] = True
+                    logger.warning(
+                        "A2A: task %s settle requested without positive done "
+                        "evidence; registry entry quarantined", task_id,
+                    )
+                    return
+                entry["settled"] = True
+            self._exec_registry.pop(task_id, None)
+
+    def _settle_task_timeout(self, task_id: str) -> None:
+        """Reply-wait timeout: request a stop on the exact handle; settle only
+        when the stop is confirmed (resistant entries stay quarantined)."""
+        if self._stop_registered_task(task_id):
+            self._settle_registered_task(task_id)
+
+    def _settle_task_disconnect(self, task_id: str) -> None:
+        """Client disconnect: request a stop on the exact handle; settle only
+        when the stop is confirmed (resistant entries stay quarantined)."""
+        if self._stop_registered_task(task_id):
+            self._settle_registered_task(task_id)
+
+    def _cleanup_registered_task(self, task_id: str) -> None:
+        self._settle_registered_task(task_id)
+
+    def _cleanup_all_registered_tasks(self) -> int:
+        """Stop every registered execution (disconnect/shutdown).
+
+        Confirmed-stopped entries are removed; resistant (unconfirmed) entries
+        are QUARANTINED — retained with their exact handle (and NOT marked
+        settled-removable) so a later stop/settle pass can still contain them
+        and shutdown never drops a live, unconfirmed process out of tracking."""
+        with self._exec_registry_lock:
+            entries = list(self._exec_registry.values())
+        stopped = 0
+        for entry in entries:
+            task_id = entry.get("task_id", "")
+            try:
+                if self._stop_registered_task(task_id):
+                    stopped += 1
+                    self._settle_registered_task(task_id)
+                else:
+                    logger.warning(
+                        "A2A: shutdown could not confirm stop for task %s; "
+                        "entry stays quarantined (unsettled)", task_id)
+            except Exception as e:
+                logger.warning("A2A: shutdown stop failed for task %s: %s", task_id, e)
+        return stopped
+
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         if agent is None:
             agent = self._agents[""]
@@ -1303,8 +1655,13 @@ class A2AAdapter(BasePlatformAdapter):
         requested_allowed = posture.allowed_tool_names(mutable, mutable_names)
         allowed = frozenset(requested_allowed & available_names)
         binding = posture.make_binding(
-            peer, slug, context_id, allowed,
-            **route_identity,
+            peer,
+            slug,
+            context_id,
+            allowed,
+            served_profile=route_identity["served_profile"],
+            served_tenant=route_identity["served_tenant"],
+            profile_home_identity=route_identity["profile_home_identity"],
             mutation_enabled=mutable,
         )
         # Peer is part of the immutable binding value, not the lookup key;
@@ -1350,8 +1707,13 @@ class A2AAdapter(BasePlatformAdapter):
                 & (posture.READONLY_TOOL_NAMES - {"a2a_history", "a2a_list"})
             )
             binding = posture.make_binding(
-                peer, slug, context_id, allowed,
-                **route_identity,
+                peer,
+                slug,
+                context_id,
+                allowed,
+                served_profile=route_identity["served_profile"],
+                served_tenant=route_identity["served_tenant"],
+                profile_home_identity=route_identity["profile_home_identity"],
                 mutation_enabled=False,
             )
         elif status in {"corrupt", "error"}:
@@ -1364,8 +1726,13 @@ class A2AAdapter(BasePlatformAdapter):
                 & (posture.READONLY_TOOL_NAMES - {"a2a_history", "a2a_list"})
             )
             binding = posture.make_binding(
-                peer, slug, context_id, allowed,
-                **route_identity,
+                peer,
+                slug,
+                context_id,
+                allowed,
+                served_profile=route_identity["served_profile"],
+                served_tenant=route_identity["served_tenant"],
+                profile_home_identity=route_identity["profile_home_identity"],
                 mutation_enabled=False,
             )
         elif persisted_binding is not None:
@@ -1407,23 +1774,34 @@ class A2AAdapter(BasePlatformAdapter):
 
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
         self._register_inline_push(task_id, params, agent=agent, peer=peer)
+        _tenant = str(rec.get("tenant") or "")
 
         if not agent.get("local", True):
-            reply, state = self._forward_to_profile(
-                agent, peer, context_id, framed, task_id=task_id,
-                posture_policy={
-                    "authenticated": True,
-                    "served_agent_slug": slug,
-                    "served_profile": binding["served_profile"],
-                    "served_tenant": binding["served_tenant"],
-                    "profile_home_identity": binding["profile_home_identity"],
-                    "context_id": context_id,
-                    "mutation_enabled": mutable,
-                    "allowed_tool_names": sorted(allowed),
-                    "binding": binding,
-                },
-            )
-            self.tasks.complete(task_id, state, reply)
+            self._register_task_exec(task_id, context_id, peer, slug, tenant=_tenant)
+            try:
+                reply, state = self._forward_to_profile(
+                    agent, peer, context_id, framed, task_id=task_id,
+                    posture_policy={
+                        "authenticated": True,
+                        "served_agent_slug": slug,
+                        "context_id": context_id,
+                        "mutation_enabled": mutable,
+                        "allowed_tool_names": sorted(allowed),
+                        "binding": binding,
+                    },
+                )
+            finally:
+                self._cleanup_registered_task(task_id)
+            # Terminal transition first: complete() refuses to clobber a
+            # canceled/cancel_requested record, so a cancel that won during the
+            # forward suppresses all late completion side effects here.
+            settled = self.tasks.complete(task_id, state, reply)
+            if settled is None:
+                cur = self.tasks.get(task_id, *self._scope_for_agent(agent), peer)
+                if cur is not None:
+                    return protocol.build_task(
+                        task_id, context_id, cur["state"], cur.get("reply", ""),
+                        created_at=rec["created_iso"]), None
             protocol.persist_message(
                 context_id, "agent", reply, task_id, peer=peer, agent_slug=slug,
             )
@@ -1486,9 +1864,20 @@ class A2AAdapter(BasePlatformAdapter):
             },
         )
 
+        # Register the execution with an exact, task-scoped handle: this task's
+        # OWN dispatch Future, which spans the real gateway processing for this
+        # task only (the adapter-owned coroutine awaits handle_message — which
+        # returns after spawning _process_message_background — then waits on
+        # exactly the gateway task created FOR THIS event, by identity).
+        # tasks/cancel cancels THIS Future only; a sibling task on the same
+        # session is never touched.
+        self._register_task_exec(task_id, context_id, peer, slug, tenant=_tenant)
         try:
-            asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
+            turn_future = asyncio.run_coroutine_threadsafe(
+                self._run_local_turn(event), self._loop,
+            )
         except Exception as e:
+            self._cleanup_registered_task(task_id)
             self._pop_pending(task_id)
             msg = security.redact_outbound(f"Dispatch failed: {e}")
             self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
@@ -1497,6 +1886,10 @@ class A2AAdapter(BasePlatformAdapter):
                 task_id, context_id, protocol.STATE_FAILED, msg,
                 created_at=rec["created_iso"],
             ), None
+        entry = self._registered_task(task_id)
+        if entry is not None:
+            with entry["lock"]:
+                entry["local_future"] = turn_future
 
         self.tasks.set_state(task_id, protocol.STATE_WORKING)
         return None, {
@@ -1508,6 +1901,88 @@ class A2AAdapter(BasePlatformAdapter):
             "created_iso": rec["created_iso"],
             "started": time.time(),
         }
+
+    async def _run_local_turn(self, event: MessageEvent) -> None:
+        """Adapter-owned dispatch coroutine for one local A2A task.
+
+        The returned Future (via run_coroutine_threadsafe) is the task's exact
+        execution handle: it spans the REAL gateway processing for this task
+        only. ``handle_message`` returns after spawning the session's
+        ``_process_message_background`` task, so this coroutine captures the
+        gateway task identity created FOR THIS event (the first unseen
+        session task after dispatch) and waits on exactly that task — never
+        on whatever task later occupies the shared ``_session_tasks`` slot —
+        so a sibling task dispatched on the same session is neither observed
+        nor cancelled. When the shared slot is UNCHANGED after dispatch (the
+        event queued behind a busy session or was dropped), there is NO exact
+        handle for this turn: the coroutine returns unbound, and a cancel of
+        the dispatch Future correctly reports the stop UNCONFIRMED rather
+        than adopting a sibling's task. Cancelling this Future cancels only
+        this turn's own gateway task.
+        """
+        session_key = ""
+        try:
+            from gateway.session import build_session_key
+            _extra = getattr(self.config, "extra", {}) or {}
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=_extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=_extra.get("thread_sessions_per_user", False),
+                profile=self._session_key_profile(event.source),
+            )
+        except Exception:
+            pass
+        known_tasks = set()
+        if session_key:
+            try:
+                t = self._session_tasks.get(session_key)
+                if t is not None:
+                    known_tasks.add(id(t))
+            except Exception:
+                pass
+
+        await self.handle_message(event)
+
+        if not session_key:
+            return
+        # Capture the exact gateway task created FOR THIS event: the first
+        # session task we had not seen before dispatch. If the shared slot is
+        # UNCHANGED (this event queued behind a busy session or was dropped),
+        # there is NO exact handle for this turn — the slot still points at a
+        # sibling's running task, which must NEVER be adopted as ours (an
+        # adopted sibling would be observed and cancelled as this task).
+        own_task = None
+        try:
+            t = self._session_tasks.get(session_key)
+            if t is not None and id(t) not in known_tasks:
+                own_task = t
+        except Exception:
+            return
+        if own_task is None:
+            # Unbound: this turn has no provable exact execution handle.
+            # The dispatch Future returns now (nothing to wait on); a cancel
+            # of this Future will find no bound gateway task and will report
+            # the stop UNCONFIRMED — the correct, honest outcome.
+            return
+        # Wait on THIS task by identity until it finishes; never re-read the
+        # shared slot (a sibling may replace it).
+        while True:
+            done = getattr(own_task, "done", None)
+            try:
+                if done is None or done():
+                    return
+            except Exception:
+                return
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                # Confirmed-stop path: cancel THIS turn's exact gateway task,
+                # then re-raise so the dispatch Future ends cancelled.
+                try:
+                    own_task.cancel()
+                except Exception:
+                    pass
+                raise
 
     def _profile_state_db(self, profile: str) -> Optional[str]:
         home = _profile_home(profile)
@@ -1667,8 +2142,87 @@ class A2AAdapter(BasePlatformAdapter):
                 con.close()
 
     @staticmethod
-    def _terminate_profile_process_tree(proc: subprocess.Popen) -> None:
-        """Terminate and reap a timed-out Hermes child and all descendants."""
+    def _terminate_profile_process_tree(proc_or_entry) -> bool:
+        """Terminate and reap a Hermes child and all descendants.
+
+        Accepts either a ``subprocess.Popen`` or a registry ``entry`` dict.
+        When given an entry with captured pid/create_time/pgid identity, the
+        recorded process GROUP is signalled (TERM then KILL) only after
+        verifying the live process at that pid still matches the captured
+        create_time — so a reused PID can never route the signal to an
+        innocent process. The whole group is signalled (catches children that
+        escaped the psutil parent/child snapshot), then reaped. An identity
+        MISMATCH refuses to signal anything and returns False (unconfirmed) —
+        never falls back to raw-pid signalling.
+
+        Returns True when the whole tree is confirmed dead (group-liveness
+        postcondition), False when anything survived the bounded reap — callers
+        use False to treat the stop as unconfirmed rather than silently moving
+        on with a resistant process still alive."""
+        if isinstance(proc_or_entry, dict):
+            entry = proc_or_entry
+            proc = entry.get("proc")
+            pid = entry.get("pid")
+            create_time = entry.get("create_time")
+            pgid = entry.get("pgid")
+        else:
+            proc = proc_or_entry
+            pid = getattr(proc, "pid", None)
+            create_time = None
+            pgid = None
+        if proc is None:
+            return True
+
+        # PID-reuse guard: only signal the group if the live process at the
+        # recorded pid still matches the captured start time.
+        identity_ok = True
+        if pid is not None and create_time is not None:
+            try:
+                import psutil
+                live = psutil.Process(pid)
+                identity_ok = abs(live.create_time() - create_time) < 1.0
+            except Exception:
+                identity_ok = False  # process gone (or unreadable)
+        if not identity_ok:
+            # The process at the recorded pid is NOT the one we spawned (PID
+            # was reused). Signalling its group or tree would strike an
+            # innocent process. The original worker's fate is unknown, so the
+            # stop is UNCONFIRMED — never fall back to raw-pid signalling.
+            logger.warning(
+                "A2A: pid %s identity mismatch (create_time changed); refusing "
+                "to signal a possibly-reused PID — stop unconfirmed", pid)
+            return False
+
+        if pgid is not None and hasattr(os, "killpg"):
+            import signal
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            # Postcondition: the process group must be gone (no survivor).
+            try:
+                os.killpg(pgid, 0)
+                group_alive = True
+            except PermissionError:
+                group_alive = True  # exists but not ours — treat as alive
+            except OSError:
+                group_alive = False
+            if not group_alive and proc.poll() is not None:
+                return True
+            # Group survived (SIGKILL-immune uninterruptible sleep) or reap
+            # failed: fall through to psutil tree kill as a last resort.
+
         try:
             import psutil
 
@@ -1686,27 +2240,50 @@ class A2AAdapter(BasePlatformAdapter):
                 except psutil.NoSuchProcess:
                     pass
             if alive:
-                psutil.wait_procs(alive, timeout=2)
+                _, alive = psutil.wait_procs(alive, timeout=2)
+            # Postcondition: nothing in the tree may still be alive.
+            still = [t for t in targets if t.is_running() and t.status() != psutil.STATUS_ZOMBIE]
+            return not still
         except Exception:
             logger.debug("A2A: process-tree termination failed", exc_info=True)
             try:
                 proc.kill()
+                proc.wait(timeout=2)
+                return proc.poll() is not None
             except Exception:
-                pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
+                return False
 
-    def _run_profile_command(self, cmd: list[str], timeout: int, env: dict) -> tuple[int, str, str]:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            stdin=subprocess.DEVNULL,
-        )
+    def _run_profile_command(
+        self, cmd: list[str], timeout: int, env: dict, task_id: str = "",
+    ) -> tuple[int, str, str]:
+        # Spawn in its own process group so cancel can signal the whole tree
+        # (group identity), not just the captured parent + descendant snapshot.
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,  # new process group / session (POSIX)
+            )
+        except TypeError:
+            # Platform without start_new_session — fall back to plain spawn.
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                stdin=subprocess.DEVNULL,
+            )
+        # Close the pre-Popen window: if a cancel already won while we were
+        # spawning, kill this child immediately rather than letting an
+        # untracked worker run. Bind + check the terminal state atomically.
+        if self._bind_and_check_cancelled(task_id, proc):
+            self._terminate_profile_process_tree(proc)
+            return proc.returncode if proc.returncode is not None else -15, "", ""
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -1822,7 +2399,15 @@ class A2AAdapter(BasePlatformAdapter):
                 )
             start = time.time()
             try:
-                returncode, stdout, stderr = self._run_profile_command(cmd, timeout, env)
+                try:
+                    returncode, stdout, stderr = self._run_profile_command(cmd, timeout, env, task_id=task_id)
+                except TypeError as e:
+                    # Tests and older stubs patch _run_profile_command with a
+                    # 3-arg callable that predates the task_id parameter; fall
+                    # back so those doubles keep working (no abort tracking).
+                    if "task_id" not in str(e):
+                        raise
+                    returncode, stdout, stderr = self._run_profile_command(cmd, timeout, env)
             except subprocess.TimeoutExpired:
                 if not session_id:
                     session_id = self._latest_a2a_session(profile, start)
@@ -1902,6 +2487,23 @@ class A2AAdapter(BasePlatformAdapter):
                 state = protocol.STATE_INPUT_REQUIRED
                 reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
 
+        # Terminal transition first: complete() is a single-winner CAS that
+        # refuses to clobber CANCELED/CANCEL_REQUESTED. Side effects
+        # (persist/audit/metrics/push) fire ONLY when this wins, so a late or
+        # losing worker cannot leak a reply after a cancel already settled.
+        settled = self.tasks.complete(task_id, state, reply)
+        if settled is None:
+            cur = self.tasks.get(task_id, agent_slug=agent_slug)
+            if cur is not None:
+                return cur["state"], cur.get("reply", "")
+            return state, reply
+
+        # Only after the terminal transition won do we settle the registry
+        # entry — and only when the exact worker is positively done (or its
+        # stop was confirmed). A stop-requested-unconfirmed entry stays
+        # quarantined: normal completion must not drop containment.
+        self._settle_registered_task(task_id)
+
         protocol.persist_message(
             context_id, "agent", reply, task_id,
             peer=peer, agent_slug=agent_slug,
@@ -1915,7 +2517,6 @@ class A2AAdapter(BasePlatformAdapter):
         else:
             protocol.metrics.tasks_failed += 1
 
-        self.tasks.complete(task_id, state, reply)
         self._send_push_notification(task_id, context_id, reply, state)
         return state, reply
 
@@ -1933,13 +2534,16 @@ class A2AAdapter(BasePlatformAdapter):
                 return fut.result(timeout=_SSE_KEEPALIVE if keepalive else max(0.0, deadline - time.time()))
             except FuturesTimeout:
                 if time.time() >= deadline:
+                    self._settle_task_timeout(pending["task_id"])
                     return (protocol.STATE_FAILED, "[agent did not reply in time]")
                 if keepalive:
                     try:
                         keepalive()
                     except Exception:
+                        self._settle_task_disconnect(pending["task_id"])
                         return (protocol.STATE_FAILED, "[client disconnected]")
             except Exception:
+                self._settle_task_timeout(pending["task_id"])
                 return (protocol.STATE_FAILED, "[agent did not reply in time]")
 
     def _rpc_message_send(
@@ -2110,8 +2714,17 @@ class A2AAdapter(BasePlatformAdapter):
         })
 
     def _rpc_tasks_cancel(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer: str = "") -> dict:
+        """Cancel a task with a true, bounded stop.
+
+        Flow (settled design): mark cancel_requested first (CAS so exactly one
+        caller wins), then stop the underlying worker and wait (bounded) for
+        confirmation, then perform the terminal CAS. Persistence/audit/push/
+        SSE/turn-reset side effects run only for the terminal-CAS winner, so a
+        resistant or already-completed worker cannot leak late side effects.
+        """
         task_id = str(params.get("taskId") or params.get("id") or "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent), peer)
+        scope = self._scope_for_agent(agent)
+        rec = self.tasks.get(task_id, *scope, peer)
         if not rec:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
@@ -2119,11 +2732,84 @@ class A2AAdapter(BasePlatformAdapter):
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_CANCELABLE,
                 f"task {task_id} already {rec['state']}")
-        self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
-        self._turns.reset(rec["context_id"])
-        self._resolve_task(task_id, protocol.STATE_CANCELED, "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent), peer) or rec
+
+        # Verify the caller's scope against the registered execution, when one
+        # exists — a task-id-only match must not let a caller cancel a task
+        # outside its immutable peer+agent+tenant+context scope.
+        entry = self._registered_task(task_id)
+        if entry is not None:
+            req_agent, req_tenant = scope
+            if (
+                str(entry.get("peer") or "") != str(rec.get("peer") or "")
+                or str(entry.get("agent_slug") or "") != str(rec.get("agent_slug") or "")
+                or str(entry.get("context_id") or "") != str(rec.get("context_id") or "")
+                or str(entry.get("tenant") or "") != str(req_tenant or rec.get("tenant") or "")
+            ):
+                return protocol.jsonrpc_error(
+                    req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
+
+        # Step 1: single-winner CAS to cancel_requested. Whoever loses this CAS
+        # is not the terminal winner and must not perform side effects.
+        won = self.tasks.compare_and_set_state(
+            task_id,
+            (protocol.STATE_SUBMITTED, protocol.STATE_WORKING, protocol.STATE_INPUT_REQUIRED),
+            protocol.STATE_CANCEL_REQUESTED,
+        )
+        if won is None:
+            # Another path already moved it (cancel in flight, or it completed).
+            rec = self.tasks.get(task_id, *scope, peer) or rec
+            if rec["state"] in protocol.TERMINAL_STATES:
+                return protocol.jsonrpc_error(
+                    req_id, protocol.ERR_TASK_NOT_CANCELABLE,
+                    f"task {task_id} already {rec['state']}")
+            # cancel already requested by another caller; report current state.
+            return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec))
+
+        # Step 2: bounded stop, then terminal CAS winner performs side effects.
+        stopped = self._stop_registered_task(task_id)
+        self._finalize_cancel(task_id, rec, peer=peer, scope=scope, stopped=stopped)
+
+        rec = self.tasks.get(task_id, *scope, peer) or rec
         return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec))
+
+    def _finalize_cancel(self, task_id: str, rec: dict, *, peer: str, scope, stopped: bool) -> None:
+        """Settle a cancel-request after the bounded stop window.
+
+        CONFIRMED stop: the terminal CAS winner transitions to CANCELED and the
+        registry entry is settled and removed. NO persistence/audit/metrics/
+        push side effects fire for a canceled task — cancel suppresses ALL
+        post-cancel side effects (not merely single-winner gates them). SSE
+        subscribers and tasks/get observe the state transition through the
+        store/watchers themselves.
+
+        UNCONFIRMED stop (resistant worker): the task must NOT terminalize and
+        NO terminal side effects may fire. The record stays in non-terminal
+        CANCEL_REQUESTED (queryable) and the registry entry stays QUARANTINED
+        — its exact handle retained. The orphan watchdog keeps re-attempting
+        containment on each sweep; only a POSITIVE stop settles the task.
+        """
+        if not stopped:
+            logger.warning(
+                "A2A: task %s cancel stop was NOT confirmed within the bounded "
+                "wait; worker may be orphaned. Task stays non-terminal "
+                "cancel_requested (quarantined, no side effects); the watchdog "
+                "will keep attempting containment.", task_id)
+            # Registry entry intentionally NOT settled/removed: quarantined.
+            return
+        final = self.tasks.compare_and_set_state(
+            task_id, (protocol.STATE_CANCEL_REQUESTED,), protocol.STATE_CANCELED, "",
+        )
+        if final is None:
+            logger.debug("A2A: cancel terminal CAS lost for task %s (already settled)", task_id)
+            self._settle_registered_task(task_id)
+            return
+        context_id = str(rec.get("context_id") or final.get("context_id") or "")
+        self._turns.reset(context_id)
+        # Resolve the HTTP waiter so message/send returns the canceled state.
+        # No persistence, audit, metrics, or push: cancel suppresses all
+        # post-cancel side effects.
+        self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+        self._settle_registered_task(task_id)
 
     # ── Push notifications ────────────────────────────────────────────────
 
@@ -2283,6 +2969,17 @@ class A2AAdapter(BasePlatformAdapter):
         task_id = str(getattr(event, "message_id", "") or "")
         if not task_id:
             return
+        # Set the registry stop latch when the run is interrupted so a
+        # concurrent tasks/cancel observes confirmed stop promptly.
+        if outcome == ProcessingOutcome.CANCELLED:
+            entry = self._registered_task(task_id)
+            if entry is not None and entry.get("stop_requested"):
+                stop_latch = entry.get("stop_latch")
+                if stop_latch is not None:
+                    try:
+                        stop_latch.set()
+                    except Exception:
+                        pass
         if outcome == ProcessingOutcome.FAILURE:
             self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
         elif outcome == ProcessingOutcome.CANCELLED:

@@ -44,8 +44,20 @@ STATE_COMPLETED = "TASK_STATE_COMPLETED"
 STATE_FAILED = "TASK_STATE_FAILED"
 STATE_CANCELED = "TASK_STATE_CANCELED"
 STATE_REJECTED = "TASK_STATE_REJECTED"
+# Non-terminal marker: a cancel was requested; the underlying worker is being
+# stopped. The terminal CAS winner (see adapter._rpc_tasks_cancel) performs
+# the actual stop confirmation, then transitions to CANCELED. Side-effect
+# paths must not fire while a task sits in this state.
+STATE_CANCEL_REQUESTED = "TASK_STATE_CANCEL_REQUESTED"
 
 TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
+
+# A cancel holds CANCEL_REQUESTED (non-terminal) until its exact worker
+# confirms stop. Only a POSITIVE confirmation may transition to terminal
+# CANCELED and emit terminal side effects. An UNCONFIRMED stop must leave the
+# task non-terminal (CANCEL_REQUESTED, quarantined) with no terminal effects;
+# the watchdog later surfaces the stuck cancel as a containment failure.
+CANCEL_SETTLE_TIMEOUT = 10.0
 
 # A2A v1.0 message roles.
 ROLE_USER = "ROLE_USER"
@@ -622,7 +634,9 @@ class TaskStore:
     def set_state(self, task_id: str, state: str) -> None:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if rec and rec["state"] not in TERMINAL_STATES:
+            # Do not overwrite a cancel-in-progress marker: the cancel winner
+            # owns the transition out of CANCEL_REQUESTED.
+            if rec and rec["state"] not in TERMINAL_STATES and rec["state"] != STATE_CANCEL_REQUESTED:
                 rec["state"] = state
 
     def set_push_config(self, task_id: str, url: str,
@@ -691,11 +705,16 @@ class TaskStore:
             return dict(rec)
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
-        """Transition a task to a terminal state. Idempotent."""
+        """Transition a task to a terminal state. Idempotent.
+
+        Refuses to clobber a task in CANCEL_REQUESTED: the cancel path owns
+        that task's stop and terminal transition, so a late or losing worker
+        completion cannot steal the record during the bounded stop window.
+        """
         watchers: list[Future] = []
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or rec["state"] in TERMINAL_STATES:
+            if not rec or rec["state"] in TERMINAL_STATES or rec["state"] == STATE_CANCEL_REQUESTED:
                 return None
             rec["state"] = state
             rec["reply"] = reply
@@ -706,6 +725,33 @@ class TaskStore:
         for fut in watchers:
             if not fut.done():
                 fut.set_result((state, reply))
+        return out
+
+    def compare_and_set_state(self, task_id: str, expected: tuple, new_state: str,
+                              reply: str = "") -> Optional[dict]:
+        """CAS: transition ``task_id`` to ``new_state`` only if its current
+        state is in ``expected``. Returns the updated record on success, None
+        otherwise. Wakes watchers so subscribers/streamers see the transition.
+        Used to enforce single-winner cancel and to make cancel side effects
+        fire only for the terminal-CAS winner."""
+        watchers: list[Future] = []
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec["state"] not in expected:
+                return None
+            rec["state"] = new_state
+            if new_state in TERMINAL_STATES:
+                rec["reply"] = reply
+                rec["completed_at"] = time.time()
+                # Only terminal transitions resolve watchers — a non-terminal
+                # cancel_requested marker must not unblock subscribers with a
+                # false terminal-looking result.
+                watchers = self._watchers.pop(task_id, [])
+            self._trim_locked()
+            out = dict(rec)
+        for fut in watchers:
+            if not fut.done():
+                fut.set_result((new_state, reply))
         return out
 
     def watch(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[Future]:
@@ -752,6 +798,11 @@ class TaskStore:
             return page, next_offset, total
         return page, next_offset
 
+    def tasks_in_state(self, state: str) -> list[str]:
+        """Return task ids currently in ``state`` (any scope)."""
+        with self._lock:
+            return [tid for tid, rec in self._tasks.items() if rec["state"] == state]
+
     def fail_orphans(
         self,
         timeout_seconds: int = 300,
@@ -775,6 +826,10 @@ class TaskStore:
             stale = [
                 tid for tid, rec in self._tasks.items()
                 if rec["state"] not in TERMINAL_STATES
+                # A stuck CANCEL_REQUESTED (unconfirmed stop, quarantined) is
+                # NOT failed here: it stays non-terminal until a POSITIVE stop
+                # confirms containment (the adapter watchdog keeps retrying).
+                and rec["state"] != STATE_CANCEL_REQUESTED
                 and now - rec["created_at"] > _deadline(rec)
             ]
         failed = []
