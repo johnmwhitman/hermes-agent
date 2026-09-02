@@ -726,7 +726,13 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    admit_execution,
+    create_execution,
+    execution_owned_by,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -7003,8 +7009,19 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         execution_id = job.get("execution_id")
         if not execution_id:
             return
+        # Carry any caller-supplied owner_token through to the
+        # owner-fenced finish_execution; this guarantees the close-out
+        # only lands when WE inserted the row (or when an existing row's
+        # owner_token matches — back-compat for paths that re-use an
+        # execution_id without minting fresh).
+        _owner_token = job.get("_execution_owner_token")
         try:
-            finish_execution(execution_id, success=False, error=error)
+            finish_execution(
+                execution_id,
+                success=False,
+                error=error,
+                owner_token=_owner_token,
+            )
         except Exception:
             logger.warning(
                 "Job '%s': failed to close unstarted execution ledger row",
@@ -7202,9 +7219,80 @@ def _run_one_job_body(
             fire_claim_lost.set()
         return True
 
-    execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+    execution_owner_token: Optional[str] = None
+    execution_id: str = ""
+    if job.get("_execution_owner_token"):
+        # Provider path already minted + carried an owner_token through
+        # claim_fire. The caller asserts ownership — do NOT re-admit. Just
+        # validate the carried token still matches the persisted row, so a
+        # parallel worker that already finished + cleared the row (or
+        # switched owners) is detected and aborted BEFORE run_job.
+        execution_id = job.get("execution_id") or ""
+        execution_owner_token = job["_execution_owner_token"]
+        if not execution_id:
+            # Defensive: provider forgot execution_id. Fail closed — the
+            # token alone is not enough; the body is targeted by id.
+            logger.info(
+                "Job '%s': provider path supplied owner_token without "
+                "execution_id; failing closed",
+                job.get("name", job["id"]),
+            )
+            return False
+        _owned = execution_owned_by(
+            execution_id, execution_owner_token,
+            allowed_statuses=frozenset({"claimed", "running"}),
+        )
+        if not _owned:
+            logger.info(
+                "Job '%s': provider execution_id/token mismatch or row "
+                "no longer owned/active; skipping body",
+                job.get("name", job["id"]),
+            )
+            return False
+    else:
+        execution_id = job.get("execution_id") or ""
+        execution_owner_token = job.get("_execution_owner_token")
+        if execution_id and not execution_owner_token:
+            # Caller supplied an execution_id without an owner_token. This
+            # is unsafe — the id could belong to another owner's row, and
+            # re-admitting would either dedup onto a winner's row OR
+            # succeed in inserting a competing row. Fail closed.
+            logger.info(
+                "Job '%s': execution_id supplied without owner_token; "
+                "failing closed (refuse to re-admit or run against an "
+                "unknown row)",
+                job.get("name", job["id"]),
+            )
+            return False
+        if execution_id and execution_owner_token:
+            # Built-in path that already admitted (e.g. _submit_with_guard
+            # set both fields). Validate; do NOT re-admit.
+            if not execution_owned_by(
+                execution_id, execution_owner_token,
+                allowed_statuses=frozenset({"claimed", "running"}),
+            ):
+                logger.info(
+                    "Job '%s': builtin path execution_id/token mismatch; "
+                    "skipping body",
+                    job.get("name", job["id"]),
+                )
+                return False
+        else:
+            # Direct call site with no execution_id at all (e.g. an
+            # operator-driven manual run). Admit fresh, then proceed only
+            # if owned.
+            record, execution_owner_owned, execution_owner_token = (
+                admit_execution(job["id"], source="direct")
+            )
+            execution_id = record["id"]
+            if not execution_owner_owned:
+                logger.info(
+                    "Job '%s': lost execution admission race (direct "
+                    "call); skipping body — another worker owns the "
+                    "active row",
+                    job.get("name", job["id"]),
+                )
+                return False
     delivery_attempted = False
     delivery_error = None
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
@@ -7236,12 +7324,24 @@ def _run_one_job_body(
                 execution_id,
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
+                owner_token=execution_owner_token,
             )
             return True  # not an error — already handled/removed
 
         # The attempt is claimed durably before executor/provider dispatch and
-        # becomes running only immediately before the actual run.
-        mark_execution_running(execution_id)
+        # becomes running only immediately before the actual run. The mark is
+        # owner-fenced (successor to da0c5b5c22): a None return here means we
+        # lost the body race — abort BEFORE run_job, BEFORE delivery, BEFORE
+        # any side effect.
+        if not mark_execution_running(
+            execution_id, owner_token=execution_owner_token
+        ):
+            logger.info(
+                "Job '%s': mark_execution_running refused (lost owner race "
+                "or already terminalized); skipping body",
+                job.get("name", job["id"]),
+            )
+            return False
 
         # Run and deliver under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is active, and cron
@@ -7309,12 +7409,14 @@ def _run_one_job_body(
                     execution_id,
                     success=False,
                     error="Interrupted by shutdown before terminal completion.",
+                    owner_token=execution_owner_token,
                 )
             else:
                 finish_execution(
                     execution_id,
                     success=False,
                     error="Fire claim ownership lost; stale result was discarded.",
+                    owner_token=execution_owner_token,
                 )
             return True
 
@@ -7495,12 +7597,14 @@ def _run_one_job_body(
                     execution_id,
                     success=False,
                     error="Interrupted by shutdown before terminal completion.",
+                    owner_token=execution_owner_token,
                 )
             else:
                 finish_execution(
                     execution_id,
                     success=False,
                     error="Fire claim ownership lost; stale result was discarded.",
+                    owner_token=execution_owner_token,
                 )
             return True
 
@@ -7534,6 +7638,7 @@ def _run_one_job_body(
                 execution_id,
                 success=False,
                 error="Interrupted by gateway shutdown before terminal completion.",
+                owner_token=execution_owner_token,
             )
             return True
 
@@ -7548,6 +7653,7 @@ def _run_one_job_body(
                 execution_id,
                 success=False,
                 error="Fire claim ownership lost before terminal completion.",
+                owner_token=execution_owner_token,
             )
             return True
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
@@ -7574,6 +7680,7 @@ def _run_one_job_body(
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
+            owner_token=execution_owner_token,
         )
         return True
 
@@ -7669,6 +7776,7 @@ def _run_one_job_body(
                 success=False,
                 error=_err_text,
                 delivery_outcome=delivery_outcome,
+                owner_token=execution_owner_token,
             )
         except Exception as record_err:
             logger.error(
@@ -8091,6 +8199,7 @@ def tick(
                 finish_execution(
                     job["execution_id"],
                     success=False,
+                    owner_token=job.get("_execution_owner_token"),
                     error="Fire claim lost; execution was not started.",
                 )
                 return True
@@ -8099,6 +8208,13 @@ def tick(
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
+            # Carry the owner_token through to run_one_job's claimed_job so
+            # _run_one_job_body can pass it to every owner-fenced
+            # mark/finish. The submit-guard already minted + persisted it.
+            if job.get("_execution_owner_token") is not None:
+                claimed_job["_execution_owner_token"] = job[
+                    "_execution_owner_token"
+                ]
             return run_one_job(
                 claimed_job,
                 adapters=adapters,
@@ -8164,11 +8280,46 @@ def tick(
             if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                 return None
-            # Record the attempt before executor dispatch. Recovery classifies
-            # abandoned records as unknown; it never automatically retries them.
+            # Owner-safe admission (successor to da0c5b5c22): admit BEFORE
+            # submit so a concurrent tick that already owns the active row
+            # is never executed against by THIS worker. If we lose, abort
+            # cleanly (release the in-flight claim) and return None — the
+            # dispatch NEVER happens for a non-owner.
             try:
-                execution = create_execution(job_id, source="builtin")
-                dispatched_job = dict(job, execution_id=execution["id"])
+                (
+                    _execution,
+                    _owned,
+                    _execution_owner_token,
+                ) = admit_execution(job_id, source="builtin")
+            except Exception as admission_err:
+                release_running_job(job_id)
+                _clear_run_claim_best_effort()
+                logger.exception(
+                    "Job '%s' not dispatched: execution admission failed: %s",
+                    job.get("name", job_id),
+                    admission_err,
+                )
+                return None
+            if not _owned:
+                # Lost the unique-index admission — another worker is the
+                # owner. Release our in-flight claim and skip without
+                # submitting. The owner's run continues; we leave its row
+                # untouched.
+                release_running_job(job_id)
+                _clear_run_claim_best_effort()
+                logger.info(
+                    "Job '%s' not dispatched — lost execution admission "
+                    "race to another worker",
+                    job.get("name", job_id),
+                )
+                return None
+            execution_id = _execution["id"]
+            try:
+                dispatched_job = dict(
+                    job,
+                    execution_id=execution_id,
+                    _execution_owner_token=_execution_owner_token,
+                )
                 _ctx = contextvars.copy_context()
             except Exception as execution_err:
                 # Init/creation failure between the claim and the submit —
@@ -8176,6 +8327,20 @@ def tick(
                 # retry instead of wedging on 'already running' forever (the
                 # audit requirement: every add is paired with guaranteed
                 # cleanup).
+                # We are the owner — finish the row we inserted.
+                try:
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        owner_token=_execution_owner_token,
+                        error=f"Dispatch setup failed: {execution_err}",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not close execution row %s after setup failure",
+                        execution_id,
+                        exc_info=True,
+                    )
                 release_running_job(job_id)
                 _clear_run_claim_best_effort()
                 logger.exception(
@@ -8196,11 +8361,20 @@ def tick(
             except Exception as submit_err:
                 release_running_job(job_id)
                 _clear_run_claim_best_effort()
-                finish_execution(
-                    execution["id"],
-                    success=False,
-                    error=f"Executor dispatch failed: {submit_err}",
-                )
+                # We are the owner — finish the row we inserted.
+                try:
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        owner_token=_execution_owner_token,
+                        error=f"Executor dispatch failed: {submit_err}",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not close execution row %s after submit failure",
+                        execution_id,
+                        exc_info=True,
+                    )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):

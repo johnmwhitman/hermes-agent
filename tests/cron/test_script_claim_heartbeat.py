@@ -386,13 +386,15 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
         "name": "reclaimed agent",
         "prompt": "work",
         "execution_id": "stale-execution",
+        "_execution_owner_token": "tok-stale-execution",
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "stale-owner"},
     }
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _heartbeat)
     monkeypatch.setattr(scheduler, "run_job", _run_job)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda job_id: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda execution_id: None)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda execution_id, **_kw: {"id": execution_id})
+    monkeypatch.setattr(scheduler, "execution_owned_by", lambda _id, _tok, **_kw: True)
     monkeypatch.setattr(scheduler, "finish_execution", lambda *args, **kwargs: None)
     save_output = MagicMock()
     deliver_result = MagicMock()
@@ -412,7 +414,12 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
 
 
 def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatch):
-    """A stale claimed snapshot rejected before body entry must close its ledger row."""
+    """A stale claimed snapshot rejected before body entry must close its ledger row.
+
+    Ownerless legacy snapshot: the job carries no ``_execution_owner_token``,
+    so the fail-closed close-out MUST pass ``owner_token=None so the transition
+    gate refuses to mutate the un-owned row instead of silently succeeding.
+    """
     import cron.scheduler as scheduler
 
     run_body = MagicMock(return_value=True)
@@ -433,6 +440,7 @@ def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatc
         "stale-execution",
         success=False,
         error="Fire claim ownership lost before execution started.",
+        owner_token=None,
     )
 
 
@@ -459,7 +467,12 @@ def test_initially_lost_claim_does_not_run_when_ledger_write_fails(monkeypatch):
 
 
 def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
-    """Unconfirmed initial ownership must fail closed before any side effect."""
+    """Unconfirmed initial ownership must fail closed before any side effect.
+
+    Ownerless legacy snapshot: the job carries no ``_execution_owner_token``,
+    so the fail-closed close-out MUST pass ``owner_token=None so the transition
+    gate refuses to mutate the un-owned row instead of silently succeeding.
+    """
     import cron.scheduler as scheduler
 
     run_body = MagicMock(return_value=True)
@@ -484,11 +497,17 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
         "validation-execution",
         success=False,
         error="Fire claim ownership could not be validated before execution started.",
+        owner_token=None,
     )
 
 
 def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
-    """A claimed job cannot run when no renewal monitor protects its lease."""
+    """A claimed job cannot run when no renewal monitor protects its lease.
+
+    Ownerless legacy snapshot: same fail-closed contract as the initial
+    validation-loss case above - no token carried, transition gate must be
+    passed ``owner_token=None and refused.
+    """
     import cron.scheduler as scheduler
 
     run_body = MagicMock(return_value=True)
@@ -514,6 +533,7 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
         "thread-execution",
         success=False,
         error="Fire claim heartbeat could not be started; execution was not run.",
+        owner_token=None,
     )
 
 
@@ -558,13 +578,19 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     job = {
         "id": "terminal-cas",
         "execution_id": "execution-cas",
+        "_execution_owner_token": "tok-terminal-cas",
         "name": "terminal-cas",
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
     }
     finish = MagicMock()
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args, **_kwargs: {"id": "execution-cas"})
+    monkeypatch.setattr(
+        scheduler,
+        "execution_owned_by",
+        lambda _id, _tok, **_kw: True,
+    )
     monkeypatch.setattr(
         scheduler,
         "run_job",
@@ -581,8 +607,16 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
          patch("agent.secret_scope.reset_secret_scope"):
         assert scheduler.run_one_job(job) is True
 
-    finish.assert_called_once_with(
-        "execution-cas",
-        success=False,
-        error="Fire claim ownership lost before terminal completion.",
-    )
+    finish.assert_called_once()
+    call = finish.call_args
+    # production calls with owner_token= as well; verify the
+    # identity/intent of the call rather than the full signature.
+    assert call.args[0] == "execution-cas"
+    assert call.kwargs.get("success") is False
+    assert call.kwargs.get(
+        "error"
+    ) == "Fire claim ownership lost before terminal completion."
+    # The job's _execution_owner_token MUST be carried through to the
+    # owner-fenced finish_execution so the transition gate can verify
+    # against the persisted row's token (successor to da0c5b5c22).
+    assert call.kwargs.get("owner_token") == "tok-terminal-cas"

@@ -403,8 +403,9 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     )
     monkeypatch.setattr(
         executions,
-        "create_execution",
-        lambda jid, source: events.append("ledger") or {"id": "exec-1"},
+        "admit_execution",
+        lambda jid, source: events.append("ledger")
+        or ({"id": "exec-1"}, True, "tok-1"),
     )
     monkeypatch.setattr(
         sched,

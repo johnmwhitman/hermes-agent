@@ -204,11 +204,60 @@ class CronScheduler(ABC):
         Webhook transports call this synchronously before acknowledging the
         external scheduler, then pass the exact owner-bearing snapshot to
         ``fire_claimed`` in tracked background work.
+
+        Owner-safe contract (successor to da0c5b5c22 — REQUIRED INVARIANT):
+
+          * ONLY ``admit_execution`` mints the token; this method NEVER
+            pre-mints a separate token (that path always disagrees with
+            the persisted token and breaks the fence for the legitimate
+            owner).
+          * If the admit returns ``owned=False`` we lost the admission
+            race — we MUST NOT call ``finish_execution`` against the
+            owner's row, MUST NOT insert anything, and MUST return None.
+          * If the admit returns ``owned=True`` we win — we carry the
+            exact token ``admit_execution`` returned (which IS the
+            persisted token, by construction) through ``claimed_job``
+            under ``_execution_owner_token`` so the downstream
+            ``fire_claimed`` / ``run_job`` can pass it to every
+            owner-fenced transition.
+          * On the lost-fire-claim branches, only finish when WE are
+            the owner. The owner's row stays active until the owner
+            itself finishes it.
         """
-        from cron.executions import create_execution, finish_execution
+        from cron.executions import (
+            admit_execution,
+            finish_execution,
+        )
         from cron.jobs import claim_job_for_fire
 
-        execution = create_execution(job_id, source=self.name)
+        try:
+            execution, owned, owner_token = admit_execution(
+                job_id, source=self.name
+            )
+        except BaseException:
+            raise
+
+        execution_id = execution["id"]
+        if not owned:
+            # We lost the unique-index admission. Another worker owns the
+            # active row. Per the documented ``claim_fire`` contract, the
+            # loser returns None silently — the caller treats None as
+            # "lost; abort". We MUST NOT call finish_execution against
+            # the owner's row (the owner is still progressing) and MUST
+            # NOT insert anything. The owner_token returned by
+            # admit_execution is already None per the loser contract.
+            return None
+
+        # We are the owner. The owner_token returned by admit_execution is
+        # the EXACT token persisted to the row — by construction they
+        # originate from the same call. Sanity-check the local token is
+        # non-None (defensive: we already returned None for the loser
+        # branch above, so reaching here with None would be a programming
+        # error in admit_execution).
+        assert owner_token is not None, (
+            "admit_execution owned=True contract violation: token is None"
+        )
+
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
@@ -216,19 +265,29 @@ class CronScheduler(ABC):
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:
             finish_execution(
-                execution["id"],
+                execution_id,
                 success=False,
-                error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
+                owner_token=owner_token,
+                error=(
+                    f"Fire claim failed before dispatch: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
             )
             raise
         if not isinstance(claimed_job, dict):
             finish_execution(
-                execution["id"],
+                execution_id,
                 success=False,
+                owner_token=owner_token,
                 error="Fire claim was not acquired",
             )
             return None
-        claimed_job["execution_id"] = execution["id"]
+        claimed_job["execution_id"] = execution_id
+        # Stash the owner token on the claimed snapshot so the eventual
+        # run_job body (and finish_execution in cron.scheduler.run_job)
+        # can pass expected_owner through and stay owner-fenced end to
+        # end. The token is non-None because we won the admission.
+        claimed_job["_execution_owner_token"] = owner_token
         return claimed_job
 
     def fire_claimed(

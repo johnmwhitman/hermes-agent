@@ -1,4 +1,16 @@
-"""Durable cron execution-ledger behavior."""
+"""Durable cron execution-ledger behavior.
+
+The successor-to-da0c5b5c22 owner-safe redesign mints an
+``owner_token`` on every active row and refuses any public mutation
+without it. The legacy ``create_execution`` wrapper mints but
+discards the token (its callers cannot drive the transition). For
+tests that exercise transitions we use :func:`_claim` below — it
+calls ``admit_execution`` and returns ``(record, owner_token)`` so
+the caller can thread the token through ``mark_execution_running``
+and ``finish_execution``. Tests that only assert ledger shape (list /
+latest / counts) keep using ``create_execution`` — the public record
+contract is unchanged for them.
+"""
 
 from __future__ import annotations
 
@@ -17,20 +29,34 @@ def _point_ledger(monkeypatch, tmp_path):
     return executions
 
 
+def _claim(executions, job_id: str, *, source: str = "builtin"):
+    """Admit a claim and return ``(record, owner_token)``.
+
+    Equivalent to ``create_execution`` in that the row is inserted and
+    the record is returned, BUT it preserves the ``owner_token`` so the
+    caller can drive mark/finish transitions. The strict owner-fence
+    refuses any mutation without the matching token.
+    """
+    record, _owned, owner_token = executions.admit_execution(
+        job_id, source=source
+    )
+    return record, owner_token
+
+
 def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
 
-    claimed = executions.create_execution("job-1", source="builtin")
+    claimed, token = _claim(executions, "job-1")
     assert claimed["status"] == "claimed"
     assert claimed["claimed_at"]
     assert claimed["started_at"] is None
     assert claimed["finished_at"] is None
 
-    running = executions.mark_execution_running(claimed["id"])
+    running = executions.mark_execution_running(claimed["id"], owner_token=token)
     assert running["status"] == "running"
     assert running["started_at"]
 
-    completed = executions.finish_execution(claimed["id"], success=True)
+    completed = executions.finish_execution(claimed["id"], success=True, owner_token=token)
     assert completed["status"] == "completed"
     assert completed["finished_at"]
     assert completed["error"] is None
@@ -59,12 +85,12 @@ def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path
 
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
-    record = executions.create_execution("immutable", source="builtin")
-    executions.mark_execution_running(record["id"])
-    executions.finish_execution(record["id"], success=True)
+    record, token = _claim(executions, "immutable")
+    executions.mark_execution_running(record["id"], owner_token=token)
+    executions.finish_execution(record["id"], success=True, owner_token=token)
 
     assert executions.finish_execution(
-        record["id"], success=False, error="late writer"
+        record["id"], success=False, error="late writer", owner_token=token,
     ) is None
     assert executions.latest_execution("immutable")["status"] == "completed"
 
@@ -72,11 +98,13 @@ def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
 def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)
-    inflight = executions.create_execution("live", source="builtin")
-    executions.mark_execution_running(inflight["id"])
+    inflight, inflight_token = _claim(executions, "live")
+    executions.mark_execution_running(inflight["id"], owner_token=inflight_token)
     for index in range(8):
-        row = executions.create_execution(f"done-{index}", source="builtin")
-        executions.finish_execution(row["id"], success=True)
+        row, row_token = _claim(executions, f"done-{index}")
+        # Force the row terminal first so the dedup index lets a new
+        # one in for the next iteration of the loop.
+        executions.finish_execution(row["id"], success=True, owner_token=row_token)
 
     records = executions.list_executions(limit=100)
     assert len([row for row in records if row["status"] == "completed"]) == 3
@@ -95,8 +123,8 @@ def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
 
 def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
     executions = _point_ledger(monkeypatch, tmp_path)
-    row = executions.create_execution("cli-job", source="builtin")
-    executions.finish_execution(row["id"], success=False, error="boom")
+    row, token = _claim(executions, "cli-job")
+    executions.finish_execution(row["id"], success=False, error="boom", owner_token=token)
     from hermes_cli.cron import cron_runs
 
     cron_runs("cli-job", limit=10)
@@ -116,8 +144,10 @@ def test_quick_backup_includes_execution_ledger():
 def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
 
-    record = executions.create_execution("job-2", source="external")
-    failed = executions.finish_execution(record["id"], success=False, error="provider exploded")
+    record, token = _claim(executions, "job-2", source="external")
+    failed = executions.finish_execution(
+        record["id"], success=False, error="provider exploded", owner_token=token,
+    )
 
     assert failed["status"] == "failed"
     assert failed["error"] == "provider exploded"
@@ -125,8 +155,8 @@ def test_failed_execution_keeps_error(monkeypatch, tmp_path):
 
 def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
-    record = executions.create_execution("still-live", source="builtin")
-    executions.mark_execution_running(record["id"])
+    record, token = _claim(executions, "still-live")
+    executions.mark_execution_running(record["id"], owner_token=token)
 
     assert executions.recover_interrupted_executions() == 0
     assert executions.latest_execution("still-live")["status"] == "running"
@@ -191,9 +221,16 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
             raise ValueError("executor rejected")
 
     finished = []
+    # Successor to da0c5b5c22: the scheduler now admits via
+    # ``admit_execution`` and threads the owner_token through
+    # ``finish_execution``. Patch the deterministic shape (record +
+    # owned=True + token) so the test asserts the owner-safe
+    # semantics, not the random uuid of a real admit.
     monkeypatch.setattr(
-        scheduler, "create_execution",
-        lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
+        scheduler, "admit_execution",
+        lambda _job_id, **_kw: (
+            {"id": "exec-submit-fail"}, True, "tok-submit",
+        ),
     )
     monkeypatch.setattr(
         scheduler, "finish_execution",
@@ -207,6 +244,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     assert finished == [
         ("exec-submit-fail", {
             "success": False,
+            "owner_token": "tok-submit",
             "error": "Executor dispatch failed: executor rejected",
         })
     ]
@@ -218,17 +256,27 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
 
     events = []
     run_execution_ids = []
+    # Successor to da0c5b5c22: the carried-token validation now uses
+    # ``execution_owned_by``. Patch it to True for this synthetic
+    # execution_id (no real DB row). The transition mocks below stay
+    # on the scheduler-module symbols — run_one_job resolves those
+    # via the top-of-file imports.
+    monkeypatch.setattr(
+        scheduler, "execution_owned_by",
+        lambda _id, _tok, **_kw: True,
+    )
     monkeypatch.setattr(
         scheduler,
         "mark_execution_running",
-        lambda execution_id: events.append(("running", execution_id)),
-        raising=False,
+        lambda execution_id, **_kw: (
+            events.append(("running", execution_id)),
+            {"status": "running", "id": execution_id},
+        )[1],
     )
     monkeypatch.setattr(
         scheduler,
         "finish_execution",
         lambda execution_id, **kwargs: events.append(("finish", execution_id, kwargs)),
-        raising=False,
     )
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
 
@@ -241,7 +289,11 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
 
-    assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
+    assert scheduler.run_one_job({
+        "id": "job-3",
+        "execution_id": "exec-3",
+        "_execution_owner_token": "tok-3",
+    }) is True
     assert run_execution_ids == ["exec-3"]
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
@@ -334,9 +386,9 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     opened, closed = _count_open_connections(executions, monkeypatch)
 
-    record = executions.create_execution("leak-check", source="builtin")
-    executions.mark_execution_running(record["id"])
-    executions.finish_execution(record["id"], success=True)
+    record, token = _claim(executions, "leak-check")
+    executions.mark_execution_running(record["id"], owner_token=token)
+    executions.finish_execution(record["id"], success=True, owner_token=token)
     executions.list_executions(job_id="leak-check")
     executions.latest_executions(["leak-check"])
     executions.recover_interrupted_executions()
@@ -412,8 +464,8 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
 
     job = jobs.create_job(prompt="audit me", schedule="every 1h", name="audit")
-    record = executions.create_execution(job["id"], source="builtin")
-    executions.mark_execution_running(record["id"])
+    record, token = _claim(executions, job["id"])
+    executions.mark_execution_running(record["id"], owner_token=token)
 
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]

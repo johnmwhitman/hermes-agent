@@ -136,7 +136,14 @@ class TestRunningJobGuard:
 
 
     def test_create_execution_failure_does_not_wedge_running_set(self, tmp_path, monkeypatch):
-        """create_execution failures clear the running lock and still allow next jobs."""
+        """admit_execution failures clear the running lock and still allow next jobs.
+
+        Successor to the retired ``create_execution`` fixture: production now
+        goes through ``admit_execution(job_id, source=...)`` (owner-fenced,
+        returns ``(record, owned, owner_token)``); the failing path exercises
+        its exception arm, the healthy path returns the OWNED record so the
+        worker proceeds (successor to da0c5b5c22).
+        """
         import cron.scheduler as sched
 
         sched._parallel_pool = None
@@ -164,14 +171,14 @@ class TestRunningJobGuard:
 
         called = []
 
-        def create_execution_side_effect(job_id, source):
+        def admit_execution_side_effect(job_id, source):
             if job_id == "failing-job":
                 raise RuntimeError("execution ledger unavailable")
-            return {"id": f"{job_id}-execution"}
+            return {"id": f"{job_id}-execution"}, True, f"tok-{job_id}"
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [failing_job, healthy_job])
         monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
-        monkeypatch.setattr(sched, "create_execution", create_execution_side_effect)
+        monkeypatch.setattr(sched, "admit_execution", admit_execution_side_effect)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: called.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -187,8 +194,15 @@ class TestRunningJobGuard:
             if job_id == "healthy-job"
             else None,
         )
-        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: {"id": "stub"})
         monkeypatch.setattr(sched, "heartbeat_fire_claim", lambda *_a, **_kw: True)
+        # _submit_with_guard stamps the owner_token + execution_id onto the
+        # dispatched job, so the body asserts ownership via execution_owned_by
+        # BEFORE run_job (owner-fence contract, successor to da0c5b5c22).
+        monkeypatch.setattr(
+            sched, "execution_owned_by",
+            lambda _id, _tok, **_kw: True,
+        )
 
         n = sched.tick(verbose=False)
 

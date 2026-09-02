@@ -113,6 +113,18 @@ class TestPausedJobNeverRearmedByPersistedErrorRecovery:
         assert J.pause_job(job_id), "fixture must be pausable"
         paused_next = J.get_job(job_id)["next_run_at"]
 
+        from cron import jobs as Jmod
+        # Snapshot the counter AFTER the fixture setup but BEFORE the
+        # tick loop. The property under test is "this paused job does
+        # NOT trigger any persisted-error recovery" — that is a delta
+        # vs. this baseline. Reading the module-global
+        # ``_persisted_error_recoveries`` counter as an absolute value
+        # makes this test cross-file order dependent (an earlier test
+        # in pytest's collection order may already have incremented it).
+        baseline = Jmod.get_persisted_error_recovery_stats()[
+            "persisted_error_recoveries"
+        ]
+
         for tick_no in range(3):
             _tick(J, S, job_id)
             job = J.get_job(job_id)
@@ -131,9 +143,13 @@ class TestPausedJobNeverRearmedByPersistedErrorRecovery:
         assert E.latest_execution(job_id) is None, (
             "a paused job must never dispatch, even in stale-error state"
         )
-        from cron import jobs as Jmod
-        stats = Jmod.get_persisted_error_recovery_stats()
-        assert stats["persisted_error_recoveries"] == 0
+        post = Jmod.get_persisted_error_recovery_stats()[
+            "persisted_error_recoveries"
+        ]
+        assert post - baseline == 0, (
+            f"paused job must not trigger persisted-error recovery "
+            f"(baseline={baseline}, post={post})"
+        )
 
     def test_disabled_stale_error_job_next_run_untouched(self, cron_env, monkeypatch):
         """Acceptance (1), disabled variant: enabled=false with no pause
@@ -202,6 +218,16 @@ class TestRecoveryBlockedWhileFireFenceHeld:
         )
         parked_next = J.get_job(job_id)["next_run_at"]
 
+        from cron import jobs as Jmod
+        # See test_paused_stale_error_job_next_run_untouched_no_execution:
+        # read the module-global counter as a delta to avoid
+        # cross-file order pollution. Property under test: a held
+        # fire_claim prevents persisted-error recovery from re-arming
+        # the fenced job. That is a delta vs. this baseline.
+        baseline = Jmod.get_persisted_error_recovery_stats()[
+            "persisted_error_recoveries"
+        ]
+
         for tick_no in range(3):
             # get_due_jobs alone is enough: the bug is the recovery's re-arm
             # (a save-side effect of the due scan), not the dispatch itself.
@@ -216,9 +242,13 @@ class TestRecoveryBlockedWhileFireFenceHeld:
                 "a fenced job must not be returned as due"
             )
 
-        from cron import jobs as Jmod
-        stats = Jmod.get_persisted_error_recovery_stats()
-        assert stats["persisted_error_recoveries"] == 0
+        post = Jmod.get_persisted_error_recovery_stats()[
+            "persisted_error_recoveries"
+        ]
+        assert post - baseline == 0, (
+            f"live fire_claim must block persisted-error recovery "
+            f"(baseline={baseline}, post={post})"
+        )
 
     def test_stale_fire_claim_does_not_block_recovery(self, cron_env, monkeypatch):
         """Guard against over-blocking: a fire_claim older than the TTL means
@@ -248,25 +278,47 @@ class TestDuplicateClaimedExecutionRowsBounded:
     def test_create_execution_dedups_active_claim_rows(self, cron_env, monkeypatch):
         """Acceptance (3): N concurrent dispatches for one fenced job produce
         exactly ONE active claimed row, not N. The partial unique index +
-        existing-row reuse in create_execution is the durable bound."""
+        existing-row reuse in admit_execution is the durable bound.
+
+        Migrated to ``admit_execution`` (successor to da0c5b5c22): the
+        deprecated ``create_execution`` wrapper discards the owner
+        token so the wrapper caller cannot drive the finish
+        transition. We use the explicit API for all inserts so we keep
+        the owner_token of the WINNER (the first admit) and can
+        finish with it. The dedup invariant is the same: 5 calls
+        converge on 1 row; the loser branches return ``owned=False``,
+        ``token=None`` per contract."""
         _, E, J, env = _setup(cron_env, monkeypatch)
         job_id = env["job_id"]
 
-        created = [E.create_execution(job_id, source="builtin") for _ in range(5)]
-        ids = {row["id"] for row in created}
+        # Step 1: dedup invariant — 5 admit_execution calls yield ONE
+        # active row. First caller wins (owned=True), the rest are
+        # losers (owned=False, token=None).
+        results = [E.admit_execution(job_id, source="builtin") for _ in range(5)]
+        ids = {rec["id"] for rec, _owned, _tok in results}
         assert len(ids) == 1, (
-            f"5 create_execution calls must yield one active claim row, got {ids}"
+            f"5 admit_execution calls must yield one active claim row, got {ids}"
         )
+        winner_rec, winner_owned, winner_token = results[0]
+        assert winner_owned is True, "first caller wins the admission"
+        assert winner_token, "winner's owner_token must be non-empty"
 
         rows = E.list_executions(job_id=job_id, limit=50)
         assert len(rows) == 1
         assert rows[0]["status"] == "claimed"
 
-        # After the active row goes terminal, a fresh attempt is a NEW row —
-        # the dedup must never block legitimate later fires.
-        E.finish_execution(created[0]["id"], success=True)
-        second = E.create_execution(job_id, source="builtin")
-        assert second["id"] != created[0]["id"]
+        # Step 2: finish the active row with the WINNER's owner_token.
+        # Loser rows in the loop above carry token=None; only the
+        # winner can drive transitions.
+        E.finish_execution(
+            rows[0]["id"], success=True, owner_token=winner_token,
+        )
+        # After finish, the dedup index permits a fresh admit for a NEW row.
+        second_rec, _owned2, _t2 = E.admit_execution(job_id, source="builtin")
+        assert second_rec["id"] != rows[0]["id"], (
+            "fresh admit AFTER the active row is terminalized MUST "
+            "yield a NEW row id (the partial unique index permits it)"
+        )
         rows = E.list_executions(job_id=job_id, limit=50)
         assert len(rows) == 2
 

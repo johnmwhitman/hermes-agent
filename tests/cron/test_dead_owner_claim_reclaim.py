@@ -107,9 +107,19 @@ class TestTickReapsDeadOwnerClaims:
         assert executions.latest_execution("orphaned-running")["status"] == "unknown"
 
     def test_live_owner_claim_is_never_rewritten(self, executions):
-        """A claim owned by a live process (this one) must survive the reap."""
-        record = executions.create_execution("live-job", source="builtin")
-        executions.mark_execution_running(record["id"])
+        """A claim owned by a live process (this one) must survive the reap.
+
+        Migrated to ``admit_execution`` + explicit owner_token (successor
+        to da0c5b5c22): the deprecated ``create_execution`` wrapper
+        discards the owner token so the caller cannot drive the
+        transition, and the strict owner-fence refuses tokenless
+        mutations. The new API threads the token through."""
+        record, _owned, owner_token = executions.admit_execution(
+            "live-job", source="builtin"
+        )
+        executions.mark_execution_running(
+            record["id"], owner_token=owner_token
+        )
 
         _run_tick()
 

@@ -85,10 +85,16 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     finished = []
 
     monkeypatch.setattr(
-        s, "create_execution", lambda *_a, **_kw: {"id": "exec-j3"}
+        s, "admit_execution",
+        lambda *_a, **_kw: ({"id": "exec-j3"}, True, "tok-exec-j3"),
     )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id, **_kw: {"id": _execution_id})
+    monkeypatch.setattr(
+        s, "execution_owned_by",
+        lambda _id, _tok, **_kw: True,
+    )
+    monkeypatch.setattr(s, "heartbeat_fire_claim", lambda *_a, **_kw: True)
     monkeypatch.setattr(
         s,
         "run_job",
@@ -128,6 +134,7 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
                 "success": False,
                 "error": "Gemini HTTP 503 (UNAVAILABLE)",
                 "delivery_outcome": "delivered",
+                "owner_token": "tok-exec-j3",
             },
         )
     ]
@@ -138,10 +145,16 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
     marked = []
 
     monkeypatch.setattr(
-        s, "create_execution", lambda *_a, **_kw: {"id": "exec-j4"}
+        s, "admit_execution",
+        lambda *_a, **_kw: ({"id": "exec-j4"}, True, "tok-exec-j4"),
     )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id, **_kw: {"id": _execution_id})
+    monkeypatch.setattr(
+        s, "execution_owned_by",
+        lambda _id, _tok, **_kw: True,
+    )
+    monkeypatch.setattr(s, "heartbeat_fire_claim", lambda *_a, **_kw: True)
     monkeypatch.setattr(
         s,
         "run_job",
@@ -163,9 +176,17 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
 
 def _patch_escaped_failure(monkeypatch, delivered, *, exec_id, err):
     """Make run_job raise, and capture what the escape handler delivers."""
-    monkeypatch.setattr(s, "create_execution", lambda *_a, **_kw: {"id": exec_id})
+    monkeypatch.setattr(
+        s, "admit_execution",
+        lambda *_a, **_kw: ({"id": exec_id}, True, f"tok-{exec_id}"),
+    )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id, **_kw: {"id": _execution_id})
+    monkeypatch.setattr(
+        s, "execution_owned_by",
+        lambda _id, _tok, **_kw: True,
+    )
+    monkeypatch.setattr(s, "heartbeat_fire_claim", lambda *_a, **_kw: True)
     monkeypatch.setattr(
         s,
         "run_job",
@@ -243,10 +264,16 @@ def test_run_one_job_exception_after_delivery_does_not_redeliver(monkeypatch):
     mark_calls = []
 
     monkeypatch.setattr(
-        s, "create_execution", lambda *_a, **_kw: {"id": "exec-j5"}
+        s, "admit_execution",
+        lambda *_a, **_kw: ({"id": "exec-j5"}, True, "tok-exec-j5"),
     )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id, **_kw: {"id": _execution_id})
+    monkeypatch.setattr(
+        s, "execution_owned_by",
+        lambda _id, _tok, **_kw: True,
+    )
+    monkeypatch.setattr(s, "heartbeat_fire_claim", lambda *_a, **_kw: True)
     monkeypatch.setattr(
         s,
         "run_job",
@@ -285,10 +312,16 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
     finished = []
 
     monkeypatch.setattr(
-        s, "create_execution", lambda *_a, **_kw: {"id": "exec-j6"}
+        s, "admit_execution",
+        lambda *_a, **_kw: ({"id": "exec-j6"}, True, "tok-exec-j6"),
     )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id, **_kw: {"id": _execution_id})
+    monkeypatch.setattr(
+        s, "execution_owned_by",
+        lambda _id, _tok, **_kw: True,
+    )
+    monkeypatch.setattr(s, "heartbeat_fire_claim", lambda *_a, **_kw: True)
     monkeypatch.setattr(
         s,
         "run_job",
@@ -322,6 +355,7 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
                 "success": False,
                 "error": "KeyboardInterrupt",
                 "delivery_outcome": "suppressed",
+                "owner_token": "tok-exec-j6",
             },
         )
     ]
