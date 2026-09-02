@@ -59,6 +59,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
            )"""
     )
     conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_active_claim
+           ON executions(job_id) WHERE status IN ('claimed','running')"""
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
     )
@@ -139,19 +143,61 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
 
 
 def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
-    """Persist a claimed attempt before executor/provider dispatch."""
+    """Persist a claimed attempt before executor/provider dispatch.
+
+    At most one non-terminal ('claimed'/'running') row may exist per job —
+    enforced by the idx_executions_active_claim partial unique index. This is
+    the durable dedup guard for the 2026-09-02 cron-storm class: when a tick
+    dispatches a job while a prior fire of that same job still holds the
+    per-job fire fence (its claim row is still active), the second tick's
+    insert here hits the unique index and we return the EXISTING active row
+    instead of minting a duplicate claim. Callers already tolerate reusing a
+    row: the loser runs its job body against it and ``finish_execution``
+    (status must still be non-terminal) and ``mark_execution_running``
+    (status must be exactly 'claimed') both degrade to no-ops on transition
+    conflicts, so at most one execution progresses per job at a time and the
+    claim row count stays bounded at 1 per job. Sources label rows; a dedup
+    keeps the FIRST active row's source.
+    """
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
-        conn.execute(
-            """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now),
-        )
+        try:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+                 _process_start_time(pid), now),
+            )
+        except sqlite3.IntegrityError:
+            # A live claimed/running row already exists for this job: another
+            # fire (possibly in another thread or process) owns the active
+            # attempt. Reuse it rather than creating an unbounded duplicate
+            # claim storm.
+            row = conn.execute(
+                """SELECT * FROM executions
+                   WHERE job_id=? AND status IN ('claimed','running')
+                   ORDER BY claimed_at DESC, id DESC LIMIT 1""",
+                (str(job_id),),
+            ).fetchone()
+            if row is not None:
+                record = _record(row)
+                _emit_execution_state(record)
+                return record  # type: ignore[return-value]
+            # Raced with a terminal transition between the failed insert and
+            # the select — no active row anymore; fall through and retry the
+            # insert for this fresh attempt.
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+                 _process_start_time(pid), now),
+            )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone()

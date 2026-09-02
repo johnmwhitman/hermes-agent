@@ -1245,7 +1245,18 @@ def _job_is_stale_error_recurring(
         normal transient-error retry that will fire on its own soon, it is a
         job that has been sitting errored for a full period with no recovery;
       * it is not currently running in this process (a live run must never be
-        re-armed underneath itself, #62002-style).
+        re-armed underneath itself, #62002-style); and
+      * it holds no live ``fire_claim`` (a claim younger than its TTL means a
+        fire is in flight and already holds the per-job fire fence; re-arming
+        ``next_run_at`` to now under that claim makes the job look due again
+        on the very next tick, producing a new claimed execution row on every
+        tick whose worker then blocks 30s on the fence and fails closed —
+        the 2026-09-02 storm shape).
+
+    Paused/disabled jobs never reach this discriminator: the due scan's
+    enabled gate and pause-marker self-heal (which force-disables
+    contradictory records) both ``continue`` before the recovery branch, so
+    recovery can never resurrect a job the operator froze.
 
     ``last_run_at`` being older than one cadence is the key discriminator: a
     job that errors and is retried on its normal schedule keeps ``last_run_at``
@@ -1253,6 +1264,12 @@ def _job_is_stale_error_recurring(
     stale check does not fire for a job that is merely erroring-and-retrying.
     """
     if job.get("last_status") != "error":
+        return False
+    if _claim_is_live(job.get("fire_claim"), now, _fire_claim_ttl_seconds()):
+        # A fire for this job is in flight (its worker holds the fire fence).
+        # Re-arming next_run_at now would re-surface the job as due while the
+        # fence is still held, so every tick mints a duplicate claimed
+        # execution whose worker times out on the fence and fails closed.
         return False
     if _job_running_in_this_process(str(job.get("id") or "")):
         return False
@@ -2784,6 +2801,32 @@ def trigger_job(
     )
 
 
+# Default fire-claim lease: one claim blocks a duplicate fire for this long
+# after stamping. Sized to cover a full _JOBS_LOCK_TIMEOUT_SECONDS fence wait
+# plus delivery; a claim older than this is treated as stale (claiming
+# process died mid-fire) and may be overwritten.
+_FIRE_CLAIM_TTL_SECONDS = 300
+
+
+def _fire_claim_ttl_seconds() -> float:
+    """Resolved TTL for a ``fire_claim`` lease, in seconds.
+
+    Single source of truth for the lease window: the CAS in
+    ``_claim_job_for_fire_locked``, the one-shot re-arm guard, and the
+    persisted-error recovery discriminator must all agree on how long a
+    claim counts as "a fire is in flight". Config override:
+    ``cron.fire_claim_ttl_seconds`` (seconds, number), default
+    ``_FIRE_CLAIM_TTL_SECONDS``.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return float(cron_cfg.get("fire_claim_ttl_seconds", _FIRE_CLAIM_TTL_SECONDS))
+    except Exception:
+        return float(_FIRE_CLAIM_TTL_SECONDS)
+
+
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     if not isinstance(claim, dict) or not claim.get("at"):
         return False
@@ -2823,7 +2866,7 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
             now = _hermes_now()
             if _claim_is_live(job.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
                 raise ValueError("Cannot re-arm one-shot over a live run claim.")
-            if _claim_is_live(job.get("fire_claim"), now, 300):
+            if _claim_is_live(job.get("fire_claim"), now, _fire_claim_ttl_seconds()):
                 raise ValueError("Cannot re-arm one-shot over a live fire claim.")
             if job.get("schedule", {}).get("kind") != "once":
                 raise ValueError(
@@ -3440,10 +3483,12 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str,
     *,
-    claim_ttl_seconds: int = 300,
+    claim_ttl_seconds: Optional[float] = None,
     force: bool = False,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
+    if claim_ttl_seconds is None:
+        claim_ttl_seconds = _fire_claim_ttl_seconds()
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
@@ -3458,7 +3503,7 @@ def claim_job_for_fire(
 def _claim_job_for_fire_locked(
     job_id: str,
     *,
-    claim_ttl_seconds: int = 300,
+    claim_ttl_seconds: float = _FIRE_CLAIM_TTL_SECONDS,
     force: bool = False,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
