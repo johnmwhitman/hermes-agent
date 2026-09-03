@@ -4626,6 +4626,60 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _sticky_block_has_no_reason(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the task's most recent ``blocked`` event carries
+    no usable ``reason`` (missing, null, empty, or whitespace-only).
+
+    A reasonless block is not a deliberate human handoff — it is the
+    stranded shape the release-or-record actor (t_e6423d36) exists to
+    clear.  The caller must already have established that the most
+    recent ``blocked``/``unblocked`` event IS ``blocked`` (via
+    :func:`_has_sticky_block`); this function only inspects the payload.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or row["payload"] is None:
+        return True
+    try:
+        payload = json.loads(row["payload"])
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    if payload.get("initial"):
+        # ``create_task(initial_status='blocked')`` parks the card for
+        # human-ops with payload ``{"initial": True}`` and no reason —
+        # the reason is implicit in the act of parking.  That is a
+        # deliberate hold, not the stranded shape, and must stay sticky
+        # until an explicit ``unblock_task`` (pinned by
+        # test_kanban_disk_governor_guard.py::
+        # test_initial_blocked_task_stays_sticky_until_explicit_unblock).
+        return False
+    reason = payload.get("reason")
+    return not (isinstance(reason, str) and reason.strip())
+
+
+def _release_reasonless_sticky_block(conn: sqlite3.Connection, task_id: str) -> None:
+    """Record the auto-release of a reasonless sticky block.
+
+    Only writes the ``unblocked`` event — the caller
+    (:func:`recompute_ready`) performs the actual status transition
+    through its normal promotion path, so the resume-status and
+    circuit-breaker guards there stay the single source of truth for
+    where the task lands.  The event's ``reason`` is what keeps the card
+    from ever being *silently* stranded: the audit trail now says why
+    the block ended.
+    """
+    _append_event(
+        conn, task_id, "unblocked",
+        {"reason": "parents done; auto-released", "auto": True},
+    )
+
+
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the durable phase a blocked/dependency-wait task should resume.
 
@@ -4703,7 +4757,26 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
-                continue
+                #
+                # Release-or-record actor (conductor proposal on
+                # t_add33d23, card t_e6423d36): a sticky block whose
+                # latest ``blocked`` event carries NO reason is not a
+                # deliberate hold — it is the stranded shape the board
+                # measured at 35 cards on 2026-09-02.  Once every parent
+                # is done the block has nothing left to wait on, so we
+                # release the task here and record WHY on the
+                # ``unblocked`` event, keeping the card from ever being
+                # silently stranded.  A block WITH a non-empty reason is
+                # an explicit human handoff and stays sticky — upstream
+                # #28712 behaviour is unchanged for it.
+                if _sticky_block_has_no_reason(conn, task_id) and _parents_satisfied(
+                    conn, task_id
+                ):
+                    _release_reasonless_sticky_block(conn, task_id)
+                    # Fall through: the task is no longer sticky-blocked,
+                    # so the normal promotion path below resumes it.
+                else:
+                    continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
