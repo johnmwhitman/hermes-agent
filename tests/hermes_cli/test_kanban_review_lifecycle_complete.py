@@ -719,3 +719,107 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         )
     assert kb.complete_task(conn, ok_id, summary="done")
     assert _failures(conn, ok_id) == 0
+
+
+def test_re_review_refuses_inherited_implementer_as_reviewer(conn) -> None:
+    """Regression for t_1c80eb07: a re-review must fail closed when the
+    resolved reviewer is the implementer.
+
+    request_changes restores the implementer as assignee. A subsequent
+    request_review that omits ``reviewer`` used to inherit that provenance
+    one round-trip later (via the changes_requested event's ``reviewer``
+    field), letting the implementer silently review their own rework. The
+    refusal must leave the task untouched in ``running``.
+    """
+    task_id, review = _claimed_review(conn, "Reviewer provenance inheritance")
+    assert kb.request_changes(
+        conn,
+        task_id,
+        reason="Add a regression for the empty-input branch.",
+        expected_run_id=review.current_run_id,
+    ) == (True, "builder")
+
+    rework = kb.claim_task(conn, task_id, claimer="builder:rework")
+    assert rework is not None
+
+    # Corrupt the reviewer provenance the way an unguarded re-review would
+    # see it: the latest changes_requested event names the implementer as
+    # reviewer (the exact inheritance failure mode from the incident).
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET payload = json_set(payload, '$.reviewer', 'builder') "
+            "WHERE id = (SELECT id FROM task_events "
+            "WHERE task_id = ? AND kind = 'changes_requested' "
+            "ORDER BY id DESC LIMIT 1)",
+            (task_id,),
+        )
+
+    # Omitting reviewer= must now fail closed instead of silently
+    # self-assigning the implementer as their own reviewer.
+    assert not kb.request_review(
+        conn,
+        task_id,
+        summary="Rework ready.",
+        expected_run_id=rework.current_run_id,
+    )
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert unchanged.assignee == "builder"
+    assert unchanged.current_run_id == rework.current_run_id
+    events = kb.list_events(conn, task_id)
+    assert not [e for e in events if e.kind == "review_requested" and e.run_id == rework.current_run_id]
+
+    # An explicit distinct reviewer still works (and is recorded).
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        summary="Rework ready.",
+        expected_run_id=rework.current_run_id,
+    )
+    awaiting = kb.get_task(conn, task_id)
+    assert awaiting is not None
+    assert awaiting.status == "review"
+    assert awaiting.assignee == "reviewer"
+    requested = _event(kb.list_events(conn, task_id), "review_requested")
+    assert requested.payload["reviewer"] == "reviewer"
+    assert requested.payload["implementer"] == "builder"
+
+
+def test_direct_request_review_refuses_reviewer_equal_to_implementer(conn) -> None:
+    """The direct (first-pass) path also fails closed: a worker that names
+    itself as its own reviewer is refused before the task leaves running."""
+    task_id = kb.create_task(conn, title="Self review attempt", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+
+    ok, reason = kb.request_review(
+        conn,
+        task_id,
+        reviewer="builder",
+        summary="reviewed myself",
+        expected_run_id=implementation.current_run_id,
+        with_reason=True,
+    )
+    assert not ok
+    assert "reviewer is the implementer" in reason
+
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert unchanged.assignee == "builder"
+    assert unchanged.current_run_id == implementation.current_run_id
+
+    # Normalization applies: case/alias variants of the same profile are
+    # still the same identity and must be refused.
+    ok, reason = kb.request_review(
+        conn,
+        task_id,
+        reviewer="Builder",
+        summary="reviewed myself (alias)",
+        expected_run_id=implementation.current_run_id,
+        with_reason=True,
+    )
+    assert not ok
+    assert "reviewer is the implementer" in reason

@@ -6974,6 +6974,24 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        implementer = _canonical_assignee(implementer)
+        # Fail closed when the resolved reviewer is the implementer. A
+        # re-review would silently self-approve otherwise — request_changes
+        # restores the implementer as assignee, and a re-review omitting
+        # ``reviewer`` inherits that provenance, so without this check the
+        # reviewer identity is lost one round-trip later. This mirrors the
+        # malformed-payload fail-closed path in the block above.
+        if (
+            reviewer is not None
+            and implementer is not None
+            and reviewer == implementer
+        ):
+            return _ret(
+                False,
+                "resolved reviewer is the implementer; pass an explicit "
+                "distinct reviewer= for re-review instead of inheriting "
+                "implementer provenance",
+            )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
