@@ -752,6 +752,57 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     monkeypatch.setattr(_kdb, "connect", _guarded_connect)
 
 
+# ── Kanban closed-world sandbox (t_658c6048) ────────────────────────────────
+# The deny-list guard above catches writes that resolve INSIDE the real
+# kanban root. It cannot catch the vector that actually landed fixture rows
+# (``racer N`` / ``ro task`` / ``Task A`` / ``specimen target``) in the live
+# board: a subprocess or thread whose resolved path points at the real board
+# WITHOUT passing under the captured root (rebuilt child env that dropped the
+# HERMES_HOME redirect, a leaked HERMES_KANBAN_DB pin, a memoised default
+# root, or a home symlinked outside ~/.hermes). This fixture closes the
+# in-process half of that hole; the module-level production trap in
+# ``kanban_db.connect`` closes the subprocess half (it needs no captured env
+# and fires on resolved-path identity, so a rebuilt child env cannot slip it):
+#   • Every hermes_cli.kanban_db path-resolution cache / connection registry
+#     the module exposes is cleared per test, so a root resolved before this
+#     test's HERMES_HOME redirect cannot survive into it.
+#   • kanban_db._PRODUCTION_BOARD_PATHS is re-resolved per test so the
+#     module-level production trap always has a current symlink-free view of
+#     the real board.
+# HERMES_KANBAN_DB is deliberately NOT pinned here: existing tests assert
+# resolution semantics against custom HERMES_HOMEs and the env var would
+# override them. The trap, not an env pin, is the closed-world guarantee.
+# Opt out per-test with @pytest.mark.live_kanban_board when a test genuinely
+# needs the real board (none should).
+
+@pytest.fixture(autouse=True)
+def _kanban_closed_world(request, monkeypatch):
+    if request.node.get_closest_marker("live_kanban_board") is not None:
+        yield
+        return
+    # Clear every resolution cache the kanban module exposes so nothing
+    # resolved against a previous home survives into this test.
+    try:
+        from hermes_cli import kanban_db as _kb_mod
+    except Exception:
+        _kb_mod = None
+    if _kb_mod is not None:
+        for attr in (
+            "_INITIALIZED_PATHS",
+            "_CONNECTION_REGISTRY",
+            "_PATH_INIT_CACHE",
+        ):
+            cache = getattr(_kb_mod, attr, None)
+            if cache is not None and hasattr(cache, "clear"):
+                try:
+                    cache.clear()
+                except Exception:
+                    pass
+        # Refresh the production-path snapshot the module-level trap uses.
+        monkeypatch.setattr(_kb_mod, "_PRODUCTION_BOARD_PATHS", None, raising=False)
+    yield
+
+
 # ── Live state.db write guard ───────────────────────────────────────────────
 # Companion to the kanban guard above, for the MAIN state database.
 # ``hermes_state._ensure_test_isolation`` (the single choke point every
