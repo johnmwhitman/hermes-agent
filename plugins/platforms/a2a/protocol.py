@@ -142,7 +142,9 @@ def build_agent_card(
         "capabilities": {
             "streaming": streaming,
             "pushNotifications": push_notifications,
-            "stateTransitionHistory": False,
+            # v1.0 canonical: stateTransitionHistory is OMITTED entirely
+            # (the field was dropped from the v1 AgentCard schema; emitting
+            # it is non-canonical drift).
             "extendedAgentCard": False,
         },
         "defaultInputModes": ["text/plain"],
@@ -150,10 +152,15 @@ def build_agent_card(
         "skills": skills or [],
     }
     if auth_required:
+        # v1.0 canonical security shape:
+        #   securitySchemes.<name>.httpAuthSecurityScheme.scheme = "Bearer"
+        #   securityRequirements = [{"schemes": {"bearer": {"list": []}}}]
+        # The pre-1.0 singular `security` member is NOT emitted; legacy peer
+        # parsing stays tolerant on the inbound side.
         card["securitySchemes"] = {
-            "bearer": {"type": "http", "scheme": "bearer"}
+            "bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}
         }
-        card["security"] = [{"bearer": []}]
+        card["securityRequirements"] = [{"schemes": {"bearer": {"list": []}}}]
     return card
 
 

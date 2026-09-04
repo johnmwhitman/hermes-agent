@@ -285,7 +285,10 @@ def a2a_discover(args: dict, **_: Any) -> str:
     desc = card.get("description", "")
     caps = card.get("capabilities", {}) or {}
     skills = card.get("skills", []) or []
-    auth = "yes" if card.get("security") else "no"
+    # Auth display: tolerate both the canonical v1 shape
+    # (securityRequirements non-empty) and pre-1.0 legacy cards
+    # (singular `security` member).
+    auth = "yes" if (card.get("securityRequirements") or card.get("security")) else "no"
     ifaces = card.get("supportedInterfaces", []) or []
     proto = ", ".join(
         f"{i.get('protocolBinding', '?')} v{i.get('protocolVersion', '?')}"

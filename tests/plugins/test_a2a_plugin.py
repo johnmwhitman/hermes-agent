@@ -240,14 +240,20 @@ class TestAgentCardV1:
         assert card["provider"]["organization"]
         assert card["capabilities"]["extendedAgentCard"] is False
         assert card["capabilities"]["streaming"] is False
+        # v1.0 canonical: stateTransitionHistory omitted entirely.
+        assert "stateTransitionHistory" not in card["capabilities"]
+        # Unauthenticated localhost card: no security requirements.
         assert "security" not in card
+        assert "securityRequirements" not in card
 
     def test_card_auth_required(self):
         card = protocol.build_agent_card(
             name="x", url="u", description="d", auth_required=True,
         )
-        assert card["security"] == [{"bearer": []}]
-        assert card["securitySchemes"]["bearer"]["scheme"] == "bearer"
+        # v1.0 canonical security shape; no legacy singular `security`.
+        assert card["securityRequirements"] == [{"schemes": {"bearer": {"list": []}}}]
+        assert card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"] == "Bearer"
+        assert "security" not in card
 
     def test_skills_from_toolset_names(self):
         skills = protocol.skills_from_toolsets(["web", "terminal"])
@@ -608,6 +614,23 @@ class TestClientTools:
         assert "researcher" in out
         assert "search" in out
         assert "JSONRPC v1.0" in out
+        # Unauthenticated card → auth display reads "no".
+        assert "Auth required: no" in out
+
+    def test_discover_auth_display_canonical_and_legacy(self, monkeypatch):
+        """Auth display reads both v1 securityRequirements and legacy `security`."""
+        canonical = protocol.build_agent_card(
+            name="v1", url="http://peer/", description="d", auth_required=True,
+        )
+        assert "security" not in canonical  # canonical card carries no legacy member
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: canonical)
+        assert "Auth required: yes" in tools.a2a_discover({"url": "http://peer"})
+
+        legacy = dict(canonical)
+        legacy.pop("securityRequirements")
+        legacy["security"] = [{"bearer": []}]
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: legacy)
+        assert "Auth required: yes" in tools.a2a_discover({"url": "http://peer"})
 
     def test_call_sends_v1_message(self, monkeypatch):
         """Outbound params: contextId inside the message, v1.0 role, no kind."""
@@ -1490,9 +1513,11 @@ class TestInboundRoundTrip:
 
         async def run():
             assert await adapter.connect() is True
-            # Card should now advertise auth.
+            # Card should now advertise auth (v1 canonical securityRequirements;
+            # no legacy singular `security`).
             card = await asyncio.to_thread(_get_json, base + "/.well-known/agent.json")
-            assert card["security"] == [{"bearer": []}]
+            assert card["securityRequirements"] == [{"schemes": {"bearer": {"list": []}}}]
+            assert "security" not in card
 
             # POST without auth → 401 with our custom (non-spec-reserved) code.
             def _post_unauth():
