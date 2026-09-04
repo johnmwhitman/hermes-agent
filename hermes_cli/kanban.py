@@ -781,6 +781,55 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    p_gaveup = sub.add_parser(
+        "gave-up-triage",
+        help=(
+            "Enumerate gave_up circuit-breaker orphans (blocked, latest "
+            "event gave_up, no sticky block, failure limit reached, "
+            "parents done) and optionally retry or archive them with a "
+            "reasoned audit event. The supported operator path for the "
+            "t_8285095c stuck class."
+        ),
+    )
+    p_gaveup.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit the orphan enumeration as JSON",
+    )
+    p_gaveup.add_argument(
+        "--retry",
+        dest="retry_ids",
+        nargs="+",
+        default=None,
+        metavar="TASK_ID",
+        help="Fresh-retry these orphan ids (failure budget reset; lands ready/todo)",
+    )
+    p_gaveup.add_argument(
+        "--archive",
+        dest="archive_ids",
+        nargs="+",
+        default=None,
+        metavar="TASK_ID",
+        help="Archive these orphan ids (superseded/abandoned)",
+    )
+    p_gaveup.add_argument(
+        "--reason",
+        default=None,
+        help="Required with --retry/--archive — recorded on the audit event",
+    )
+    p_gaveup.add_argument(
+        "--failure-limit",
+        dest="failure_limit",
+        type=int,
+        default=None,
+        help=(
+            "Dispatcher failure limit the orphans were tripped under "
+            "(default: kanban.failure_limit config, then the built-in "
+            "default). Per-task max_retries still wins."
+        ),
+    )
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1173,6 +1222,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "gave-up-triage": _cmd_gaveup_triage,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -2695,6 +2745,109 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:
                 print(f"Archived {tid}")
+    return 0 if not failed else 1
+
+
+def _gaveup_failure_limit(args: argparse.Namespace) -> "int | None":
+    """Resolve --failure-limit, else the operator's on-disk
+    ``kanban.failure_limit`` (the limit the gateway dispatcher actually
+    tripped under), else None → the kanban_db default.
+
+    The raw on-disk value is read (not ``load_config()``) because the
+    merged config injects the scaffold default 2, which is
+    indistinguishable from an operator-set 2 — and the scaffold default
+    must NOT mask ``DEFAULT_FAILURE_LIMIT`` should they ever diverge.
+    """
+    cli_val = getattr(args, "failure_limit", None)
+    if cli_val is not None:
+        return int(cli_val)
+    try:
+        from hermes_cli.config import get_config_path
+
+        path = get_config_path()
+        if not path.exists():
+            return None
+        try:
+            from utils import fast_safe_load
+        except ImportError:
+            fast_safe_load = None
+        with open(path, encoding="utf-8") as fh:
+            raw_cfg = (
+                fast_safe_load(fh)
+                if fast_safe_load is not None
+                else None
+            )
+        if isinstance(raw_cfg, dict):
+            raw = (raw_cfg.get("kanban") or {}).get("failure_limit")
+            if raw is not None:
+                val = int(raw)
+                if val >= 1:
+                    return val
+    except Exception:
+        pass
+    return None
+
+
+def _cmd_gaveup_triage(args: argparse.Namespace) -> int:
+    retry_ids = list(getattr(args, "retry_ids", None) or [])
+    archive_ids = list(getattr(args, "archive_ids", None) or [])
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    overlap = set(retry_ids) & set(archive_ids)
+    if overlap:
+        print(
+            "task ids cannot be both retried and archived: "
+            + ", ".join(sorted(overlap)),
+            file=sys.stderr,
+        )
+        return 1
+    if (retry_ids or archive_ids) and not reason:
+        print("--reason is required with --retry/--archive", file=sys.stderr)
+        return 1
+    actor = _profile_author()
+    failure_limit = _gaveup_failure_limit(args)
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in retry_ids:
+            ok, err = kb.retry_gaveup_task(
+                conn, tid, actor=actor, reason=reason,
+                failure_limit=failure_limit,
+            )
+            if not ok:
+                failed.append(tid)
+                print(f"cannot retry {tid}: {err}", file=sys.stderr)
+            else:
+                landed = kb.get_task(conn, tid)
+                where = landed.status if landed else "ready"
+                print(f"Retried {tid} → {where}: {reason}")
+        for tid in archive_ids:
+            ok, err = kb.archive_gaveup_task(
+                conn, tid, actor=actor, reason=reason,
+                failure_limit=failure_limit,
+            )
+            if not ok:
+                failed.append(tid)
+                print(f"cannot archive {tid}: {err}", file=sys.stderr)
+            else:
+                print(f"Archived {tid}: {reason}")
+        if not retry_ids and not archive_ids:
+            orphans = kb.list_gaveup_orphans(conn, failure_limit=failure_limit)
+            if getattr(args, "json", False):
+                print(json.dumps(orphans, indent=2, ensure_ascii=False))
+                return 0
+            if not orphans:
+                print("no gave_up orphans")
+                return 0
+            for o in orphans:
+                print(
+                    f"{o['task_id']}  failures={o['consecutive_failures']}"
+                    f"/{o['effective_limit']}"
+                    f"  trigger={o['trigger_outcome'] or '?'}"
+                    f"  assignee={o['assignee'] or '-'}"
+                    f"  {o['title']}"
+                )
+            return 0
     return 0 if not failed else 1
 
 

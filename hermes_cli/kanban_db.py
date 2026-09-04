@@ -4821,6 +4821,301 @@ def recompute_ready(
 
 
 # ---------------------------------------------------------------------------
+# gave_up circuit-breaker orphan triage (t_8285095c / t_fae878e7)
+# ---------------------------------------------------------------------------
+#
+# ``_has_sticky_block`` deliberately distinguishes worker/operator sticky
+# blocks (latest ``blocked`` event — an explicit human hold) from dispatcher
+# circuit breakers (latest event ``gave_up``, no ``blocked`` event — a
+# transient failure budget that ran out).  But ``recompute_ready`` only ever
+# moves non-sticky ``blocked`` tasks to ``ready``, and for a child whose
+# parents are already done the landing status IS ``ready``, so the guard
+# ``status == 'ready' AND status != 'blocked'`` skips the card forever.
+# Until these helpers landed, no supported actor polled for that shape —
+# gave_up orphans sat in ``blocked`` with a spent failure budget until
+# someone ran direct SQLite.  The supported path is:
+#
+#   1. ``list_gaveup_orphans`` — read-only enumeration of the exact shape
+#      (status=blocked, latest event gave_up, no sticky block, failure
+#      budget spent, parents done/archived).
+#   2. ``retry_gaveup_task`` — guarded fresh retry with a RESET failure
+#      budget (deliberate operator action, same reset semantics as
+#      ``unblock_task``), landing through the shared parent re-gate.
+#   3. ``archive_gaveup_task`` — guarded archive/supersede that first emits
+#      a human-decision ``blocked`` event (so the orphan classifier can
+#      never misread the card mid-flight) and then runs the standard
+#      ``archive_task`` machinery.
+#
+# Both mutations require an operator ``actor`` and a non-empty ``reason``
+# and refuse anything that is not exactly the orphan shape — sticky blocks
+# stay sticky, and a task below its effective limit stays fail-closed.
+
+def _effective_failure_limit_for(
+    conn: sqlite3.Connection, task_id: str,
+    failure_limit: Optional[int] = None,
+) -> Optional[int]:
+    """Return the circuit-breaker limit ``_record_task_failure`` would
+    resolve for this task: per-task ``max_retries`` when set, else the
+    caller-supplied dispatcher ``failure_limit`` (the gateway passes its
+    ``kanban.failure_limit`` config value), else ``DEFAULT_FAILURE_LIMIT``.
+
+    ``kanban_db`` deliberately holds no config import (the CLI and gateway
+    layers own config), so the dispatcher-layer limit arrives as a
+    parameter — exactly how ``_record_task_failure`` itself receives it.
+    """
+    row = conn.execute(
+        "SELECT max_retries FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    override = row["max_retries"] if "max_retries" in row.keys() else None
+    if override is not None:
+        return int(override)
+    if failure_limit is not None:
+        try:
+            val = int(failure_limit)
+        except (TypeError, ValueError):
+            val = 0
+        if val >= 1:
+            return val
+    return int(DEFAULT_FAILURE_LIMIT)
+
+
+def _gaveup_orphan_row(
+    conn: sqlite3.Connection, task_id: str,
+    failure_limit: Optional[int] = None,
+    include_parent_gated: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Return the orphan diagnostic row for ``task_id``, or ``None`` when
+    the task is not exactly the gave_up orphan shape:
+
+    * ``status == 'blocked'``
+    * latest task event is ``gave_up`` (no later event of any kind)
+    * NO sticky block — the latest ``blocked``/``unblocked`` event, if
+      any, is not a ``blocked`` event newer than the ``gave_up``
+      (mirrors ``_has_sticky_block``: a worker/operator hold newer than
+      the breaker trip is an explicit human hold, not an orphan)
+    * ``consecutive_failures >= effective_limit`` (fail-closed)
+    * every parent ``done``/``archived`` (the stuck class; parent-gated
+      orphans become enumerable once their parents finish).  Skipped when
+      ``include_parent_gated=True`` — the retry actor re-gates through
+      ``_landing_status_after_parents`` itself, so a parent-gated orphan
+      is retriable straight into ``todo``.
+    """
+    task = conn.execute(
+        "SELECT status, consecutive_failures, last_failure_error, "
+        "title, assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None or task["status"] != "blocked":
+        return None
+    if _has_sticky_block(conn, task_id):
+        return None
+    last = conn.execute(
+        "SELECT kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is None or last["kind"] != "gave_up":
+        return None
+    effective_limit = _effective_failure_limit_for(
+        conn, task_id, failure_limit
+    )
+    if effective_limit is None:
+        return None
+    failures = int(task["consecutive_failures"])
+    if failures < effective_limit:
+        return None
+    if not include_parent_gated and not _parents_satisfied(conn, task_id):
+        return None
+    payload: dict[str, Any] = {}
+    if last["payload"]:
+        try:
+            payload = json.loads(last["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+    return {
+        "task_id": task_id,
+        "title": task["title"],
+        "assignee": task["assignee"],
+        "consecutive_failures": failures,
+        "effective_limit": effective_limit,
+        "last_failure_error": task["last_failure_error"],
+        "trigger_outcome": payload.get("trigger_outcome"),
+        "last_event_at": int(last["created_at"]),
+    }
+
+
+def list_gaveup_orphans(
+    conn: sqlite3.Connection,
+    failure_limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Enumerate gave_up circuit-breaker orphans — the exact stuck class
+    from triage card t_8285095c.  Read-only; safe to poll from a cron or
+    Conductor diagnostic.  See :func:`_gaveup_orphan_row` for the shape.
+    Ordered by most recent gave_up first."""
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked'"
+    ).fetchall()
+    orphans = [
+        info
+        for row in rows
+        if (info := _gaveup_orphan_row(conn, row["id"], failure_limit)) is not None
+    ]
+    orphans.sort(key=lambda o: o["last_event_at"], reverse=True)
+    return orphans
+
+
+def retry_gaveup_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str],
+    failure_limit: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Supported fresh retry for a gave_up circuit-breaker orphan.
+
+    Guards (fail-closed, in order): task exists and is ``blocked``; NOT a
+    sticky block (explicit human hold — refuse); latest event is
+    ``gave_up``; ``consecutive_failures`` has reached the effective limit;
+    ``reason`` is non-empty.
+
+    On success the failure budget is RESET (``consecutive_failures = 0``,
+    same fresh-start semantics as ``unblock_task`` — a deliberate operator
+    retry), the task lands through the shared parent re-gate
+    (``ready`` when parents are done, ``todo`` otherwise), and a
+    ``gave_up_retried`` event with actor + reason + previous failure count
+    is appended.  ``block_recurrences`` is deliberately untouched (different
+    signal).  Returns ``(ok, error)``.
+    """
+    clean_reason = (reason or "").strip()
+    if not clean_reason:
+        return False, "a reason is required (audit trail for the retry)"
+    now = int(time.time())
+    with write_txn(conn):
+        info = _gaveup_orphan_row(
+            conn, task_id, failure_limit, include_parent_gated=True,
+        )
+        if info is None:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is None:
+                return False, f"task {task_id} not found"
+            if row["status"] != "blocked":
+                return False, (
+                    f"task is {row['status']}, not blocked — only gave_up "
+                    f"orphans are retried through this actor"
+                )
+            if _has_sticky_block(conn, task_id):
+                return False, (
+                    "sticky block — an explicit worker/operator hold newer "
+                    "than the breaker trip; use unblock_task with a human "
+                    "decision, not the gave_up actor"
+                )
+            return False, (
+                "not a gave_up orphan (latest event is not gave_up or "
+                "consecutive_failures below effective limit)"
+            )
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("blocked",), now=now,
+            note="invariant recovery on gave_up retry",
+        )
+        landing = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'blocked'",
+            (landing, task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"concurrent state change on {task_id}"
+        _append_event(
+            conn, task_id, "gave_up_retried",
+            {
+                "actor": actor,
+                "reason": clean_reason,
+                "landed": landing,
+                "previous_failures": info["consecutive_failures"],
+                "effective_limit": info["effective_limit"],
+                "trigger_outcome": info["trigger_outcome"],
+            },
+        )
+    return True, None
+
+
+def archive_gaveup_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str],
+    failure_limit: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Supported archive/supersede for a gave_up circuit-breaker orphan.
+
+    Same fail-closed guards as :func:`retry_gaveup_task`.  On success a
+    human-decision ``blocked`` event (``kind='transient'``,
+    ``reason='gave_up archived: …'``, actor) is appended FIRST — inside the
+    same txn the status flips, so the orphan classifier can never observe
+    the card as an orphan again — then the standard :func:`archive_task`
+    machinery runs (``archived`` event, dependent recompute, workspace
+    reap).  Returns ``(ok, error)``.
+    """
+    clean_reason = (reason or "").strip()
+    if not clean_reason:
+        return False, "a reason is required (audit trail for the archive)"
+    now = int(time.time())
+    with write_txn(conn):
+        info = _gaveup_orphan_row(conn, task_id, failure_limit)
+        if info is None:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is None:
+                return False, f"task {task_id} not found"
+            if row["status"] != "blocked":
+                return False, (
+                    f"task is {row['status']}, not blocked — only gave_up "
+                    f"orphans are archived through this actor"
+                )
+            if _has_sticky_block(conn, task_id):
+                return False, (
+                    "sticky block — an explicit worker/operator hold newer "
+                    "than the breaker trip; archive through archive_task "
+                    "with a human decision, not the gave_up actor"
+                )
+            return False, (
+                "not a gave_up orphan (latest event is not gave_up, "
+                "consecutive_failures below effective limit, or parents "
+                "still open)"
+            )
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("blocked",), now=now,
+            note="invariant recovery on gave_up archive",
+        )
+        # Human-decision block event FIRST: the archive below ends the
+        # card, and this event is what keeps the audit trail honest about
+        # WHO decided the breaker trip was terminal — the orphan
+        # classifier never sees the card again after this txn.
+        _append_event(
+            conn, task_id, "blocked",
+            {
+                "kind": "transient",
+                "reason": f"gave_up archived: {clean_reason}",
+                "actor": actor,
+                "previous_failures": info["consecutive_failures"],
+                "effective_limit": info["effective_limit"],
+                "trigger_outcome": info["trigger_outcome"],
+            },
+        )
+    if not archive_task(conn, task_id):
+        return False, f"archive_task failed for {task_id}"
+    return True, None
+
+
+# ---------------------------------------------------------------------------
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
