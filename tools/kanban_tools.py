@@ -679,6 +679,50 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     return None
 
 
+# Triage profiles that may archive / reassign any card regardless of who
+# created or owns it (the conductor triage loop and the overwatch seat).
+# Everyone else must be the card's current assignee or its creator.
+_TRIAGE_PROFILES = frozenset({"conductor", "overwatch"})
+
+
+def _enforce_triage_ownership(kb, conn, tool_name: str, tid: str) -> Optional[str]:
+    """Fail-closed ownership gate for kanban_archive / kanban_reassign.
+
+    Allowed when ANY of (checked against the LIVE task row, never against
+    caller-supplied strings):
+
+    * the active profile is the task's current ``assignee``
+    * the active profile created the task (``created_by``)
+    * the active profile is a triage profile (conductor / overwatch)
+
+    Workers (HERMES_KANBAN_TASK set) may only touch their own task — the
+    stricter ``_enforce_worker_task_ownership`` guard runs first in the
+    handlers, so a worker reaching this check is already scoped to its
+    own card and just needs the assignee check.
+
+    A missing task row or missing profile identity refuses the call —
+    the gate is fail-closed by construction.
+    """
+    task = kb.get_task(conn, tid)
+    if task is None:
+        return tool_error(f"{tool_name}: task {tid} not found")
+    profile = os.environ.get("HERMES_PROFILE") or ""
+    if not profile:
+        return tool_error(
+            f"{tool_name} refused: no HERMES_PROFILE identity; archive/"
+            "reassign require an attributable actor"
+        )
+    if profile in _TRIAGE_PROFILES:
+        return None
+    if profile == task.assignee or profile == task.created_by:
+        return None
+    return tool_error(
+        f"{tool_name} refused: profile {profile!r} is not the assignee "
+        f"({task.assignee!r}), the creator ({task.created_by!r}), or a "
+        f"triage profile {sorted(_TRIAGE_PROFILES)} for task {tid}"
+    )
+
+
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
@@ -1872,6 +1916,136 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_archive(args: dict, **kw) -> str:
+    """Archive a task — the triage escape hatch for orphaned cards.
+
+    Ownership-guarded (assignee / creator / triage profiles) and
+    reason-stamped: the archive event carries the caller's reason so the
+    audit trail shows why the card was retired.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_archive")
+    if delegated_err:
+        return delegated_err
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    tid = str(tid)
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error(
+            "reason is required — an archive without a stated reason is "
+            "an unauditable board mutation"
+        )
+    reason = redact_sensitive_text(str(reason).strip(), force=True)
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            triage_err = _enforce_triage_ownership(kb, conn, "kanban_archive", tid)
+            if triage_err:
+                return triage_err
+            ok = kb.archive_task(conn, tid)
+            if not ok:
+                return tool_error(
+                    f"could not archive {tid} (already archived or unknown)"
+                )
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn, tid, "archive_reason",
+                    {
+                        "reason": reason,
+                        "actor": os.environ.get("HERMES_PROFILE") or "unknown",
+                    },
+                )
+            return _ok(task_id=tid, status="archived")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_archive: {e}")
+    except Exception as e:
+        logger.exception("kanban_archive failed")
+        return tool_error(f"kanban_archive: {e}")
+
+
+def _handle_reassign(args: dict, **kw) -> str:
+    """Reassign a task to a different profile — the triage recovery path.
+
+    Ownership-guarded (assignee / creator / triage profiles) and
+    reason-stamped: the reassign event carries the caller's reason so the
+    audit trail shows why the card moved.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_reassign")
+    if delegated_err:
+        return delegated_err
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    tid = str(tid)
+    new_assignee = _normalize_profile(args.get("assignee"))
+    if not new_assignee:
+        return tool_error(
+            "assignee is required — name the profile that should take over "
+            "this task"
+        )
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error(
+            "reason is required — a reassign without a stated reason is "
+            "an unauditable board mutation"
+        )
+    reason = redact_sensitive_text(str(reason).strip(), force=True)
+    reclaim, bool_err = _parse_bool_arg(args, "reclaim_first", default=False)
+    if bool_err:
+        return tool_error(bool_err)
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            triage_err = _enforce_triage_ownership(kb, conn, "kanban_reassign", tid)
+            if triage_err:
+                return triage_err
+            prior = kb.get_task(conn, tid)
+            prior_assignee = prior.assignee if prior else None
+            ok = kb.reassign_task(
+                conn, tid, new_assignee,
+                reclaim_first=reclaim, reason=reason,
+            )
+            if not ok:
+                return tool_error(
+                    f"could not reassign {tid} to {new_assignee} (unknown id "
+                    "or a run is still active — retry with reclaim_first=true)"
+                )
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn, tid, "reassign_reason",
+                    {
+                        "reason": reason,
+                        "from": prior_assignee,
+                        "to": new_assignee,
+                        "actor": os.environ.get("HERMES_PROFILE") or "unknown",
+                    },
+                )
+            task = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                assignee=new_assignee,
+                status=task.status if task else None,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_reassign: {e}")
+    except Exception as e:
+        logger.exception("kanban_reassign failed")
+        return tool_error(f"kanban_reassign: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -2554,6 +2728,83 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_ARCHIVE_SCHEMA = {
+    "name": "kanban_archive",
+    "description": (
+        "Archive a task — the triage escape hatch for orphaned, "
+        "superseded, or circuit-breaker cards that no actor will ever "
+        "claim. Ownership-guarded and fail-closed: allowed for the "
+        "card's current assignee, its creator, and the conductor/"
+        "overwatch triage profiles; refused otherwise. A reason is "
+        "required and is written to the task's event log so the archive "
+        "is auditable. Archived parents stop blocking children, the "
+        "same as done."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id to archive.",
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Why this card is being archived (e.g. 'circuit-breaker "
+                    "orphan: assignee profile no longer exists'). Required; "
+                    "written to the event log."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "reason"],
+    },
+}
+
+KANBAN_REASSIGN_SCHEMA = {
+    "name": "kanban_reassign",
+    "description": (
+        "Reassign a task to a different profile — the recovery path for "
+        "'this profile's model is broken, try a different one'. "
+        "Ownership-guarded and fail-closed: allowed for the card's "
+        "current assignee, its creator, and the conductor/overwatch "
+        "triage profiles; refused otherwise. A reason is required and "
+        "is written to the event log. Refuses to reassign a running "
+        "task unless reclaim_first is true."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id to reassign.",
+            },
+            "assignee": {
+                "type": "string",
+                "description": "Profile that should take over the task.",
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Why the card is moving (e.g. 'assignee profile's "
+                    "provider is down; rerouting'). Required; written to "
+                    "the event log."
+                ),
+            },
+            "reclaim_first": {
+                "type": "boolean",
+                "description": (
+                    "Release any active claim before reassigning. Use only "
+                    "when the current worker is genuinely stuck — reclaiming "
+                    "a healthy run kills in-flight progress."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "assignee", "reason"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -2683,4 +2934,22 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_archive",
+    toolset="kanban",
+    schema=KANBAN_ARCHIVE_SCHEMA,
+    handler=_handle_archive,
+    check_fn=_check_kanban_mode,
+    emoji="🗄",
+)
+
+registry.register(
+    name="kanban_reassign",
+    toolset="kanban",
+    schema=KANBAN_REASSIGN_SCHEMA,
+    handler=_handle_reassign,
+    check_fn=_check_kanban_mode,
+    emoji="🔀",
 )

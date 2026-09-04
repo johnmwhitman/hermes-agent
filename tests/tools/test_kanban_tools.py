@@ -1233,3 +1233,269 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# kanban_archive / kanban_reassign — t_7c5545a0
+#
+# The conductor triage loop needs to retire circuit-breaker orphans and
+# reroute stuck cards without shelling out to the CLI. These tests pin
+# the ownership gate (assignee / creator / triage profile allowed;
+# everyone else refused, fail-closed) and the reason-stamped event
+# trail for both verbs.
+
+import json as _json
+
+import pytest as _pytest
+
+
+def _mk_orphan_env(monkeypatch, tmp_path, profile, assignee="dead-lane",
+                   created_by="fable-5.1"):
+    """Stand up an isolated board with one ready task NOT owned by
+    ``profile``, then point the env at it as that profile with no
+    worker task scope (orchestrator context)."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="circuit-breaker orphan",
+                             assignee=assignee)
+        conn.execute(
+            "UPDATE tasks SET created_by=?, status='ready' WHERE id=?",
+            (created_by, tid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return tid
+
+
+# ---------------------------------------------------------------------
+# kanban_archive
+# ---------------------------------------------------------------------
+
+def test_archive_by_creator_allowed(monkeypatch, tmp_path):
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="fable-5.1")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_archive({"task_id": tid,
+                              "reason": "circuit-breaker orphan"})
+    d = _json.loads(out)
+    assert d["ok"] is True, out
+    assert d["status"] == "archived"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "archived"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "archived" in kinds
+        assert "archive_reason" in kinds
+        reason_ev = [e for e in kb.list_events(conn, tid)
+                     if e.kind == "archive_reason"][0]
+        assert reason_ev.payload["reason"] == "circuit-breaker orphan"
+        assert reason_ev.payload["actor"] == "fable-5.1"
+    finally:
+        conn.close()
+
+
+def test_archive_by_triage_profile_allowed(monkeypatch, tmp_path):
+    """conductor may archive a card it neither owns nor created."""
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="conductor")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_archive({"task_id": tid, "reason": "triage sweep"})
+    d = _json.loads(out)
+    assert d["ok"] is True, out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "archived"
+    finally:
+        conn.close()
+
+
+def test_archive_by_assignee_allowed(monkeypatch, tmp_path):
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="dead-lane")
+    from tools import kanban_tools as kt
+
+    out = kt._handle_archive({"task_id": tid, "reason": "self-retire"})
+    assert _json.loads(out)["ok"] is True, out
+
+
+def test_archive_refused_for_unrelated_profile(monkeypatch, tmp_path):
+    """A profile that is neither assignee, creator, nor triage must be
+    refused — fail-closed."""
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="intruder")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_archive({"task_id": tid, "reason": "hostile archive"})
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "refused" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "ready"  # untouched
+    finally:
+        conn.close()
+
+
+def test_archive_refused_without_reason(monkeypatch, tmp_path):
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="conductor")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_archive({"task_id": tid})
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "reason is required" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_archive_unknown_task_refused(monkeypatch, tmp_path):
+    _mk_orphan_env(monkeypatch, tmp_path, profile="conductor")
+    from tools import kanban_tools as kt
+
+    out = kt._handle_archive({"task_id": "t_deadbeef",
+                              "reason": "ghost card"})
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "not found" in d["error"]
+
+
+def test_worker_archive_foreign_task_refused(monkeypatch, worker_env):
+    """A dispatcher-scoped worker cannot archive a sibling card — the
+    worker-ownership guard fires before the triage gate."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="sibling", assignee="peer")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_archive({"task_id": other, "reason": "overreach"})
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status != "archived"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------
+# kanban_reassign
+# ---------------------------------------------------------------------
+
+def test_reassign_by_triage_profile_allowed(monkeypatch, tmp_path):
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="conductor")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_reassign({
+        "task_id": tid,
+        "assignee": "developer",
+        "reason": "assignee profile's provider is down; rerouting",
+    })
+    d = _json.loads(out)
+    assert d["ok"] is True, out
+    assert d["assignee"] == "developer"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).assignee == "developer"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "assigned" in kinds
+        assert "reassign_reason" in kinds
+        ev = [e for e in kb.list_events(conn, tid)
+              if e.kind == "reassign_reason"][0]
+        assert ev.payload["from"] == "dead-lane"
+        assert ev.payload["to"] == "developer"
+        assert ev.payload["actor"] == "conductor"
+    finally:
+        conn.close()
+
+
+def test_reassign_refused_for_unrelated_profile(monkeypatch, tmp_path):
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="intruder")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_reassign({
+        "task_id": tid, "assignee": "intruder", "reason": "self-grab",
+    })
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "refused" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).assignee == "dead-lane"  # untouched
+    finally:
+        conn.close()
+
+
+def test_reassign_refused_without_reason_or_assignee(monkeypatch, tmp_path):
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="conductor")
+    from tools import kanban_tools as kt
+
+    out = kt._handle_reassign({"task_id": tid, "assignee": "developer"})
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "reason is required" in d["error"]
+
+    out2 = kt._handle_reassign({"task_id": tid, "reason": "no target"})
+    d2 = _json.loads(out2)
+    assert d2.get("ok") is not True
+    assert "assignee is required" in d2["error"]
+
+
+def test_reassign_running_task_refused_without_reclaim(monkeypatch, tmp_path):
+    tid = _mk_orphan_env(monkeypatch, tmp_path, profile="conductor")
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, tid)  # now running
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_reassign({
+        "task_id": tid, "assignee": "developer", "reason": "reroute",
+    })
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "reclaim_first" in d["error"]
+
+    # With reclaim_first the reassign lands.
+    out2 = kt._handle_reassign({
+        "task_id": tid, "assignee": "developer", "reason": "reroute",
+        "reclaim_first": True,
+    })
+    d2 = _json.loads(out2)
+    assert d2["ok"] is True, out2
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).assignee == "developer"
+    finally:
+        conn.close()
