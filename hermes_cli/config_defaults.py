@@ -2841,6 +2841,13 @@ DEFAULT_CONFIG = {
         # claims while RED, missing, malformed, or unsupported state defers
         # them; already-running workers and reclaim/promotion still proceed.
         "disk_governor_state_path": None,
+        # Profiles exempt from the disk-governor RED/UNKNOWN deferral: the
+        # conductor triage loop and the overwatch seat are the only lanes
+        # allowed to issue the disk-pressure envelope and reclaim space, so
+        # the gate must never strand its own issuer. ``None`` keeps the
+        # built-in default (conductor, overwatch); a list of profile names
+        # overrides it; an empty list disables the exemption entirely.
+        "disk_governor_exempt_profiles": None,
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.

@@ -10536,6 +10536,40 @@ def _dispatch_governor_level() -> Optional[str]:
     return level if level in {"GREEN", "YELLOW", "RED"} else "UNKNOWN"
 
 
+# Profiles the disk governor may never strand: the conductor triage loop and
+# the overwatch seat are the lanes allowed to issue the disk-pressure envelope
+# and reclaim space, so a RED governor must not stop their dispatch — the gate
+# must never block its own issuer. Mirrors ``_TRIAGE_PROFILES`` in
+# ``tools/kanban_tools.py``; keep the two in sync. Operators may widen the
+# set via ``kanban.disk_governor_exempt_profiles``.
+DISPATCH_GOVERNOR_DEFAULT_EXEMPT_PROFILES = frozenset({"conductor", "overwatch"})
+
+
+def _disk_governor_exempt_profiles() -> "frozenset[str]":
+    """Return the profiles exempt from disk-governor RED/UNKNOWN deferral.
+
+    ``kanban.disk_governor_exempt_profiles`` (list of strings) overrides the
+    default triage set; an explicit empty list disables the exemption
+    entirely. Invalid values fail closed to the default so a typo cannot
+    silently re-strand the envelope issuer.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        kanban = config.get("kanban", {})
+        if not isinstance(kanban, Mapping):
+            return DISPATCH_GOVERNOR_DEFAULT_EXEMPT_PROFILES
+        raw = kanban.get("disk_governor_exempt_profiles")
+        if raw is None:
+            return DISPATCH_GOVERNOR_DEFAULT_EXEMPT_PROFILES
+        if not isinstance(raw, (list, tuple)):
+            return DISPATCH_GOVERNOR_DEFAULT_EXEMPT_PROFILES
+        return frozenset(str(p).strip() for p in raw if str(p).strip())
+    except Exception:
+        return DISPATCH_GOVERNOR_DEFAULT_EXEMPT_PROFILES
+
+
 def _system_memory_sample() -> dict:
     """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
 
@@ -10863,22 +10897,29 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    # Optional disk/swap-governor admission. This is intentionally inside the
-    # dispatcher's single-writer tick and before both concurrency short-circuits
-    # and ready/review enumeration, so every gateway/CLI tick reports the
-    # canonical pressure state and no task can be claimed between the check and
-    # spawn. Reclaim, crash detection, timeout enforcement, and todo->ready
+    # Optional disk/swap-governor admission. The level is read here, inside
+    # the dispatcher's single-writer tick and before the concurrency
+    # short-circuits, so every gateway/CLI tick reports the canonical
+    # pressure state even when a cap would otherwise mask it. The deferral
+    # itself is applied AFTER ready/review enumeration below so that exempt
+    # triage profiles (conductor / overwatch — the only lanes allowed to
+    # issue the disk-pressure envelope and reclaim space) can still be
+    # spawned under a RED gate. The gate must never block its own issuer.
+    # Reclaim, crash detection, timeout enforcement, and todo->ready
     # promotion above still run; existing workers are untouched. Once
     # configured, unreadable state fails closed.
     disk_level = _dispatch_governor_level()
+    disk_exempt_profiles: "frozenset[str]" = frozenset()
     if disk_level in {"RED", "UNKNOWN"}:
         result.disk_pressure = disk_level
+        disk_exempt_profiles = _disk_governor_exempt_profiles()
         _log.warning(
             "kanban dispatch: configured disk governor is %s; "
-            "spawning no new workers this tick (deferred, not dropped)",
+            "spawning no new workers this tick except exempt profiles %s "
+            "(deferred, not dropped)",
             disk_level,
+            sorted(disk_exempt_profiles),
         )
-        return result
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -10956,6 +10997,37 @@ def _dispatch_once_locked(
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
+    # Disk-governor deferral (applied after enumeration, before any claim):
+    # under RED/UNKNOWN only exempt triage profiles may still spawn — the
+    # conductor triage loop and the overwatch seat are the lanes allowed to
+    # issue the disk-pressure envelope and reclaim space, so the gate must
+    # never strand its own issuer. Everyone else stays queued for the next
+    # tick. A configured-exempt assignee is logged per card so the audit
+    # trail shows which profile the governor admitted under pressure.
+    if result.disk_pressure is not None:
+        def _disk_admitted(assignee: Optional[str]) -> bool:
+            return bool(assignee) and assignee in disk_exempt_profiles
+
+        admitted = sorted(
+            {row["assignee"] for row in (*ready_rows, *review_rows)
+             if _disk_admitted(row["assignee"])}
+        )
+        if admitted:
+            _log.warning(
+                "kanban dispatch: disk governor is %s; exempt profiles %s "
+                "still spawning this tick",
+                result.disk_pressure,
+                admitted,
+            )
+        ready_rows = [r for r in ready_rows if _disk_admitted(r["assignee"])]
+        review_rows = [r for r in review_rows if _disk_admitted(r["assignee"])]
+        if not ready_rows and not review_rows:
+            _log.warning(
+                "kanban dispatch: configured disk governor is %s; "
+                "spawning no new workers this tick (deferred, not dropped)",
+                result.disk_pressure,
+            )
+            return result
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work
