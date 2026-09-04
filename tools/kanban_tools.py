@@ -377,6 +377,19 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _triage_actor_profile() -> Optional[str]:
+    """Return the active profile name when it is a triage profile.
+
+    Triage profiles (conductor / overwatch) may mutate cards other than
+    their own claimed task — that's their whole job (see #20216 /
+    t_3c949d42: measured live, the conductor's cross-card archive/block
+    calls were refused by the worker-scope guard, forcing the fable seat
+    to retire orphans by hand). Every other profile stays scoped.
+    """
+    profile = os.environ.get("HERMES_PROFILE") or ""
+    return profile if profile in _TRIAGE_PROFILES else None
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -390,7 +403,11 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     ``HERMES_KANBAN_TASK`` in env) aren't subject to this check — their
     job is routing, and they sometimes legitimately close out child
     tasks or reopen blocked ones. Workers are narrowly scoped to their
-    one task.
+    one task — EXCEPT triage profiles (conductor / overwatch), whose
+    runs exist precisely to triage OTHER cards: archive orphans, reroute
+    stuck work, block cards that need a human (see #20216). Those
+    profiles are admitted here and then still pass through the
+    fail-closed triage/assignee/creator gate in the handler.
 
     Returns ``None`` when the call is allowed, or a tool-error string
     when it must be rejected. Callers should ``return`` the error
@@ -401,6 +418,8 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
     if tid != env_tid:
+        if _triage_actor_profile() is not None:
+            return None
         return tool_error(
             f"worker is scoped to task {env_tid}; refusing to mutate "
             f"{tid}. Use kanban_comment to hand off information to other "
@@ -670,6 +689,13 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
+    if _triage_actor_profile() is not None:
+        # Triage profiles (conductor / overwatch) may block cards other
+        # than their own claimed task — that's the cross-card triage
+        # escape hatch. Reason-stamped by construction: kanban_block
+        # already requires a non-empty reason below, and block_task
+        # event-logs it. Non-triage workers stay scoped to their card.
+        return None
     if os.environ.get("HERMES_KANBAN_TASK"):
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "

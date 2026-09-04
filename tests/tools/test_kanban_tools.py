@@ -1435,6 +1435,178 @@ def test_reassign_by_triage_profile_allowed(monkeypatch, tmp_path):
         conn.close()
 
 
+# ---------------------------------------------------------------------
+# Cross-card triage from a CLAIMED worker run — t_3c949d42
+#
+# Follow-up to t_246c9833: the triage ownership gate admits
+# conductor/overwatch, but _enforce_worker_task_ownership still refused
+# every cross-card call with "worker is scoped to task <own>" — measured
+# live on t_4ea70b13, forcing the fable seat to archive orphans by hand.
+# These tests pin: triage-profile workers may archive / reassign / block
+# / unblock OTHER cards (reason-stamped, event-logged); every other
+# profile's workers stay scoped to their own card.
+# ---------------------------------------------------------------------
+
+def _mk_scoped_worker_env(monkeypatch, tmp_path, profile):
+    """Stand up an isolated board with a claimed run for ``profile``
+    plus one foreign ready card the worker does not own, then scope the
+    env to the claimed task (dispatcher-worker context)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        own = kb.create_task(conn, title="triage-run", assignee=profile)
+        kb.claim_task(conn, own)
+        other = kb.create_task(conn, title="orphan", assignee="dead-lane")
+        conn.execute(
+            "UPDATE tasks SET created_by='fable-5.1', status='ready' WHERE id=?",
+            (other,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", own)
+    return own, other
+
+
+@pytest.fixture
+def triage_worker_env(monkeypatch, tmp_path):
+    """A dispatcher-scoped worker run whose profile is a triage profile,
+    plus one foreign card it does not own."""
+    return _mk_scoped_worker_env(monkeypatch, tmp_path, "conductor")
+
+
+def test_triage_profile_can_archive_other_card(monkeypatch, triage_worker_env):
+    """conductor, from its claimed run, may archive a card it neither
+    owns nor created — the worker-scope guard admits triage profiles."""
+    own, other = triage_worker_env
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_archive({"task_id": other, "reason": "orphan sweep"})
+    d = _json.loads(out)
+    assert d["ok"] is True, out
+    assert d["status"] == "archived"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "archived"
+        assert kb.get_task(conn, own).status == "running"  # own run intact
+        kinds = [e.kind for e in kb.list_events(conn, other)]
+        assert "archive_reason" in kinds
+        ev = [e for e in kb.list_events(conn, other)
+              if e.kind == "archive_reason"][0]
+        assert ev.payload["actor"] == "conductor"
+        assert ev.payload["reason"] == "orphan sweep"
+    finally:
+        conn.close()
+
+
+def test_triage_profile_can_reassign_other_card(monkeypatch, triage_worker_env):
+    own, other = triage_worker_env
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_reassign({
+        "task_id": other, "assignee": "developer",
+        "reason": "dead lane; rerouting",
+    })
+    d = _json.loads(out)
+    assert d["ok"] is True, out
+    assert d["assignee"] == "developer"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).assignee == "developer"
+        ev = [e for e in kb.list_events(conn, other)
+              if e.kind == "reassign_reason"][0]
+        assert ev.payload["actor"] == "conductor"
+    finally:
+        conn.close()
+
+
+def test_triage_profile_can_block_other_card(monkeypatch, triage_worker_env):
+    own, other = triage_worker_env
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_block({
+        "task_id": other, "reason": "needs a human decision",
+        "kind": "needs_input",
+    })
+    d = _json.loads(out)
+    assert d["ok"] is True, out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "blocked"
+        assert kb.get_task(conn, own).status == "running"  # own run intact
+    finally:
+        conn.close()
+
+
+def test_triage_profile_can_unblock_other_card(monkeypatch, triage_worker_env):
+    own, other = triage_worker_env
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.block_task(conn, other, reason="parked", kind="needs_input")
+        assert kb.get_task(conn, other).status == "blocked"
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_unblock({"task_id": other})
+    d = _json.loads(out)
+    assert d["ok"] is True, out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_non_triage_worker_cannot_archive_other_card(monkeypatch, tmp_path):
+    """The negative: a dispatcher-scoped worker that is NOT a triage
+    profile is still refused on a foreign card — worker scoping holds."""
+    own, other = _mk_scoped_worker_env(monkeypatch, tmp_path, "intruder")
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_archive({"task_id": other, "reason": "overreach"})
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d["error"]
+
+    out = kt._handle_block({"task_id": other, "reason": "overreach"})
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d["error"]
+
+    out = kt._handle_reassign({
+        "task_id": other, "assignee": "intruder", "reason": "self-grab",
+    })
+    d = _json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "ready"  # untouched
+    finally:
+        conn.close()
+
+
 def test_reassign_refused_for_unrelated_profile(monkeypatch, tmp_path):
     tid = _mk_orphan_env(monkeypatch, tmp_path, profile="intruder")
     from hermes_cli import kanban_db as kb
