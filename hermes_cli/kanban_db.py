@@ -4979,6 +4979,57 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Self-review guard (t_18d071ac): the implementer must never claim
+        # their own card out of the review lane. The reviewer identity comes
+        # from the task assignee (set by request_review) and the implementer
+        # from the review_requested provenance; fail closed when they match
+        # and the claimer profile is that same identity. request_review
+        # already refuses to create such provenance (t_1c80eb07) — this
+        # protects legacy or pre-guard rows at claim time.
+        _sr_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if _sr_row is not None:
+            _sr_event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            _sr_payload: dict = {}
+            if _sr_event and _sr_event["payload"]:
+                try:
+                    _parsed = json.loads(_sr_event["payload"])
+                    if isinstance(_parsed, dict):
+                        _sr_payload = _parsed
+                except (json.JSONDecodeError, TypeError):
+                    _sr_payload = {}
+            _sr_reviewer = _canonical_assignee(_sr_row["assignee"])
+            _sr_implementer = _canonical_assignee(_sr_payload.get("implementer"))
+            _sr_claimer = _canonical_assignee(lock.split(":")[0])
+            if (
+                _sr_reviewer is not None
+                and _sr_implementer is not None
+                and _sr_reviewer == _sr_implementer
+                and _sr_claimer == _sr_implementer
+            ):
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_claim_refused_self_review",
+                    {
+                        "claimer": lock,
+                        "reviewer": _sr_reviewer,
+                        "implementer": _sr_implementer,
+                    },
+                )
+                _log.warning(
+                    "kanban claim_review_task: task %s claim refused — reviewer "
+                    "%s is the implementer (self-review)",
+                    task_id, _sr_reviewer,
+                )
+                return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -5649,6 +5700,71 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    # Self-approval guard (t_18d071ac): a completion that approves a review
+    # cycle must never let the implementer act as their own reviewer. Walk
+    # the review provenance chain — each ``review_requested`` event names a
+    # reviewer and each intervening ``changes_requested`` outcome names the
+    # reviewer who returned the card — and fail closed if the reviewer who
+    # would be approving is the implementer. request_review already refuses
+    # to *create* such a cycle (t_1c80eb07); this guard protects legacy or
+    # pre-guard rows where the provenance is already entangled, for both the
+    # active-review-run and parked-in-review approval paths.
+    _self_review_row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if _self_review_row and _self_review_row["status"] in ("running", "review"):
+        _prov_events = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind IN ('review_requested', 'changes_requested') "
+            "ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        _reviewer = None
+        _implementer = None
+        for _ev in _prov_events:
+            try:
+                _payload = json.loads(_ev["payload"]) if _ev["payload"] else {}
+            except (json.JSONDecodeError, TypeError):
+                _payload = {}
+            if not isinstance(_payload, dict):
+                continue
+            if _ev["kind"] == "review_requested":
+                if isinstance(_payload.get("implementer"), str):
+                    _implementer = _payload["implementer"]
+                if isinstance(_payload.get("reviewer"), str):
+                    _reviewer = _payload["reviewer"]
+            else:  # changes_requested outcome: names who returned the card
+                if isinstance(_payload.get("reviewer"), str):
+                    _reviewer = _payload["reviewer"]
+        _reviewer = _canonical_assignee(_reviewer)
+        _implementer = _canonical_assignee(_implementer)
+        if (
+            _reviewer is not None
+            and _implementer is not None
+            and _reviewer == _implementer
+        ):
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_self_review",
+                    {
+                        "reviewer": _reviewer,
+                        "implementer": _implementer,
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            _log.warning(
+                "kanban complete_task: task %s approval refused — reviewer %s is "
+                "the implementer; leaving task in its prior status",
+                task_id, _reviewer,
+            )
+            return False
 
     # Minimum-runtime gate: a worker that exits rc=0 in under
     # DEFAULT_MIN_WORKER_RUNTIME_SECONDS is treated as HOLLOW — the

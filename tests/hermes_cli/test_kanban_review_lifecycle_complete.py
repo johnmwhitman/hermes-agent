@@ -823,3 +823,145 @@ def test_direct_request_review_refuses_reviewer_equal_to_implementer(conn) -> No
     )
     assert not ok
     assert "reviewer is the implementer" in reason
+
+
+def _self_review_setup(conn):
+    """Drive a card to a claimed review run whose reviewer IS the implementer.
+
+    Uses raw SQL to bypass both fail-closed guards (request_review from
+    t_1c80eb07 and claim_review_task from t_18d071ac) so the complete_task
+    approval paths can be tested in isolation against the entangled
+    provenance a legacy row would carry.
+    Returns (task_id, review_run).
+    """
+    task_id = kb.create_task(conn, title="Self review card", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'review', assignee = 'builder', "
+            "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "review_requested",
+            {"reviewer": "builder", "implementer": "builder",
+             "source_status": "running"},
+        )
+        now = int(time.time())
+        run_cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'builder', 'running', ?, ?, ?)",
+            (task_id, "builder:1", now + 900, now),
+        )
+        run_id = run_cur.lastrowid
+        conn.execute(
+            "UPDATE tasks SET status = 'running', current_run_id = ?, "
+            "claim_lock = 'builder:1', claim_expires = ? WHERE id = ?",
+            (run_id, now + 900, task_id),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "claimed",
+            {"lock": "builder:1", "expires": now + 900, "run_id": run_id,
+             "source_status": "review"},
+            run_id=run_id,
+        )
+    review = kb.get_task(conn, task_id)
+    assert review is not None
+    assert review.status == "running"
+    assert review.current_run_id == run_id
+    return task_id, review
+
+
+def test_claim_review_task_refuses_implementer_claimer(conn) -> None:
+    """An implementer must not be able to claim their own card out of the
+    review lane — even before any approval is attempted."""
+    task_id = kb.create_task(conn, title="Claim guard card", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'review', assignee = 'builder', "
+            "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "review_requested",
+            {"reviewer": "builder", "implementer": "builder",
+             "source_status": "running"},
+        )
+
+    assert kb.claim_review_task(conn, task_id, claimer="builder:1") is None
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "review"
+    assert unchanged.current_run_id is None
+
+    # A distinct reviewer can still claim the same card.
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+    assert review.status == "running"
+    assert review.current_run_id is not None
+
+
+def test_complete_task_refuses_self_approval_from_review(conn) -> None:
+    """Regression for t_18d071ac: a reviewer run whose reviewer is the
+    implementer (provenance on the review_requested event) must not be able
+    to approve the card. complete_task fails closed and leaves the review
+    run untouched."""
+    task_id, review = _self_review_setup(conn)
+
+    assert not kb.complete_task(
+        conn, task_id, summary="self-approved", expected_run_id=review.current_run_id,
+    )
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert unchanged.current_run_id == review.current_run_id
+    assert not [e for e in kb.list_events(conn, task_id) if e.kind == "completed"]
+
+
+def test_complete_task_refuses_unclaimed_self_approval(conn) -> None:
+    """The parked-in-review path (no active run) also fails closed when the
+    recorded reviewer provenance is the implementer."""
+    task_id, review = _self_review_setup(conn)
+
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'review', current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL WHERE id = ?",
+            (task_id,),
+        )
+
+    assert not kb.complete_task(conn, task_id, summary="manual self-approval")
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "review"
+
+
+def test_complete_task_allows_distinct_reviewer_approval(conn) -> None:
+    """Sanity: the normal approval path — reviewer distinct from the
+    implementer — still completes."""
+    task_id = kb.create_task(conn, title="Honest review card", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+    assert kb.request_review(
+        conn, task_id, reviewer="reviewer", summary="ready",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+    assert kb.complete_task(
+        conn, task_id, summary="approved", expected_run_id=review.current_run_id,
+    )
+    done = kb.get_task(conn, task_id)
+    assert done is not None
+    assert done.status == "done"
