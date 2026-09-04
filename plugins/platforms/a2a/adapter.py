@@ -864,6 +864,20 @@ class A2AAdapter(BasePlatformAdapter):
                             tid, rec, peer=str(rec.get("peer") or ""),
                             scope=(str(rec.get("agent_slug") or ""), str(rec.get("tenant") or "")),
                             stopped=True)
+                # Late-end settle sweep: a worker that was confirmed ended by
+                # recovery (record already terminal) must have its registry
+                # entry settled so the handle is not retained forever. An
+                # entry whose worker is provably done settles; a resistant
+                # worker's entry stays quarantined for the next pass.
+                for tid in self._registered_task_ids():
+                    rec = self.tasks.get(tid)
+                    if rec is None or rec["state"] not in protocol.TERMINAL_STATES:
+                        continue
+                    entry = self._registered_task(tid)
+                    if entry is None or not entry.get("stop_requested"):
+                        continue
+                    if self._worker_done(entry):
+                        self._settle_registered_task(tid)
             except Exception:
                 logger.debug("A2A: watchdog error", exc_info=True)
 
@@ -1228,6 +1242,7 @@ class A2AAdapter(BasePlatformAdapter):
             "create_time": None,
             "pgid": None,
             "local_future": None,
+            "gateway_task": None,
             "session_key": session_key,
             "stop_latch": threading.Event(),
             "lock": threading.Lock(),
@@ -1242,13 +1257,27 @@ class A2AAdapter(BasePlatformAdapter):
         with self._exec_registry_lock:
             return self._exec_registry.get(task_id)
 
+    def _registered_task_ids(self) -> list[str]:
+        with self._exec_registry_lock:
+            return list(self._exec_registry.keys())
+
     def _worker_done(self, entry: dict) -> bool:
         """Positive evidence that the exact registered worker has finished:
-        a proc that has exited, or a local future that is done/cancelled."""
+        a proc that has exited, or a local future that is done/cancelled.
+
+        For a local turn with a bound gateway task, the bound task (the real
+        worker) is the evidence: the dispatch wrapper can report done (an
+        exception unwind) while the gateway task it spawned keeps running —
+        wrapper-done is worker evidence ONLY when no gateway task was ever
+        bound."""
         try:
             proc = entry.get("proc")
             if proc is not None:
                 return proc.poll() is not None
+            gt = entry.get("gateway_task")
+            if gt is not None:
+                done = getattr(gt, "done", None)
+                return bool(done is not None and done())
             local_future = entry.get("local_future")
             if local_future is not None:
                 return bool(
@@ -1377,6 +1406,8 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _stop_entry_handle(self, entry: dict) -> bool:
         """Stop the exact handle bound to an entry. Positive confirmation only."""
+        if entry.get("stop_confirmed"):
+            return True  # already contained — never re-enter the bounded waits
         proc = entry.get("proc")
         local_future = entry.get("local_future")
         if proc is not None:
@@ -1402,37 +1433,187 @@ class A2AAdapter(BasePlatformAdapter):
         """Cancel THIS task's retained dispatch Future and wait (bounded) for
         the turn to positively finish (done or cancelled).
 
-        The Future spans the real gateway processing for this task only, so a
-        sibling task on the same session is never touched. Returns True only
-        on positive confirmation — the future actually done/cancelled within
-        the bounded window. Never sets the registry stop latch (that latch
-        belongs to the gateway's CANCELLED processing hook and is only set
-        when a stop was genuinely requested)."""
-        local_future = entry.get("local_future")
+        WORKER-STOP EVIDENCE — exact handles only, never a protocol state:
+
+        - The dispatch Future (``entry[\"local_future\"]``) done/cancelled is
+          worker evidence ONLY when no gateway task was ever bound: the
+          wrapper coroutine unwinds (and reports done) the moment its own
+          sleep is cancelled — but a wrapper that swallowed CancelledError,
+          or one whose spawned gateway task kept running past the wrapper's
+          unwind, reports done while the real worker lives on.
+        - The exact bound gateway task (``entry[\"gateway_task\"]``) done is
+          the ONLY worker evidence once bound: it is the real worker. A
+          CANCELLED/CANCELED (or FAILED) PROTOCOL STATE IS NEVER EVIDENCE —
+          it is a record flip (on_processing_complete hook, watchdog CAS)
+          that a cancel-swallowing worker outlives.
+
+        Cancel delivery: cancel the bound gateway task directly (the real
+        worker) AND the dispatch future (so the wrapper unwinds).
+
+        Recovery: when the worker is not provably ended inside the bounded
+        window, escalate to bounded recovery — keep re-delivering the cancel
+        and wait one orphan deadline for positive worker-end evidence; the
+        record is honestly terminalized FAILED only once the worker is
+        provably ended (a failed stop must never read as CANCELED, and a
+        live worker is never FAILED while containment is claimed)."""
+        with entry["lock"]:
+            local_future = entry.get("local_future")
+            entry["cancel_requested"] = True
         if local_future is None or not hasattr(local_future, "cancel"):
             return False
+
+        def _worker_ended() -> bool:
+            # ONLY exact-handle evidence: never a protocol state. The exact
+            # BOUND gateway task is the worker; once bound, only its end is
+            # worker evidence — the dispatch wrapper can report done (an
+            # exception unwind or unbound return) while the worker it spawned
+            # keeps running, so wrapper-done is evidence ONLY when no gateway
+            # task was ever bound.
+            try:
+                gt = entry.get("gateway_task")
+            except Exception:
+                gt = None
+            if gt is not None:
+                try:
+                    done = getattr(gt, "done", None)
+                    return bool(done is not None and done())
+                except Exception:
+                    return False
+            try:
+                return bool(
+                    local_future.done()
+                    or getattr(local_future, "cancelled", lambda: False)())
+            except Exception:
+                return False
+
+        def _deliver_cancel() -> None:
+            try:
+                gt = entry.get("gateway_task")
+                if gt is not None and hasattr(gt, "cancel"):
+                    gt.cancel()  # the real worker — stops the turn's work
+            except Exception:
+                pass
+            try:
+                local_future.cancel()
+            except Exception:
+                pass
+
         try:
-            if local_future.done() or getattr(local_future, "cancelled", lambda: False)():
+            if _worker_ended():
                 return True  # turn already finished — nothing to stop
         except Exception:
             return False
-        try:
-            local_future.cancel()
-        except Exception as e:
-            logger.debug(
-                "A2A: local future cancel failed for task %s: %s",
-                entry.get("task_id"), e,
-            )
-            return False
+        _deliver_cancel()
         deadline = time.monotonic() + _CANCEL_CONFIRM_TIMEOUT
         while time.monotonic() < deadline:
-            try:
-                if local_future.done() or getattr(local_future, "cancelled", lambda: False)():
-                    return True
-            except Exception:
-                return False
-            time.sleep(0.01)
-        return False
+            if _worker_ended():
+                return True
+            if self._watchdog_stop.wait(timeout=0.05):
+                return False  # shutdown: stay quarantined for the next pass
+        # Bounded window expired with the worker still unprovably stopped
+        # (a cancel-swallowing worker, or a queued/unbound turn): escalate
+        # to bounded recovery — never claim containment off a done wrapper
+        # while the bound gateway task is still provably alive.
+        never_bound = entry.get("gateway_task") is None
+        return self._recover_stuck_unbound_turn(
+            entry, _deliver_cancel, _worker_ended, never_bound=never_bound)
+
+    def _recover_stuck_unbound_turn(self, entry: dict, deliver_cancel=None,
+                                    worker_ended=None, never_bound=False) -> bool:
+        """Bounded recovery for a local turn whose stop is not yet provable.
+
+        The record's protocol state is NEVER worker-stop evidence: a
+        cancel-swallowing worker outlives every CANCELLED/FAILED flip, and a
+        dispatch wrapper can report done while the gateway task it spawned
+        keeps running. So recovery re-delivers the cancel on the exact
+        handles each pass and waits one orphan deadline for POSITIVE
+        worker-end evidence (dispatch future done/cancelled when no gateway
+        task was bound, else the bound gateway task done). Only when the
+        worker is provably ended is the record honestly terminalized — CAS
+        the task FAILED exactly once (or accept a terminal state that arrived
+        concurrently) — and containment reported. The record is NEVER left
+        merely CANCEL_REQUESTED with containment claimed, and never FAILED
+        while the worker is still provably alive. Returns True only on
+        worker-ended + record-terminal; False leaves the entry quarantined
+        for the next pass."""
+        task_id = str(entry.get("task_id") or "")
+        agent_slug = str(entry.get("agent_slug") or "")
+        try:
+            deadline = time.monotonic() + float(self._orphan_timeout_for(agent_slug))
+        except Exception:
+            deadline = time.monotonic() + 360.0
+        pass_n = 0
+        while time.monotonic() < deadline:
+            pass_n += 1
+            if deliver_cancel is not None:
+                deliver_cancel()  # idempotent; lands if the worker binds late
+            if worker_ended is not None and worker_ended():
+                break  # worker provably ended — now terminalize honestly
+            logger.info(
+                "A2A: recovery pass %d task %s worker not provably ended; "
+                "next poll in 5s (deadline in %.0fs)",
+                pass_n, task_id, max(0.0, deadline - time.monotonic()))
+            if self._watchdog_stop.wait(timeout=5.0):
+                return False  # shutdown: stay quarantined for the next pass
+        if worker_ended is not None and not worker_ended():
+            if never_bound:
+                # Queued-and-unbound: nothing alive to contain (no exact
+                # gateway task was ever created for this turn). Honestly
+                # terminalize the orphaned turn's record and confirm.
+                final = self.tasks.compare_and_set_state(
+                    task_id,
+                    (
+                        protocol.STATE_SUBMITTED,
+                        protocol.STATE_WORKING,
+                        protocol.STATE_INPUT_REQUIRED,
+                        protocol.STATE_CANCEL_REQUESTED,
+                    ),
+                    protocol.STATE_FAILED,
+                    "[worker orphaned: queued local turn never bound; stop confirmed]",
+                )
+                if final is None and not (
+                        self.tasks.get(task_id) or {}).get("state", "") \
+                        in protocol.TERMINAL_STATES:
+                    logger.warning(
+                        "A2A: task %s unbound recovery could not terminalize "
+                        "the record; entry stays quarantined", task_id)
+                    return False
+                logger.warning(
+                    "A2A: task %s orphaned unbound local turn failed after "
+                    "one orphan deadline (%s); stop confirmed",
+                    task_id, agent_slug or "-")
+                return True
+            logger.warning(
+                "A2A: task %s worker resisted containment past one orphan "
+                "deadline; entry stays quarantined, watchdog keeps retrying",
+                task_id)
+            return False  # UNCONFIRMED — the worker may still be alive
+        # Worker provably ended: the record must be honestly terminal, never
+        # left in CANCEL_REQUESTED with containment claimed. CAS exactly once
+        # — the confirmed stop races the compliant turn's own CANCELED hook,
+        # so whichever honest terminal state arrived first stands.
+        rec = self.tasks.get(task_id)
+        if rec is None or rec["state"] in protocol.TERMINAL_STATES:
+            return True  # the turn's own hook terminalized it concurrently
+        final = self.tasks.compare_and_set_state(
+            task_id,
+            (
+                protocol.STATE_SUBMITTED,
+                protocol.STATE_WORKING,
+                protocol.STATE_INPUT_REQUIRED,
+                protocol.STATE_CANCEL_REQUESTED,
+            ),
+            protocol.STATE_FAILED,
+            "[worker stop confirmed after recovery]",
+        )
+        if final is None and not (
+                self.tasks.get(task_id) or {}).get("state", "") \
+                in protocol.TERMINAL_STATES:
+            logger.warning(
+                "A2A: task %s stop confirmed but the record could not be "
+                "terminalized; entry stays quarantined", task_id)
+            return False
+        return True
 
     def _settle_registered_task(self, task_id: str) -> None:
         """Mark a registry entry settled and remove it.
@@ -1968,6 +2149,16 @@ class A2AAdapter(BasePlatformAdapter):
             return
         # Wait on THIS task by identity until it finishes; never re-read the
         # shared slot (a sibling may replace it).
+        task_id = str(getattr(event, "message_id", "") or "")
+        if task_id:
+            try:
+                entry = self._registered_task(task_id)
+                if entry is not None:
+                    with entry["lock"]:
+                        if entry.get("gateway_task") is None:
+                            entry["gateway_task"] = own_task
+            except Exception:
+                pass
         while True:
             done = getattr(own_task, "done", None)
             try:

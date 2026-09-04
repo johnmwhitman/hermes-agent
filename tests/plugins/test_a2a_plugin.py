@@ -3575,3 +3575,161 @@ class TestForwardHollowGuardAndFailures:
             adapter.tasks._tasks["t-long"]["state"] == protocol.STATE_SUBMITTED
         adapter.tasks._tasks["t-long"]["created_at"] = _time.time() - 1000
         assert adapter.tasks.fail_orphans(300, timeout_for=timeout_for) == ["t-long"]
+
+
+# --------------------------------------------------------------------------
+# Failed-stop false-green: FAILED/CANCELED protocol state is never
+# worker-stop evidence; only exact-handle end-of-worker evidence settles a
+# cancel. (t_4aa732bc)
+# --------------------------------------------------------------------------
+
+class _ResistantFuture:
+    """A cancel-swallowing worker double: ``cancel()`` is a no-op and
+    ``done()`` stays False (still running) until the cancel is delivered
+    ``release_after`` times (a worker that resists, then ends). The
+    dispatch-wrapper around it may have already unwound — a
+    CANCELLED/CANCELED/FAILED protocol flip is NOT evidence this worker
+    ended."""
+
+    def __init__(self, release_after=None):
+        self._done = False
+        self.cancel_calls = 0
+        self._release_after = release_after
+
+    def cancel(self, *a, **k):
+        self.cancel_calls += 1
+        if self._release_after is not None and self.cancel_calls >= self._release_after:
+            self._done = True
+        return True
+
+    def cancelled(self):
+        return False
+
+    def done(self):
+        return self._done
+
+    def release(self):
+        self._done = True
+
+
+class TestFailedStopFalseGreen:
+    """A cancel that cannot prove the worker ended must never read as a
+    confirmed stop. A FAILED (or CANCELED) protocol record flip is not
+    containment evidence: a cancel-swallowing worker outlives it. The record
+    is honestly terminalized FAILED only once the worker is provably ended;
+    while the worker is still provably alive it is never FAILED while
+    containment is claimed."""
+
+    def _entry_with_live_worker(self, adapter, task_id="t-fg", ctx="ctx-fg",
+                                release_after=None):
+        """Local task with a done dispatch wrapper but a STILL-RUNNING
+        gateway task (cancel-swallowing worker). ``release_after`` lets the
+        worker end once the cancel has been re-delivered N times."""
+        adapter.tasks.create(task_id, ctx, "peer")
+        adapter.tasks.set_state(task_id, protocol.STATE_WORKING)
+        adapter._register_task_exec(task_id, ctx, "peer", "")
+        entry = adapter._registered_task(task_id)
+
+        wrapper = _ResistantFuture()
+        wrapper.release()  # wrapper unwound — reports done
+        worker = _ResistantFuture(release_after=release_after)
+
+        with entry["lock"]:
+            entry["local_future"] = wrapper
+            entry["gateway_task"] = worker
+        return entry, wrapper, worker
+
+    def test_done_wrapper_with_live_gateway_task_is_not_confirmed_stop(self, monkeypatch):
+        """A done dispatch wrapper must not be stop evidence while the bound
+        gateway task is still running: _stop_entry_handle reports the stop
+        UNCONFIRMED and the entry stays quarantined."""
+        adapter = _bare_adapter()
+        entry, wrapper, worker = self._entry_with_live_worker(adapter)
+        assert wrapper.done() and not worker.done()
+        with entry["lock"]:
+            entry["stop_requested"] = True
+        # Shrink both bounded windows: the worker never ends inside them, so
+        # the stop is UNCONFIRMED and the entry quarantined for the next pass.
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._CANCEL_CONFIRM_TIMEOUT", 0.05)
+        monkeypatch.setattr(adapter, "_orphan_timeout_for", lambda slug: 0.2)
+        assert adapter._stop_entry_handle(entry) is False, \
+            "FAILED-stop false-green: wrapper-done claimed containment while " \
+            "the bound gateway worker is still provably alive"
+        assert adapter._registered_task("t-fg") is not None, \
+            "resistant worker's registry entry dropped"
+
+    def test_failed_protocol_flip_is_not_worker_stop_evidence(self, monkeypatch):
+        """Flipping the record FAILED (as a hook/watchdog may do) while the
+        bound worker still runs must NOT confirm the stop."""
+        adapter = _bare_adapter()
+        entry, wrapper, worker = self._entry_with_live_worker(adapter)
+        adapter.tasks.compare_and_set_state(
+            "t-fg", (protocol.STATE_WORKING,), protocol.STATE_FAILED,
+            "[worker stop resisted containment]")
+        with entry["lock"]:
+            entry["stop_requested"] = True
+        # Shrink both bounded windows: the worker never ends inside them.
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._CANCEL_CONFIRM_TIMEOUT", 0.05)
+        monkeypatch.setattr(adapter, "_orphan_timeout_for", lambda slug: 0.2)
+        assert adapter._stop_entry_handle(entry) is False, \
+            "FAILED protocol flip treated as worker-stop evidence"
+        entry = adapter._registered_task("t-fg")
+        assert entry is not None and entry.get("stop_confirmed") is not True
+
+    def test_recovery_terminalizes_failed_once_worker_provably_ended(self, monkeypatch):
+        """After the worker is provably ended, the record is honestly
+        terminalized FAILED exactly once (never left merely CANCEL_REQUESTED
+        with containment claimed, never CANCELED after a resisted stop)."""
+        adapter = _bare_adapter()
+        # Worker resists the FIRST cancel delivery (the initial bounded
+        # window), then ends on the SECOND (the recovery pass re-delivery) —
+        # a cancel-swallowing worker that eventually ends.
+        entry, wrapper, worker = self._entry_with_live_worker(
+            adapter, release_after=2)
+        adapter.tasks.compare_and_set_state(
+            "t-fg", (protocol.STATE_WORKING,), protocol.STATE_CANCEL_REQUESTED)
+        # First bounded-window delivery lands (worker resists).
+        worker.cancel()
+        assert not worker.done(), "worker ended on the first cancel delivery"
+        # Recovery re-delivers and waits; the worker provably ends, and the
+        # record is honestly terminalized FAILED.
+        assert adapter._recover_stuck_unbound_turn(
+            entry,
+            deliver_cancel=lambda: (worker.cancel(), wrapper.cancel()),
+            worker_ended=lambda: worker.done(),
+        ) is True, "recovery did not confirm after the worker provably ended"
+        rec = adapter.tasks.get("t-fg")
+        assert rec["state"] == protocol.STATE_FAILED, \
+            f"resisted stop must settle FAILED once the worker provably " \
+            f"ends, got {rec['state']}"
+        # Idempotent: a second recovery pass on the terminal record confirms
+        # without re-firing the CAS.
+        assert adapter._recover_stuck_unbound_turn(
+            entry,
+            deliver_cancel=lambda: None,
+            worker_ended=lambda: worker.done(),
+        ) is True
+        assert adapter.tasks.get("t-fg")["state"] == protocol.STATE_FAILED
+
+    def test_resistant_worker_never_terminalizes_canceled(self, monkeypatch):
+        """Full cancel path: a worker that resists past one orphan deadline
+        leaves the record non-terminal CANCEL_REQUESTED (containment
+        unconfirmed) and the entry quarantined — never CANCELED."""
+        adapter = _bare_adapter()
+        entry, wrapper, worker = self._entry_with_live_worker(adapter)
+        # Shrink both bounded windows so the full path runs fast; the worker
+        # NEVER ends inside them.
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._CANCEL_CONFIRM_TIMEOUT", 0.05)
+        monkeypatch.setattr(adapter, "_orphan_timeout_for", lambda slug: 0.2)
+        resp = adapter._rpc_tasks_cancel("r1", {"taskId": "t-fg"}, peer="peer")
+        rec = adapter.tasks.get("t-fg")
+        assert rec["state"] != protocol.STATE_CANCELED, \
+            "resistant worker terminalized CANCELED without containment proof"
+        assert rec["state"] != protocol.STATE_FAILED, \
+            "worker FAILED while still provably alive"
+        assert rec["state"] == protocol.STATE_CANCEL_REQUESTED
+        assert adapter._registered_task("t-fg") is not None, \
+            "resistant worker's registry entry dropped"
