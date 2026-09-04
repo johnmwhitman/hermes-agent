@@ -179,10 +179,19 @@ bounded wait for POSITIVE confirmation → terminal CAS to `canceled`.
   itself). The store refuses to let a worker completion clobber
   `cancel_requested`.
 - **UNCONFIRMED stop** (resistant worker, or no provable exact handle): the
-  task NEVER terminalizes. It stays non-terminal `cancel_requested`, emits NO
-  side effects, and the registry entry is quarantined (exact handle
-  retained). The orphan watchdog re-attempts containment on every sweep;
-  only a POSITIVE stop settles the task. A missing registry entry is never
+  task NEVER terminalizes off protocol flips alone. It stays non-terminal
+  `cancel_requested`, emits NO side effects, and the registry entry is
+  quarantined (exact handle retained). The orphan watchdog re-attempts
+  containment on every sweep. A done dispatch-wrapper is NOT worker-end
+  evidence when a gateway task was bound (the wrapper can unwind while the
+  gateway task it spawned keeps running), and a FAILED/CANCELED protocol
+  flip is NEVER worker-stop evidence — a cancel-swallowing worker outlives
+  both. Recovery re-delivers the cancel on the exact handles each pass and
+  waits one orphan deadline for POSITIVE worker-end evidence (the bound
+  gateway task done, or the dispatch wrapper done when no gateway task was
+  ever bound); only then is the record honestly terminalized — CAS `failed`
+  exactly once, never `canceled` after a resisted stop, never `failed` while
+  the worker is still provably alive. A missing registry entry is never
   treated as confirmed — a legitimately completed worker always leaves the
   record terminal via `_finalize_task`, where cancel is rejected
   not-cancelable before any stop attempt.
