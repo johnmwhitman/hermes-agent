@@ -90,9 +90,10 @@ def test_parse_receipt_clause_basic():
     )
     parsed = kt._parse_body_receipt_clause(body)
     assert parsed is not None
-    check, expected = parsed
+    check, expected, is_rc = parsed
     assert check == "echo 0"
     assert expected == 0
+    assert is_rc is False
 
 
 def test_parse_receipt_clause_rc_style_expected():
@@ -104,9 +105,10 @@ def test_parse_receipt_clause_rc_style_expected():
     )
     parsed = kt._parse_body_receipt_clause(body)
     assert parsed is not None
-    check, expected = parsed
+    check, expected, is_rc = parsed
     assert check == "sh /Users/johnwhitman/AI/agents/runbooks/checks/kanban-offsite.sh"
     assert expected == 0
+    assert is_rc is True
 
 
 def test_parse_receipt_clause_absent_returns_none():
@@ -264,6 +266,69 @@ def test_gate_refuses_when_only_summary_no_result():
         },
         _FakeConn(),
         "t_clause_no_result",
+        body=body,
+    )
+    assert err is not None, "expected refusal, got None"
+    parsed = json.loads(err)
+    assert "refused" in parsed["error"]
+
+
+def test_gate_accepts_rc_form_when_stdout_has_unrelated_int(tmp_path):
+    """The kernel bug fixed by t_05647e4c:
+
+    Body: ``expected: rc 0 (something — ...check passed)``
+    Check: a script whose stdout carries a non-zero count **and** exits
+    rc 0 (every seat shell that prints "N items, rc=0" looks like this).
+
+    Pre-fix runner: parses ``1`` from stdout → mismatch → REFUSE.
+    Post-fix runner: parses ``expected_is_rc=True`` from the body,
+    compares against the process return code → ``0 == 0`` → permit.
+
+    This is the shape the seat uses today:
+      receipt:
+        check: sh .../governor-sees-private-tmp.sh
+        expected: rc 0 (governor items under /private/tmp: 1)
+    """
+    from tools import kanban_tools as kt
+
+    body = _body_with_receipt(
+        "printf 'governor items under /private/tmp: 1\\n'",
+        "rc 0 (governor items under /private/tmp: 1)",
+    )
+    err = kt._enforce_receipt_on_complete(
+        {
+            "summary": "rc-form receipt carries rc=0",
+            "result": (
+                "Body check printed stdout `governor items under "
+                "/private/tmp: 1` AND exited rc=0; the kernel honored "
+                "the rc-form (expected_is_rc=True) and compared against "
+                "the return code, not the unrelated stdout count."
+            ),
+        },
+        _FakeConn(),
+        "t_clause_rc_with_stdout_count",
+        body=body,
+    )
+    assert err is None, f"expected None, got {err!r}"
+
+
+def test_gate_refuses_rc_form_when_actual_rc_is_nonzero(tmp_path):
+    """Mirror of the previous test: same body shape, but the check
+    exits rc=2. The runner must observe rc=2 and refuse — never
+    silently accept the rc=0 fallback because stdout had no integer."""
+    from tools import kanban_tools as kt
+
+    body = _body_with_receipt(
+        "sh -c 'echo 7 items; exit 2'",
+        "rc 0",
+    )
+    err = kt._enforce_receipt_on_complete(
+        {
+            "summary": "claim rc=0",
+            "result": "I claim success but the check actually exited 2",
+        },
+        _FakeConn(),
+        "t_clause_rc_nonzero_with_stdout_count",
         body=body,
     )
     assert err is not None, "expected refusal, got None"
