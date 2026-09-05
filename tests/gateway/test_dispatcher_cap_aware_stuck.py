@@ -118,7 +118,7 @@ def test_disk_governor_block_is_classified_as_expected_idle():
             skipped_per_profile_capped=[],
             skipped_unassigned=[],
             skipped_nonspawnable=[],
-            reclaimed=[],
+            reclaimed=0,
             crashed=[],
             timed_out=[],
         )
@@ -133,8 +133,146 @@ def test_disk_governor_green_or_unset_does_not_mask_stuck_ready_work():
             skipped_per_profile_capped=[],
             skipped_unassigned=[],
             skipped_nonspawnable=[],
-            reclaimed=[],
+            reclaimed=0,
             crashed=[],
             timed_out=[],
         )
         assert _dispatch_result_is_expected_idle(result) is False
+
+
+# ---------------------------------------------------------------------------
+# Orphan-assignee / non-spawnable classification (t_67ec48d0, 2026-09-05)
+# ---------------------------------------------------------------------------
+#
+# Before the fix: ``skipped_nonspawnable`` was counted in
+# ``skipped_others``, so a board whose only skip reason was a queue of
+# orphan / terminal-lane assignees (e.g. ``gpt-5.6-luna`` slipped past
+# intake, or a steady-state ``orion-cc`` queue) tripped
+# ``cap_blocked_all = False`` and the dispatcher cried wolf every 5 min
+# for as long as the queue stayed full.  ``kanban_db.py`` already
+# documented ``skipped_nonspawnable`` as "expected steady-state on
+# multi-lane setups; NOT an operator-actionable failure" — the helper
+# just wasn't honoring that docstring.
+#
+# The fix also corrected a latent crash: ``DispatchResult.reclaimed`` is
+# declared ``int = 0`` (a count) but the helper did
+# ``len(getattr(result, "reclaimed", []) or [])`` — when a stale-claim
+# requeue happened on the same tick, ``reclaimed`` was a non-zero int
+# and ``len(1)`` raised ``TypeError``. The watcher swallowed the
+# exception, ``bad_ticks`` never reset, and the warning continued to
+# fire on every port-cap tick until the gateway restarted.  The helper
+# now reads ``reclaimed`` as an int.
+
+
+def _result(**overrides):
+    """Build a minimal ``DispatchResult``-like SimpleNamespace for tests."""
+    base = dict(
+        disk_pressure=None,
+        skipped_per_profile_capped=[],
+        skipped_unassigned=[],
+        skipped_nonspawnable=[],
+        reclaimed=0,
+        crashed=[],
+        timed_out=[],
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_nonspawnable_only_is_expected_idle():
+    """A board whose only skip is ``skipped_nonspawnable`` is correctly idle.
+
+    Multi-lane setups keep the ready queue full of terminal-lane cards
+    (``orion-cc`` / ``orion-research`` / ``orion-sdlc-review``) that the
+    dispatcher correctly refuses to spawn — terminals pull those via
+    ``claim_task`` directly. The stuck-warning has to stay silent in
+    that state, otherwise it becomes a 5-min nag on every busy portfolio.
+    """
+    res = _result(skipped_nonspawnable=["t_a", "t_b"])
+    assert _dispatch_result_is_expected_idle(res) is True
+
+
+def test_cap_alone_still_expected_idle():
+    """Regression: a pure per-profile-cap skip still returns True."""
+    res = _result(skipped_per_profile_capped=[("t_a", "overwatch", 2)])
+    assert _dispatch_result_is_expected_idle(res) is True
+
+
+def test_cap_plus_nonspawnable_is_NOT_expected_idle():
+    """Cap + nonspawnable together is NOT pure: defer to the warning so the
+    operator can see mixed-skip drift if it becomes the steady state.
+    """
+    res = _result(
+        skipped_per_profile_capped=[("t_a", "overwatch", 2)],
+        skipped_nonspawnable=["t_b"],
+    )
+    assert _dispatch_result_is_expected_idle(res) is False
+
+
+def test_nonspawnable_plus_crash_is_NOT_expected_idle():
+    """A crash alongside nonspawnable work is real — keep the warning."""
+    res = _result(
+        skipped_nonspawnable=["t_a"],
+        crashed=["t_b"],
+    )
+    assert _dispatch_result_is_expected_idle(res) is False
+
+
+def test_reclaimed_int_does_not_crash():
+    """Regression: ``reclaimed`` is ``int``, not a list.
+
+    Pre-fix this raised ``TypeError: object of type 'int' has no len()``
+    on every tick where a stale-claim requeue happened, which pinned
+    ``bad_ticks`` and made the warning fire on every port-cap tick until
+    the gateway restarted (verified against conductor's gateway.error.log
+    on 2026-09-04 19:54:34Z traceback).
+    """
+    res = _result(reclaimed=1)  # int, not []
+    assert _dispatch_result_is_expected_idle(res) is False  # not expected idle
+
+
+def test_reclaimed_int_zero_is_expected_idle_when_only_cap():
+    """``reclaimed=0`` with only a cap skip is still pure cap = expected idle."""
+    res = _result(
+        skipped_per_profile_capped=[("t_a", "overwatch", 2)],
+        reclaimed=0,
+    )
+    assert _dispatch_result_is_expected_idle(res) is True
+
+
+def test_reclaimed_int_nonzero_alongside_nonspawnable_is_NOT_idle():
+    """When the queue has ONLY nonspawnable work but ``reclaimed > 0``
+    this tick, a stale worker had to be reclaimed — that's a real signal
+    even if the spawn path is correctly idle, so the warning keeps firing
+    to surface the worker-staleness drift. (``reclaimed`` is the count
+    of stale-claim requeues; non-zero means at least one worker died or
+    went silent — operator-actionable regardless of ready-queue state.)
+    """
+    res = _result(
+        skipped_nonspawnable=["t_a"],
+        reclaimed=2,
+    )
+    assert _dispatch_result_is_expected_idle(res) is False
+
+
+def test_reclaimed_int_with_real_stuck_signals_still_warns():
+    """A real crash alongside any cap-or-nonspawnable still trips the warning."""
+    res = _result(
+        skipped_nonspawnable=["t_a"],
+        reclaimed=1,
+        crashed=["t_b"],
+    )
+    assert _dispatch_result_is_expected_idle(res) is False
+
+
+def test_skipped_unassigned_alone_still_warns():
+    """Regression: empty-assignee tasks remain operator-actionable.
+
+    ``skipped_unassigned`` (no assignee at all) is a different bucket
+    from ``skipped_nonspawnable`` (assignee exists but doesn't map to a
+    real profile). Empty-assignee tasks usually mean a misfiled card
+    that needs human routing — the warning should still fire so the
+    operator notices.
+    """
+    res = _result(skipped_unassigned=["t_a"])
+    assert _dispatch_result_is_expected_idle(res) is False
