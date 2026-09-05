@@ -35,7 +35,21 @@ import re
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
+
+
+class _ReceiptClause(NamedTuple):
+    """Parsed card-body ``receipt:`` clause.
+
+    ``is_rc`` distinguishes the ``expected: rc N`` form (compare against the
+    process return code) from the count form (compare against the first
+    integer in stdout). The namedtuple shape keeps backward-compatible
+    2-tuple unpacking in callers/tests.
+    """
+
+    check: str
+    expected: int
+    is_rc: bool
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
@@ -302,9 +316,9 @@ _RECEIPT_CLAUSE_TIMEOUT_S = 5
 
 def _parse_body_receipt_clause(
     body: str,
-) -> Optional[Tuple[str, int]]:
-    """Return ``(check_line, expected_int)`` when the card body carries a
-    valid ``receipt:`` clause, otherwise ``None``.
+) -> Optional["_ReceiptClause"]:
+    """Return a ``_ReceiptClause`` when the card body carries a valid
+    ``receipt:`` clause, otherwise ``None``.
 
     Cheap and string-only — no shell parse, no tokenization, just regex
     extraction. The clause is presumed authoritative; whether the check
@@ -314,6 +328,13 @@ def _parse_body_receipt_clause(
     quoted receipt from the runbook) are NOT treated as the card's
     clause — refuse to parse when the only ``receipt:`` matches fall
     inside Markdown code fences.
+
+    The third element of the returned clause, ``is_rc``, is True only
+    when the ``expected:`` line was written in the explicit
+    ``rc <integer>`` form. That flag is propagated to the runner so
+    rc-form receipts always compare against the process return code
+    (rather than the first integer in stdout, which is the count-form
+    default).
     """
     if not body or not body.strip():
         return None
@@ -366,28 +387,44 @@ def _parse_body_receipt_clause(
     m_rc = _RECEIPT_CLAUSE_RC_RE.search(expected)
     if m_rc is not None:
         try:
-            return check, int(m_rc.group(1))
+            return _ReceiptClause(check, int(m_rc.group(1)), True)
         except ValueError:
             return None
     m_int = _RECEIPT_CLAUSE_FIRST_INT_RE.search(expected)
     if m_int is None:
         return None
     try:
-        return check, int(m_int.group(1))
+        return _ReceiptClause(check, int(m_int.group(1)), False)
     except ValueError:
         return None
 
 
 def _run_body_receipt_clause_check(
-    check: str, expected: int, timeout_s: int = _RECEIPT_CLAUSE_TIMEOUT_S
+    check: str,
+    expected: int,
+    *,
+    expected_is_rc: bool = False,
+    timeout_s: int = _RECEIPT_CLAUSE_TIMEOUT_S,
 ) -> Tuple[bool, str]:
-    """Run the body-defined shell check, capture stdout+stderr, parse the
-    first integer in stdout (or the process return code when ``expected``
-    is the only integer the author could plausibly mean), compare it to
-    ``expected``.
+    """Run the body-defined shell check, capture stdout+stderr, and compare
+    the observed integer against ``expected``.
 
-    Returns ``(passed, output)``. ``output`` is bounded to ~2 KiB and
-    returned in BOTH branches so the worker can see why it failed.
+    Comparison source depends on the ``expected:`` form used in the card
+    body (the parser sets ``expected_is_rc`` accordingly):
+
+    * ``expected_is_rc=True`` (the body wrote ``expected: rc N``):
+      compare ``expected`` against the **process return code**. The
+      stdout-first-int lookup is skipped entirely so a check that prints
+      a count alongside its rc (very common — most of the seat's own
+      ``*-accurate`` and ``sees-private-tmp`` shells print "1 item,
+      rc=0") is not mis-classified as a count mismatch.
+    * ``expected_is_rc=False`` (the body wrote a bare count, e.g.
+      ``expected: 0 — RED now``): the dominant seat shape is the first
+      integer in stdout; fall back to the process return code only when
+      stdout has no integer at all.
+
+    Either way, returns ``(passed, output)`` where ``output`` is bounded
+    to ~2 KiB and surfaced to the worker in both branches.
 
     The check string is ``shell=False``-safe in spirit but the seat's
     authorative receipt shapes use ``<`` redirect and ``bash -c '…'``
@@ -396,13 +433,6 @@ def _run_body_receipt_clause_check(
     Inputs are card bodies written by a known seat (not the closing
     worker), and the audit (PROFILE_PATH/scripts/...) already runs
     ``sqlite3 -readonly`` from card bodies — same trust level.
-
-    Comparison: by default we match ``expected`` against the first
-    integer in stdout (count-style — the dominant seat shape). When the
-    run produced no stdout integer at all, fall back to matching
-    ``expected`` against the process return code; this keeps the rc-style
-    examples (``expected: rc 0 (newest COMPLETE set has ...)``) green
-    even when the script's own stdout is informational prose.
     """
     output_capture: list[str] = []
     try:
@@ -415,19 +445,25 @@ def _run_body_receipt_clause_check(
             check=False,
         )
         out = (proc.stdout or "") + (proc.stderr or "")
-        # First-integer-in-stdout is the dominant count-style; fall back
-        # to rc when stdout carries no integer.
-        m_int = _RECEIPT_CLAUSE_FIRST_INT_RE.search(proc.stdout or "")
-        if m_int is not None:
-            observed = int(m_int.group(1))
-            observed_source = "stdout-count"
-        else:
+        if expected_is_rc:
+            # The body wrote ``expected: rc N`` — compare against the
+            # process return code regardless of any stdout count.
             observed = proc.returncode
             observed_source = "rc"
-            output_capture.append(
-                "[stdout had no count; falling back to process return "
-                f"code — observed={observed}, expected={expected}]"
-            )
+        else:
+            # Count-style: first integer in stdout wins; fall back to rc
+            # when stdout has no integer at all (info-only scripts).
+            m_int = _RECEIPT_CLAUSE_FIRST_INT_RE.search(proc.stdout or "")
+            if m_int is not None:
+                observed = int(m_int.group(1))
+                observed_source = "stdout-count"
+            else:
+                observed = proc.returncode
+                observed_source = "rc"
+                output_capture.append(
+                    "[stdout had no count; falling back to process return "
+                    f"code — observed={observed}, expected={expected}]"
+                )
         if observed != expected:
             output_capture.append(
                 f"[observed={observed} ({observed_source}), "
@@ -489,7 +525,7 @@ def _enforce_receipt_on_complete(
     # ---- Body-receipt clause (RECEIPT-CLAUSE-SPEC) ----------------------------
     clause = _parse_body_receipt_clause(body or "")
     if clause is not None:
-        check_line, expected_int = clause
+        check_line, expected_int, expected_is_rc = clause
         # (1) Empty result on a receipted card → outright refuse.
         # The seat's ask (t_2db4f45a) is that an empty ``result`` on
         # a card whose body carries a ``receipt:`` block is refused:
@@ -506,7 +542,9 @@ def _enforce_receipt_on_complete(
         # (2) Run the body-defined check; if it disagrees with the
         # clause, refuse the close with the check output attached.
         passed, run_output = _run_body_receipt_clause_check(
-            check_line, expected_int
+            check_line,
+            expected_int,
+            expected_is_rc=expected_is_rc,
         )
         if not passed:
             return tool_error(
