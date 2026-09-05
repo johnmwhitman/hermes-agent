@@ -35,7 +35,7 @@ import re
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
@@ -271,8 +271,193 @@ def _receipt_classify(
     }
 
 
+# ---------------------------------------------------------------------------
+# Body-receipt clause (RECEIPT-CLAUSE-SPEC — t_2db4f45a)
+# ---------------------------------------------------------------------------
+# A card body may carry a YAML-ish ``receipt:`` block that authoritatively
+# describes what success looks like for this specific task. Shape (from the
+# 2026-09-05 seat cards):
+#
+#     receipt:
+#       check: <shell line, may use < redirect or `bash` style args>
+#       expected: <integer>           # simple count
+#         or
+#       expected: rc <integer> ...    # explicit rc-style
+#         or
+#       expected: <integer> — ...     # loose: parse the first integer
+#
+# The clause MUST live at the left margin (``receipt:``), not inside a
+# fenced code block (no parser binding for `````` receipt: ``````). Once
+# present it is the only thing this card closes on: the prose-side
+# receipt verdicts (``VERIFIED``+cmd, existing paths, attachments, SHAs)
+# are still permitted as evidence, but an empty ``result`` text on a
+# receipted card is an automatic refusal.
+_RECEIPT_CLAUSE_HEADER_RE = re.compile(r"(?m)^receipt:\s*$")
+_RECEIPT_CLAUSE_KEY_RE = re.compile(r"(?m)^[ \t]{2,}(check|expected):\s*(.+?)\s*$")
+_RECEIPT_CLAUSE_FENCE_RE = re.compile(r"(?m)^```")
+_RECEIPT_CLAUSE_FIRST_INT_RE = re.compile(r"\b(\d+)\b")
+_RECEIPT_CLAUSE_RC_RE = re.compile(r"\brc\s+(\d+)\b", re.I)
+_RECEIPT_CLAUSE_TIMEOUT_S = 5
+
+
+def _parse_body_receipt_clause(
+    body: str,
+) -> Optional[Tuple[str, int]]:
+    """Return ``(check_line, expected_int)`` when the card body carries a
+    valid ``receipt:`` clause, otherwise ``None``.
+
+    Cheap and string-only — no shell parse, no tokenization, just regex
+    extraction. The clause is presumed authoritative; whether the check
+    actually passes is verified separately via ``_run_body_receipt_clause_check``.
+
+    Fenced-code occurrences of ``receipt:`` (an explanation block, a
+    quoted receipt from the runbook) are NOT treated as the card's
+    clause — refuse to parse when the only ``receipt:`` matches fall
+    inside Markdown code fences.
+    """
+    if not body or not body.strip():
+        return None
+    # Find every ``receipt:`` match and the indented ``check:`` /
+    # ``expected:`` that follows it. Refuse to bind a match that lives
+    # inside a fenced code block.
+    text = body
+    fence_matches = list(_RECEIPT_CLAUSE_FENCE_RE.finditer(text))
+    header_match = _RECEIPT_CLAUSE_HEADER_RE.search(text)
+    if header_match is None:
+        return None
+    # Inside-fence check: walk fences; if any matching fence pair encloses
+    # the header line, refuse.
+    header_pos = header_match.start()
+    inside_fence = False
+    for fm in fence_matches:
+        if fm.start() >= header_pos:
+            break
+        inside_fence = not inside_fence
+    if inside_fence:
+        return None
+    # Collect the indented ``check:`` / ``expected:`` lines that
+    # immediately follow the header. Only honour the FIRST clause we see
+    # to keep the contract stable and predictable — overlapping clauses
+    # are a body-authoring bug.
+    check: Optional[str] = None
+    expected: Optional[str] = None
+    past_header = False
+    for m in _RECEIPT_CLAUSE_KEY_RE.finditer(text):
+        if m.start() <= header_pos:
+            continue
+        if not past_header:
+            past_header = True
+        # Stop scanning on the next non-indented line (a new section
+        # / heading). ``_RECEIPT_CLAUSE_KEY_RE`` already restricts the
+        # match to indented lines so this is implicit — but cap width
+        # to 16 lines past the header for sanity.
+        line_no = text.count("\n", header_pos, m.start()) + 1
+        if line_no > 16:
+            break
+        key, value = m.group(1).lower(), m.group(2).strip()
+        if key == "check" and check is None:
+            check = value
+        elif key == "expected" and expected is None:
+            expected = value
+        if check is not None and expected is not None:
+            break
+    if check is None or expected is None:
+        return None
+    m_rc = _RECEIPT_CLAUSE_RC_RE.search(expected)
+    if m_rc is not None:
+        try:
+            return check, int(m_rc.group(1))
+        except ValueError:
+            return None
+    m_int = _RECEIPT_CLAUSE_FIRST_INT_RE.search(expected)
+    if m_int is None:
+        return None
+    try:
+        return check, int(m_int.group(1))
+    except ValueError:
+        return None
+
+
+def _run_body_receipt_clause_check(
+    check: str, expected: int, timeout_s: int = _RECEIPT_CLAUSE_TIMEOUT_S
+) -> Tuple[bool, str]:
+    """Run the body-defined shell check, capture stdout+stderr, parse the
+    first integer in stdout (or the process return code when ``expected``
+    is the only integer the author could plausibly mean), compare it to
+    ``expected``.
+
+    Returns ``(passed, output)``. ``output`` is bounded to ~2 KiB and
+    returned in BOTH branches so the worker can see why it failed.
+
+    The check string is ``shell=False``-safe in spirit but the seat's
+    authorative receipt shapes use ``<`` redirect and ``bash -c '…'``
+    invocations — both are well-defined shell features, so this
+    function relies on a hardened ``shell=True`` with a tight timeout.
+    Inputs are card bodies written by a known seat (not the closing
+    worker), and the audit (PROFILE_PATH/scripts/...) already runs
+    ``sqlite3 -readonly`` from card bodies — same trust level.
+
+    Comparison: by default we match ``expected`` against the first
+    integer in stdout (count-style — the dominant seat shape). When the
+    run produced no stdout integer at all, fall back to matching
+    ``expected`` against the process return code; this keeps the rc-style
+    examples (``expected: rc 0 (newest COMPLETE set has ...)``) green
+    even when the script's own stdout is informational prose.
+    """
+    output_capture: list[str] = []
+    try:
+        proc = subprocess.run(
+            check,
+            shell=True,                       # seat's receipts use `<`
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        # First-integer-in-stdout is the dominant count-style; fall back
+        # to rc when stdout carries no integer.
+        m_int = _RECEIPT_CLAUSE_FIRST_INT_RE.search(proc.stdout or "")
+        if m_int is not None:
+            observed = int(m_int.group(1))
+            observed_source = "stdout-count"
+        else:
+            observed = proc.returncode
+            observed_source = "rc"
+            output_capture.append(
+                "[stdout had no count; falling back to process return "
+                f"code — observed={observed}, expected={expected}]"
+            )
+        if observed != expected:
+            output_capture.append(
+                f"[observed={observed} ({observed_source}), "
+                f"expected={expected}, rc={proc.returncode}]"
+            )
+            if out.strip():
+                output_capture.append(out.strip())
+            return False, "\n".join(s for s in output_capture if s)[:2000]
+        # Pass.
+        output_capture.append(
+            f"[observed={observed} ({observed_source}) == "
+            f"expected={expected}, rc={proc.returncode}]"
+        )
+        if out.strip():
+            output_capture.append(out.strip())
+        return True, "\n".join(s for s in output_capture if s)[:2000]
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"[check timed out after {timeout_s}s; expected={expected}]"
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        return False, f"[check raised {type(exc).__name__}: {exc}]"
+
+
 def _enforce_receipt_on_complete(
-    args: dict, conn: sqlite3.Connection, task_id: str
+    args: dict,
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    body: str = "",
 ) -> Optional[str]:
     """Hard-gate kanban_complete: refuse DONE without an observable receipt.
 
@@ -284,6 +469,13 @@ def _enforce_receipt_on_complete(
     result, and any artifacts paths the worker declared — those are the
     only durable fields the close-time write persists, and the board
     downstream does not separately audit them.
+
+    When ``body`` is provided AND the body carries a ``receipt:``
+    clause (see RECEIPT-CLAUSE-SPEC, t_2db4f45a), the clause is the
+    authoritative success condition for this card: the check line is
+    re-run on the done transition, and the first integer in its
+    stdout must equal the clause's ``expected`` integer. An empty
+    ``result`` text on a receipted card is refused outright.
     """
     summary = args.get("summary") or ""
     result = args.get("result") or ""
@@ -293,6 +485,46 @@ def _enforce_receipt_on_complete(
         # Already rejected upstream; defensive: do not let a non-dict slip
         # into json.dumps in the receipt text below.
         metadata = {}
+
+    # ---- Body-receipt clause (RECEIPT-CLAUSE-SPEC) ----------------------------
+    clause = _parse_body_receipt_clause(body or "")
+    if clause is not None:
+        check_line, expected_int = clause
+        # (1) Empty result on a receipted card → outright refuse.
+        # The seat's ask (t_2db4f45a) is that an empty ``result`` on
+        # a card whose body carries a ``receipt:`` block is refused:
+        # the closing worker owes a non-empty observation, not just
+        # a summary line and an attachment path.
+        if not (result or "").strip():
+            return tool_error(
+                "kanban_complete refused: card body carries a `receipt:` "
+                "clause (check runs a verifiable acceptance command) and "
+                "the worker submitted an empty `result`. A receipted card "
+                "must state what the check observed at close time. "
+                "Card not moved to done.",
+            )
+        # (2) Run the body-defined check; if it disagrees with the
+        # clause, refuse the close with the check output attached.
+        passed, run_output = _run_body_receipt_clause_check(
+            check_line, expected_int
+        )
+        if not passed:
+            return tool_error(
+                "kanban_complete refused: the body-defined `receipt:` "
+                "clause did not land.\n"
+                f"  check:    {check_line!r}\n"
+                f"  expected: {expected_int}\n"
+                f"  output:   {run_output}\n"
+                "Re-run the check, confirm the count matches `expected:`"
+                ", and retry kanban_complete with the observation in the "
+                "result field. Card not moved to done.",
+            )
+        # The body clause passed; the existing prose evidence path
+        # below will be a no-op for the verdict (no observable receipt
+        # needed once the body's own check has matched). Return early.
+        return None
+
+    # ---- Standard prose / path / SHA / attachment gate (unchanged) -----------
     artifact_lines = "\n".join(str(p) for p in artifacts)
     receipt_text = "\n".join(
         part for part in (summary, result, artifact_lines) if part
@@ -1036,8 +1268,13 @@ def _handle_complete(args: dict, **kw) -> str:
             # profiles/conductor/scripts/kanban_completion_verifier.py).
             # A card may not move to done with hollow / unobservable
             # prose — refuse the close and keep the card alive so the
-            # worker can fix the call.
-            receipt_err = _enforce_receipt_on_complete(args, conn, tid)
+            # worker can fix the call. When the body carries a
+            # `receipt:` clause (RECEIPT-CLAUSE-SPEC, t_2db4f45a),
+            # the body's check is the authoritative success
+            # condition.
+            receipt_err = _enforce_receipt_on_complete(
+                args, conn, tid, body=task.body if task else ""
+            )
             if receipt_err:
                 return receipt_err
 
