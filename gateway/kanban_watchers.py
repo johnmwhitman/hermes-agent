@@ -102,23 +102,47 @@ def _kanban_dispatch_allowed() -> bool:
 def _dispatch_result_is_expected_idle(result: Any) -> bool:
     """Return True when a zero-spawn board was intentionally throttled.
 
-    Disk-governor RED/UNKNOWN and a pure per-profile-cap skip are expected
-    idle states. Other skip/reclaim outcomes still count toward the stuck
-    warning because at least one ready task may be unexpectedly unspawnable.
+    Disk-governor RED/UNKNOWN, a pure per-profile-cap skip, and a queue of
+    only non-spawnable assignees (terminal lanes like ``orion-cc`` /
+    ``orion-research``, or unknown profile names a card body slipped past
+    intake) are expected idle states. Other skip/reclaim outcomes still
+    count toward the stuck warning because at least one ready task may be
+    unexpectedly unspawnable.
+
+    Note: ``reclaimed`` is the *count* of stale-claim requeues (int), not a
+    list — earlier versions called ``len()`` on it and crashed whenever a
+    requeue happened on the same tick, which silently pinned
+    ``bad_ticks`` and made the stuck warning fire on every port-cap tick
+    until the gateway restarted. See #dispatcher-stuck-orphan 2026-09-05.
     """
     if getattr(result, "disk_pressure", None) in {"RED", "UNKNOWN"}:
         return True
     skipped_capped = list(
         getattr(result, "skipped_per_profile_capped", []) or []
     )
+    skipped_nonspawnable = list(
+        getattr(result, "skipped_nonspawnable", []) or []
+    )
     skipped_others = (
         len(getattr(result, "skipped_unassigned", []) or [])
-        + len(getattr(result, "skipped_nonspawnable", []) or [])
-        + len(getattr(result, "reclaimed", []) or [])
+        # reclaimed is an int count, not a list — read the value as a number.
+        # A non-zero count means the reclaim pass did do work this tick
+        # (still interesting for "stuck" detection) so it stays in the bucket.
+        + int(getattr(result, "reclaimed", 0) or 0)
         + len(getattr(result, "crashed", []) or [])
         + len(getattr(result, "timed_out", []) or [])
     )
-    return bool(skipped_capped) and skipped_others == 0
+    # Two paths to "expected idle":
+    #  1. Pure per-profile-cap (no other skip reasons and no nonspawnable
+    #     work) — the cap is the design, not a stuck dispatcher.
+    #  2. Only non-spawnable assignees in the ready queue — terminal lanes
+    #     the dispatcher correctly refuses to spawn (no subprocess exists
+    #     for them). Pair with no other skip reasons.
+    if bool(skipped_capped) and skipped_others == 0 and not skipped_nonspawnable:
+        return True
+    if skipped_nonspawnable and skipped_others == 0 and not skipped_capped:
+        return True
+    return False
 
 
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
