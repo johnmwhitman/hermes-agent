@@ -127,6 +127,71 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             assert generate_title("question", "answer") == "Investigate the title resolver bug"
 
+    def test_refuses_half_emitted_json_object(self):
+        """Thinking models (minimax-m3 et al.) burn their max_tokens budget
+        on the ``...`` block and then get cut off mid-JSON, leaking
+        ``{"title": "Work kanban task t_xxx"`` (no closing brace) as the
+        raw response. Without a JSON-fragment guard the prose fallback
+        stored this verbatim as the session title — exactly what produced
+        the malformed titles like ``title": "Work kanban task t_xxx"}``
+        across every lane (CoS finding t_081b5048). The guard refuses the
+        half-emitted object so the caller's derive_title fallback wins."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        # Exact shape observed on session 20260906_172859_18543c (overwatch)
+        # — leading whitespace from a trailing-think-block, then the JSON
+        # object minus its opening brace.
+        mock_response.choices[0].message.content = (
+            "<think>reasoning</think>\n\ntitle\": \"Work kanban task t_b2b49e30\"}"
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("work kanban task t_b2b49e30") is None
+
+    def test_refuses_truncated_object_with_only_colon(self):
+        """Truncated even further — the response cuts off right after the
+        ``: `` of the JSON key/value pair, leaving only ``: "..."`` as the
+        remaining line. Same shape as session 20260906_165905_96bb20."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            "<think>reasoning</think>\n: \"Work kanban task t_81af4745\"}"
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("work kanban task t_81af4745") is None
+
+    def test_refuses_unbalanced_quote_line(self):
+        """A single opening quote with no closing partner on the same line
+        is another half-emit shape (``"Work kanban task t_xxx``)."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            "<think>reasoning</think>\n\"Work kanban task t_xxxx"
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("work kanban task t_xxxx") is None
+
+    def test_title_max_tokens_is_beyond_think_block(self):
+        """The LLM call must hand the model enough headroom for a think
+        block AND a clean JSON answer. The old ``max_tokens=64`` ceiling
+        is what truncated minimax-m3 mid-emit (CoS t_081b5048)."""
+        captured_kwargs = {}
+
+        def fake_call_llm(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Investigate widget bug"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=fake_call_llm):
+            assert generate_title("question") == "Investigate widget bug"
+        assert captured_kwargs.get("max_tokens", 0) >= 128, (
+            "Title-generation budget is too small for thinking models — "
+            "minimax-m3 alone spends 150-200 tokens on its think block."
+        )
 
 
     def test_invokes_failure_callback_on_exception(self):

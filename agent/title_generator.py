@@ -282,12 +282,52 @@ def derive_title(user_message: str) -> Optional[str]:
     return line or None
 
 
+# JSON-fragment shapes that the prose fallback MUST refuse. Thinking models
+# (``minimax-m3`` and friends) burn their `max_tokens` budget on the
+# ``...`` block and then get cut off mid-JSON, leaking the unfinished
+# object — ``{"title": "Work kanban task t_xxx"`` with the closing brace
+# never emitted. Storing that as a session title is what produced entries
+# like ``title": "Work kanban task t_xxx"}`` and ``: "Work kanban task
+# t_xxx"}`` across every lane (observed across 11 profiles, ~103 sessions,
+# CoS finding t_081b5048). Returning ``""`` here makes the caller fall
+# back to ``derive_title`` instead.
+_FRAGMENT_PREFIXES = ("{", "\"title\"", "title\":", "\"", ":")
+_FRAGMENT_SUFFIXES = ("}", "\",")
+
+
+def _looks_like_json_fragment(line: str) -> bool:
+    """True when *line* is a half-emitted JSON object or key/value pair.
+
+    Used to refuse prose-fallback lines that begin or end with a JSON
+    delimiter, the tell-tale of a model whose ``response_format`` was honored
+    but whose ``max_tokens`` ran out before the closing brace landed.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if any(stripped.startswith(p) for p in _FRAGMENT_PREFIXES):
+        return True
+    if any(stripped.endswith(s) for s in _FRAGMENT_SUFFIXES):
+        return True
+    # An unbalanced quote in a single-line "title" is another half-emit.
+    if stripped.count('"') == 1:
+        return True
+    return False
+
+
 def _extract_title_text(content: str) -> str:
     """Pull the title out of a model response.
 
     The JSON schema makes the object shape the expected case, but not every
     provider honors ``response_format``; fall back through a loose JSON scan
     and finally to first-line prose so a non-compliant provider still titles.
+
+    The prose fallback explicitly refuses JSON-fragment lines (see
+    ``_looks_like_json_fragment``) so a thinking model that hit its token
+    limit mid-emit does not leave ``title": "Work kanban task t_xxx"}``
+    stored as the session title. Without this guard the fallback path
+    accepts the half-emitted object as a title and the row carries a
+    JSON-looking string forever (CoS finding t_081b5048).
     """
     if not content:
         return ""
@@ -320,6 +360,14 @@ def _extract_title_text(content: str) -> str:
     raw = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
     if raw.lower().startswith("title:"):
         raw = raw[6:].strip()
+    if _looks_like_json_fragment(raw):
+        # Half-emitted JSON from a thinking model that hit its token budget
+        # mid-object. Refuse the line so the caller's derive_title fallback
+        # produces a clean named row instead of a JSON-shaped string.
+        logger.debug(
+            "Refusing JSON-fragment title output: %r", raw,
+        )
+        return ""
     return raw.strip("\"'").strip()
 
 
@@ -405,7 +453,13 @@ def generate_title(
             messages=messages,
             # A title is a handful of tokens. The old 500-token ceiling let a
             # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
+            # The 64-token ceiling let thinking models (minimax-m3 and friends)
+            # burn the whole budget on the <think> block and get cut off mid-JSON,
+            # leaving half-emitted objects like `{"title": "Work kanban task
+            # t_xxx"` stored as the session title (CoS finding t_081b5048).
+            # 256 leaves comfortable room for the think block AND a clean JSON
+            # answer on every reasoning model we ship with today.
+            max_tokens=256,
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,
