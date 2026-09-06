@@ -449,20 +449,17 @@ def test_judged_done_followed_by_worker_finalize_completes(monkeypatch):
 @pytest.fixture
 def kanban_home_for_goal_loop(tmp_path, monkeypatch):
     """Per-test kanban home with an empty SQLite board."""
-    from pathlib import Path as _Path
-
     from hermes_cli import kanban_db as _kb
 
     home = tmp_path / ".hermes"
     home.mkdir()
+    db_path = home / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(home))
-    # Pin the board file through the supported direct DB-path override.  The
-    # production-board guard must see the same isolated path even when tests
-    # replace Path.home() below; relying on home-derived resolution can make
-    # a hermetic tmp DB look like the live board in an overlaid environment.
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
-    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
-    _kb.init_db()
+    # Pin both resolution and initialization to the same per-test file. This
+    # keeps the production-board guard fail-closed without relying on a
+    # patched Path.home() or any home-derived cache.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    _kb.init_db(db_path=db_path)
     return home
 
 
