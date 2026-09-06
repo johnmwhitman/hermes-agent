@@ -456,6 +456,11 @@ def kanban_home_for_goal_loop(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Pin the board file through the supported direct DB-path override.  The
+    # production-board guard must see the same isolated path even when tests
+    # replace Path.home() below; relying on home-derived resolution can make
+    # a hermetic tmp DB look like the live board in an overlaid environment.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
     _kb.init_db()
     return home
