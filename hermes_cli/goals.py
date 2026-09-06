@@ -2197,12 +2197,26 @@ def run_kanban_goal_loop(
     ephemeral, so the turn budget lives in a local counter. It is fully
     decoupled from the CLI for testability: callers inject ``run_turn``
     (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
-    (reason: str -> None).
+    (``(reason: str, *, kind: Optional[str] = None) -> None``). ``kind`` is
+    one of ``hermes_cli.kanban_db.VALID_BLOCK_KINDS`` (``"dependency"``,
+    ``"needs_input"``, ``"capability"``, ``"transient"``); the kanban goal
+    loop uses ``"transient"`` for judge-route transport failures
+    (the API may recover) and the other kinds only if a future caller wires
+    them through.
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"review_requested_by_worker"``,
     ``"changes_requested_by_reviewer"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"blocked_transport"``, or ``"stopped"``.
+
+    ``"blocked_transport"`` is a new outcome: when the auxiliary judge
+    cannot reach its API for ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``
+    consecutive turns (auth 401, DNS failure, timeout, upstream HTTP 5xx),
+    the loop pauses with a transport-specific reason instead of burning
+    the entire turn budget. This mirrors the existing pattern in
+    :class:`GoalManager` for persistent goals and prevents a broken judge
+    route from being mislabeled as worker progress exhaustion
+    (see ``game-judge-blockers-20260906T1804.md`` and t_22414872).
     """
 
     def _log(msg: str) -> None:
@@ -2220,6 +2234,12 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    # Tracks consecutive judge transport failures (auth 401, DNS, timeout).
+    # Mirrors ``GoalState.consecutive_transport_failures``. A local counter
+    # is sufficient because the kanban worker loop is ephemeral (no
+    # SessionDB persistence); the dispatcher re-spawns workers on block /
+    # unblock, so a fresh counter per goal-loop run is correct.
+    consecutive_transport_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -2257,6 +2277,71 @@ def run_kanban_goal_loop(
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        # Track consecutive judge transport failures separately from the
+        # turn budget. A persistent API error (auth 401, DNS, timeout,
+        # upstream HTTP 5xx) signals a broken configuration — not
+        # transient network flakiness. Auto-pause after N consecutive
+        # transport failures so a permanently broken judge cannot burn
+        # every turn budget slot on an unreachable API and falsely mark
+        # the worker as exhausted. Counter resets on any successful
+        # judge call (transport or otherwise).
+        if _transport_failed:
+            consecutive_transport_failures += 1
+        else:
+            consecutive_transport_failures = 0
+
+        if (
+            _transport_failed
+            and consecutive_transport_failures >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES
+        ):
+            _log(
+                f"kanban goal loop: task {task_id} judge unreachable "
+                f"{consecutive_transport_failures} turn(s) in a row; pausing"
+            )
+            try:
+                # ``kind="transient"`` is the truthful typed reason: the
+                # judge route is unreachable right now, but the underlying
+                # cause is a recoverable provider/API issue (auth 401, DNS,
+                # timeout, upstream HTTP 5xx) — not a worker progress
+                # failure. ``VALID_BLOCK_KINDS`` includes ``"transient"``
+                # exactly for this case: it routes through the normal
+                # ``blocked`` lifecycle, participates in the
+                # block-recurrence loop breaker, and signals "may clear on
+                # its own" without falsely marking the task complete.
+                # See ``game-judge-blockers-20260906T1804.md`` and t_22414872.
+                block_fn(
+                    f"Goal-mode judge could not reach its API "
+                    f"({consecutive_transport_failures} consecutive transport failures). "
+                    f"This is a judge-route problem, not a worker progress problem — "
+                    f"the worker's last response is preserved on disk. "
+                    f"Check auxiliary.goal_judge provider/key in ~/.hermes/config.yaml, "
+                    f"then unblock and retry. Last judge reason: {_truncate(reason, 300)}",
+                    kind="transient",
+                )
+            except TypeError:
+                # Older block_fn signatures (reason only) — fall back to
+                # the un-typed call so we don't strand callers.
+                try:
+                    block_fn(
+                        f"Goal-mode judge could not reach its API "
+                        f"({consecutive_transport_failures} consecutive transport failures). "
+                        f"This is a judge-route problem, not a worker progress problem — "
+                        f"the worker's last response is preserved on disk. "
+                        f"Check auxiliary.goal_judge provider/key in ~/.hermes/config.yaml, "
+                        f"then unblock and retry. Last judge reason: {_truncate(reason, 300)}"
+                    )
+                except Exception as exc:
+                    _log(f"kanban goal loop: block_fn failed ({exc})")
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return {
+                "outcome": "blocked_transport",
+                "turns_used": turns_used,
+                "reason": (
+                    f"judge API unreachable {consecutive_transport_failures} consecutive turn(s)"
+                ),
+            }
 
         if verdict == "done":
             if nudged_to_finalize:

@@ -21751,13 +21751,25 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    def _block(reason: str) -> None:
+    def _block(reason: str, kind: "str | None" = None) -> None:
         c = _kb.connect()
         try:
+            # ``run_kanban_goal_loop`` threads a typed ``kind`` through the
+            # goal loop so transport failures / capability gaps / dependency
+            # waits can be distinguished at the DB layer instead of being
+            # merged into a single un-typed ``blocked`` bucket. Forward it
+            # here; ``block_task`` rejects anything outside ``VALID_BLOCK_KINDS``.
+            if kind is not None and kind not in _kb.VALID_BLOCK_KINDS:
+                logger.warning(
+                    "goal loop requested unknown block_kind=%r; falling back to None",
+                    kind,
+                )
+                kind = None
             _kb.block_task(
                 c,
                 task_id,
                 reason=reason,
+                kind=kind,
                 expected_run_id=worker_run_id,
             )
         finally:
