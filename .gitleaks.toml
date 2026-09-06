@@ -1,0 +1,73 @@
+# Gitleaks config for the hermes-agent tree.
+#
+# PURPOSE
+# =======
+# Allowlist the two test fixture lines that gitleaks 8.18+ flags on the
+# `generic-api-key` rule but that are deliberate, documented test fixtures
+# (not real credentials). Without this allowlist the pre-push rail fails on
+# 67/68 of the local branches because every dependent branch inherits the
+# fixture commit.
+#
+# LOADED BY
+#   * gitleaks pre-push hook (if/when installed)
+#   * manual `gitleaks detect -c .gitleaks.toml --source .`
+#
+# SCOPE (t_5b864ae5, 2026-09-06)
+#   68 findings across 67 branches — ALL fixture-shaped, ZERO real secrets.
+#   Distinct findings:
+#     - 67 hits at tests/run_agent/test_plugin_context_engine_init.py:148
+#         match:   api_key="test-key-1234567890"
+#         fixture: literal "test-key" prefix; the test uses this to stub
+#                  AIAgent(api_key=...) without going near a real secret.
+#     -  1 hit  at tests/hermes_cli/test_kanban_effective_worktree_provenance.py:520
+#         match:   secret = "AKIA-CANARY-1234567890"
+#         fixture: the literal word "CANARY" is in the value; the test
+#                  proves that the canary value is NOT propagated into the
+#                  kanban payload (negative-detection fixture).
+#
+# HOW THE ALLOWLIST WORKS
+# =======================
+# 1. `paths` scope the suppression to the two specific test files. A real
+#    credential landing in any other path (or another file in tests/) still
+#    trips the rail.
+# 2. `regexTarget = "match"` and the regex is anchored on the EXTRACTED
+#    secret value, so the suppression only fires for the two exact fixture
+#    shapes. A real Stripe/AWS/OpenAI key sharing the same line would not
+#    match the regex and would still be flagged.
+# 3. No `regexTarget = "line"` — that mode would suppress every finding on
+#    the matched line, including any real secret placed on the same line.
+#    (Same pitfall called out in Tools/kanban-stage-gitleaks.toml history.)
+#
+# NEGATIVE-TEST NOTE
+#   A `paths`-only allowlist would mask ANY secret in the two files. The
+#   `regexTarget = "match"` regex is the second guard that re-fails the
+#   rail for non-fixture-shaped secrets. See Tools/kanban-stage-gitleaks.toml
+#   for the documented reproduction of the bc85d312 / 193ecd5f / t_1008becb
+#   history on which this shape is modelled.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "hermes-agent test fixtures: api_key='test-key-1234567890' (line 148 of tests/run_agent/test_plugin_context_engine_init.py) and secret='AKIA-CANARY-1234567890' (line 520 of tests/hermes_cli/test_kanban_effective_worktree_provenance.py). Both values are negative-detection canaries documented in test docstrings; allowlisted by exact extracted-secret shape to keep any real credential in those files flagged."
+
+# Path-scope: only the two known-fixture files. Real secrets elsewhere
+# (including in OTHER test files) still trip the rail.
+paths = [
+  '''tests/run_agent/test_plugin_context_engine_init.py''',
+  '''tests/hermes_cli/test_kanban_effective_worktree_provenance.py''',
+]
+
+# Value-shape guard: the EXACT extracted-secret value must match one of
+# the two fixture shapes. `regexTarget = "match"` is the gitleaks 8.18+
+# default; declaring it explicitly here for documentation. A real
+# Stripe/AWS/OpenAI/Anthropic key sharing the same line will not match
+# either regex and will still be flagged.
+regexTarget = "match"
+regexes = [
+  # test-key-1234567890 — generic test fixture for OpenAI client stubs
+  '''^test-key-1234567890$''',
+  # AKIA-CANARY-1234567890 — AWS-shaped canary with literal "CANARY"
+  # token proving the value is a fixture.
+  '''^AKIA-CANARY-1234567890$''',
+]
