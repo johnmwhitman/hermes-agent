@@ -65,6 +65,122 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def test_execution_can_be_loaded_by_exact_attempt_id(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    first = executions.create_execution("same-job", source="builtin")
+    second = executions.create_execution("same-job", source="builtin")
+
+    assert executions.get_execution(first["id"]) == first
+    assert executions.get_execution(second["id"]) == second
+    assert executions.get_execution("missing") is None
+
+
+def test_fresh_external_handoff_is_not_recovered_before_worker_adopts(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record, token = _claim(executions, "handoff-job", source="builtin")
+    assert executions.mark_execution_handoff_pending(record["id"], owner_token=token) is not None
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-gateway")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started: False)
+
+    assert executions.recover_interrupted_executions() == 0
+    assert executions.get_execution(record["id"])["status"] == "claimed"
+    adopted = executions.adopt_claimed_execution(record["id"], owner_token=token)
+    assert adopted["status"] == "running"
+    assert adopted["handoff_pending"] == 0
+
+
+def test_stale_external_handoff_is_recovered_unknown(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record, token = _claim(executions, "handoff-job", source="builtin")
+    pending = executions.mark_execution_handoff_pending(record["id"], owner_token=token)
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-gateway")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started: False)
+    monkeypatch.setattr(
+        executions.time,
+        "time",
+        lambda: pending["handoff_started_at"]
+        + executions.HANDOFF_ADOPTION_GRACE_SECONDS
+        + 1,
+    )
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.get_execution(record["id"])
+    assert recovered["status"] == "unknown"
+    assert recovered["handoff_pending"] == 0
+
+
+def test_upgrade_handoff_requires_private_token_and_transfers_process_owner(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record, token = _claim(executions, "upgrade-fenced-handoff")
+    duplicate, admitted, leaked = executions.admit_execution(
+        "upgrade-fenced-handoff", source="builtin")
+    assert duplicate["id"] == record["id"] and not admitted and leaked is None
+    assert "owner_token" not in duplicate
+    assert executions.mark_execution_handoff_pending(record["id"], owner_token="wrong") is None
+    assert executions.mark_execution_handoff_pending(record["id"], owner_token=token)
+    parent_process = executions._PROCESS_ID
+    monkeypatch.setattr(executions, "_PROCESS_ID", "synthetic-child")
+    assert executions.adopt_claimed_execution(record["id"], owner_token="wrong") is None
+    assert executions.adopt_claimed_execution(record["id"], owner_token=token)
+    assert executions.adopt_claimed_execution(record["id"], owner_token=token) is None
+    monkeypatch.setattr(executions, "_PROCESS_ID", parent_process)
+    assert executions.finish_execution(record["id"], success=True, owner_token=token) is None
+    monkeypatch.setattr(executions, "_PROCESS_ID", "synthetic-child")
+    assert executions.finish_execution(record["id"], success=True, owner_token=token)["status"] == "completed"
+
+
+def test_recovery_does_not_overwrite_concurrent_worker_adoption(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record, token = _claim(executions, "adoption-race", source="builtin")
+    pending = executions.mark_execution_handoff_pending(record["id"], owner_token=token)
+    assert pending is not None
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-scheduler")
+    monkeypatch.setattr(
+        executions.time,
+        "time",
+        lambda: pending["handoff_started_at"]
+        + executions.HANDOFF_ADOPTION_GRACE_SECONDS
+        + 1,
+    )
+
+    def adopt_while_liveness_is_checked(_pid, _started_at):
+        monkeypatch.setattr(executions, "_PROCESS_ID", "external-worker")
+        monkeypatch.setattr(executions.os, "getpid", lambda: 4242)
+        monkeypatch.setattr(executions, "_process_start_time", lambda _pid: 9876)
+        assert executions.adopt_claimed_execution(record["id"], owner_token=token) is not None
+        return False
+
+    monkeypatch.setattr(executions, "_owner_is_live", adopt_while_liveness_is_checked)
+
+    assert executions.recover_interrupted_executions() == 0
+    current = executions.get_execution(record["id"])
+    assert current is not None
+    assert current["status"] == "running"
+    assert current["process_id"] == "external-worker"
+    assert current["pid"] == 4242
+
+
+def test_foreign_process_cannot_start_or_finish_execution(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record, token = _claim(executions, "owner-fence", source="builtin")
+    original_process_id = executions._PROCESS_ID
+    original_pid = record["pid"]
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", "foreign-process")
+    monkeypatch.setattr(executions.os, "getpid", lambda: original_pid + 1)
+    assert executions.mark_execution_running(record["id"], owner_token=token) is None
+    assert executions.finish_execution(record["id"], success=True, owner_token=token) is None
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", original_process_id)
+    monkeypatch.setattr(executions.os, "getpid", lambda: original_pid)
+    assert executions.mark_execution_running(record["id"], owner_token=token) is not None
+    assert executions.finish_execution(record["id"], success=True, owner_token=token) is not None
+
+
 def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
     import cron.executions as executions
 
@@ -109,6 +225,24 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     records = executions.list_executions(limit=100)
     assert len([row for row in records if row["status"] == "completed"]) == 3
     assert executions.latest_execution("live")["status"] == "running"
+
+
+def test_recently_finished_long_running_execution_survives_retention(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1)
+    long_running, long_token = _claim(executions, "long-running", source="builtin")
+    assert executions.mark_execution_running(long_running["id"], owner_token=long_token) is not None
+    newer, newer_token = _claim(executions, "newer", source="builtin")
+    assert executions.finish_execution(newer["id"], success=True, owner_token=newer_token) is not None
+
+    finished = executions.finish_execution(long_running["id"], success=True, owner_token=long_token)
+
+    assert finished is not None
+    assert finished["status"] == "completed"
+    assert executions.get_execution(long_running["id"])["status"] == "completed"
+    assert executions.get_execution(newer["id"]) is None
 
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
@@ -174,9 +308,9 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
         [
             sys.executable,
             "-c",
-            "from cron.executions import create_execution, mark_execution_running; "
-            "r=create_execution('restart-job', source='builtin'); "
-            "mark_execution_running(r['id']); print(r['id'])",
+            "from cron.executions import admit_execution, mark_execution_running; "
+            "r,owned,token=admit_execution('restart-job', source='builtin'); "
+            "mark_execution_running(r['id'],owner_token=token); print(r['id'])",
         ],
         cwd=repo,
         env=env,

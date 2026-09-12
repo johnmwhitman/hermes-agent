@@ -9,10 +9,7 @@ import sys
 import pytest
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="systemd abstract sockets are a Linux-only AF_UNIX extension",
-)
+@pytest.mark.linux_only  # abstract (NUL-prefixed) AF_UNIX names are a Linux kernel feature
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     name = "\0hermes-test-notify"
     receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -79,4 +76,3 @@ async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
     assert "WATCHDOG=1" in calls
     assert calls[-1] == "STOPPING=1"
     assert watchdog.unhealthy is False
-

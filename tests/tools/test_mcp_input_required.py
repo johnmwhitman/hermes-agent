@@ -42,7 +42,8 @@ from mcp.types import (  # noqa: E402
     InputRequiredResult,
 )
 
-from tools import mcp_tool  # noqa: E402
+from tools import mcp_tool, mcp_tool_handlers  # noqa: E402
+from tools.mcp_tool_sampling import ElicitationHandler, SamplingHandler
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +217,13 @@ def connected_server():
         name="pay",
         session=session,
         _rpc_lock=None,
-        _elicitation=mcp_tool.ElicitationHandler("pay", {"timeout": 5}),
+        _elicitation=ElicitationHandler("pay", {"timeout": 5}),
         _sampling=None,
         _pending_call_context=None,
     )
     server._elicitation.owner = server
     with patch.dict(mcp_tool._servers, {"pay": server}), patch(
-        "tools.mcp_tool._run_on_mcp_loop",
+        "tools.mcp_tool_loop._run_on_mcp_loop",
         side_effect=_fake_run_on_mcp_loop,
     ), patch.dict(mcp_tool._server_error_counts, {}, clear=True), patch.dict(
         mcp_tool._server_breaker_opened_at, {}, clear=True
@@ -240,7 +241,7 @@ def connected_server():
 class TestCallToolOptsIntoInputRequired:
     def test_first_call_passes_allow_input_required(self, connected_server):
         """Without this flag, mcp 2.0 raises RuntimeError on InputRequiredResult."""
-        handler = mcp_tool._make_tool_handler("pay", "charge", 30.0)
+        handler = mcp_tool_handlers._make_tool_handler("pay", "charge", 30.0)
         raw = handler({"amount": "0.50"})
         assert json.loads(raw) == {"result": "ok"}
         assert connected_server.session.call_tool_calls, "call_tool was not invoked"
@@ -250,7 +251,7 @@ class TestCallToolOptsIntoInputRequired:
         assert first["arguments"] == {"amount": "0.50"}
 
     def test_happy_path_still_returns_tool_text(self, connected_server):
-        handler = mcp_tool._make_tool_handler("pay", "charge", 30.0)
+        handler = mcp_tool_handlers._make_tool_handler("pay", "charge", 30.0)
         raw = handler({"amount": "0.50"})
         assert json.loads(raw)["result"] == "ok"
 
@@ -282,9 +283,9 @@ class TestFormElicitationReachesApprovalQueue:
 
         connected_server.session.call_tool_impl = _impl
 
-        handler = mcp_tool._make_tool_handler("pay", "charge", 30.0)
+        handler = mcp_tool_handlers._make_tool_handler("pay", "charge", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent",
+            "tools.approval_prompt.request_elicitation_consent",
             return_value="accept",
         ) as consent:
             raw = handler({"amount": "0.50"})
@@ -321,9 +322,9 @@ class TestFormElicitationReachesApprovalQueue:
 
         connected_server.session.call_tool_impl = _impl
 
-        handler = mcp_tool._make_tool_handler("pay", "charge", 30.0)
+        handler = mcp_tool_handlers._make_tool_handler("pay", "charge", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent",
+            "tools.approval_prompt.request_elicitation_consent",
             return_value="decline",
         ) as consent:
             raw = handler({"amount": "0.50"})
@@ -358,9 +359,9 @@ class TestFormElicitationReachesApprovalQueue:
 
         connected_server.session.call_tool_impl = _impl
 
-        handler = mcp_tool._make_tool_handler("pay", "charge", 30.0)
+        handler = mcp_tool_handlers._make_tool_handler("pay", "charge", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent",
+            "tools.approval_prompt.request_elicitation_consent",
         ) as consent:
             raw = handler({"amount": "0.50"})
 
@@ -415,9 +416,9 @@ class TestSamplingInputRequiredDoesNotGrowSurface:
             )
         )
 
-        handler = mcp_tool._make_tool_handler("pay", "charge", 30.0)
+        handler = mcp_tool_handlers._make_tool_handler("pay", "charge", 30.0)
         with patch.object(
-            mcp_tool.SamplingHandler,
+            SamplingHandler,
             "__call__",
             side_effect=AssertionError("sampling must not grow"),
         ):
@@ -440,7 +441,7 @@ class TestSamplingInputRequiredDoesNotGrowSurface:
 
 class TestUtilityMethodsOptIn:
     def test_read_resource_passes_allow_input_required(self, connected_server):
-        handler = mcp_tool._make_read_resource_handler("pay", 30.0)
+        handler = mcp_tool_handlers._make_read_resource_handler("pay", 30.0)
         raw = handler({"uri": "file:///tmp/x"})
         assert "file body" in json.loads(raw)["result"]
         assert connected_server.session.read_resource_calls
@@ -450,7 +451,7 @@ class TestUtilityMethodsOptIn:
         )
 
     def test_get_prompt_passes_allow_input_required(self, connected_server):
-        handler = mcp_tool._make_get_prompt_handler("pay", 30.0)
+        handler = mcp_tool_handlers._make_get_prompt_handler("pay", 30.0)
         raw = handler({"name": "summarize", "arguments": {"text": "hi"}})
         assert json.loads(raw)["messages"][0]["content"] == "a summary"
         assert connected_server.session.get_prompt_calls

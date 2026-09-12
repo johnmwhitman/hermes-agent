@@ -61,7 +61,7 @@ def worker_env(monkeypatch):
 
 class TestDispatcherOwnedPredicate:
     def test_default_is_dispatcher_owned(self):
-        from agent.delegation_context import is_dispatcher_owned_worker_context
+        from agent.delegation_context import is_dispatcher_owned_worker_context, is_delegated_child_context, delegated_child_subprocess_env
 
         assert is_dispatcher_owned_worker_context() is True
 
@@ -216,11 +216,8 @@ class TestRunJobKanbanIsolation:
         import sys
 
         import cron.scheduler as sched
-        from agent.delegation_context import (
-            delegated_child_subprocess_env,
-            is_delegated_child_context,
-            is_dispatcher_owned_worker_context,
-        )
+        from cron import scheduler_delivery as sched_delivery
+        from agent.delegation_context import is_dispatcher_owned_worker_context, is_delegated_child_context, delegated_child_subprocess_env
 
         class FakeAgent:
             def __init__(self, **kwargs):
@@ -261,7 +258,7 @@ class TestRunJobKanbanIsolation:
         monkeypatch.setattr(
             sched, "_build_job_prompt", lambda job, prerun_script=None, **kw: "hi"
         )
-        monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
+        monkeypatch.setattr(sched_delivery, "_resolve_origin", lambda job: None)
         monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
         monkeypatch.setattr(
             sched, "_resolve_cron_enabled_toolsets", lambda job, cfg: None
@@ -281,6 +278,7 @@ class TestRunJobKanbanIsolation:
 
     def test_agent_runs_as_non_dispatcher(self, monkeypatch, worker_env):
         import cron.scheduler as sched
+        from cron import scheduler_delivery as sched_delivery
 
         observed: dict = {}
         self._install_stubs(monkeypatch, observed)
@@ -294,6 +292,7 @@ class TestRunJobKanbanIsolation:
         """The whole point of the ContextVar: os.environ must not be mutated, so
         the worker's claim heartbeat and the gateway watchers keep working."""
         import cron.scheduler as sched
+        from cron import scheduler_delivery as sched_delivery
 
         before = {
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
@@ -316,7 +315,8 @@ class TestRunJobKanbanIsolation:
 
     def test_context_reset_after_job(self, monkeypatch, worker_env):
         import cron.scheduler as sched
-        from agent.delegation_context import is_dispatcher_owned_worker_context
+        from cron import scheduler_delivery as sched_delivery
+        from agent.delegation_context import is_dispatcher_owned_worker_context, is_delegated_child_context, delegated_child_subprocess_env
 
         observed: dict = {}
         self._install_stubs(monkeypatch, observed)
@@ -326,7 +326,8 @@ class TestRunJobKanbanIsolation:
 
     def test_context_reset_even_when_job_raises(self, monkeypatch, worker_env):
         import cron.scheduler as sched
-        from agent.delegation_context import is_dispatcher_owned_worker_context
+        from cron import scheduler_delivery as sched_delivery
+        from agent.delegation_context import is_dispatcher_owned_worker_context, is_delegated_child_context, delegated_child_subprocess_env
 
         class ExplodingAgent:
             def __init__(self, **kwargs):
@@ -355,6 +356,7 @@ class TestRunJobKanbanIsolation:
         restore this permanently destroyed the worker's identity; a ContextVar is
         per-thread and cannot."""
         import cron.scheduler as sched
+        from cron import scheduler_delivery as sched_delivery
 
         before = {
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
@@ -381,9 +383,42 @@ class TestRunJobKanbanIsolation:
         assert after == before, "worker identity must survive concurrent cron jobs"
 
 
-# ---------------------------------------------------------------------------
-# Stale delegate_task child marker (contextvars leak into a cron execution)
-# ---------------------------------------------------------------------------
+@pytest.mark.linux_only
+def test_dispatcher_grants_only_the_assigned_worker_scope(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+    import sys
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from hermes_cli.kanban_db_dispatch import _default_spawn
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    db = tmp_path / "board.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    conn = connect(db)
+    tid = kb.create_task(conn, title="assigned child", assignee="default")
+    kb.claim_task(conn, tid)
+    task = kb.get_task(conn, tid)
+    output = tmp_path / "worker-result.json"
+    worker = tmp_path / "fixture-worker"
+    root = str(Path(__file__).resolve().parents[2])
+    worker.write_text(
+        f"#!{sys.executable}\nimport sys, os, json;sys.path.insert(0, {root!r})\n"
+        "from tools.kanban_tools import _handle_complete\n"
+        f"result=_handle_complete({{'summary':'assigned worker VERIFIED $ true'}});open({str(output)!r}, 'w').write(result)\n"
+    )
+    worker.chmod(0o700)
+    monkeypatch.setenv("HERMES_BIN", str(worker))
+    # Building a new worker under an existing task must replace, not inherit, its scope.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "prior-task")
+    pid = _default_spawn(task, str(tmp_path), board="default")
+    assert pid is not None
+    os.waitpid(pid, 0)  # windows-footgun: ok — Linux-only real dispatcher spawn
+    assert json.loads(output.read_text())["ok"]
+    assert kb.get_task(conn, tid).status == "done"
+    assert os.environ["HERMES_KANBAN_TASK"] == "prior-task"
+    conn.close()
+
 
 class TestDelegatedChildClearedContext:
     def test_token_form_clears_and_restores(self):
@@ -438,7 +473,7 @@ class TestRunJobClearsLeakedDelegatedChildContext:
             assert observed["subprocess_env_during_run"] is None
             # The leak is logged as the diagnostic datum.
             assert any(
-                "leaked _DELEGATED_CHILD_CONTEXT" in r.message for r in caplog.records
+                "cleared a leaked delegated-child context" in r.message for r in caplog.records
             )
             # Prior context state is restored after the job.
             assert dc.is_delegated_child_context() is True
@@ -458,13 +493,8 @@ class TestRunJobClearsLeakedDelegatedChildContext:
         assert success is True
         assert observed["delegated_child_during_run"] is False
         assert not any(
-            "leaked _DELEGATED_CHILD_CONTEXT" in r.message for r in caplog.records
+            "cleared a leaked delegated-child context" in r.message for r in caplog.records
         )
-
-
-# ---------------------------------------------------------------------------
-# Drift guard
-# ---------------------------------------------------------------------------
 
 
 def test_every_dispatcher_kanban_var_is_identity_gated():
@@ -474,8 +504,8 @@ def test_every_dispatcher_kanban_var_is_identity_gated():
 
     Fails loudly if a new dispatcher var is added without registering it.
     """
-    import hermes_cli.kanban_db as kanban_db
-    from agent.delegation_context import KANBAN_ENV_KEYS
+    import hermes_cli.kanban_db_dispatch as kanban_db
+    from agent.delegation_context import KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER, scrub_kanban_env
 
     source = ast.parse(open(kanban_db.__file__, encoding="utf-8").read())
     spawn = next(
@@ -528,8 +558,20 @@ def test_every_dispatcher_kanban_var_is_identity_gated():
         "HERMES_KANBAN_GOAL_MODE",
         "HERMES_KANBAN_GOAL_MAX_TURNS",
     }
-    uncovered = injected - set(KANBAN_ENV_KEYS) - behaviour_only
+    # Upstream separates dispatch authority from routing/location. Children
+    # retain the latter so they can resolve their board, but carry an explicit
+    # denial marker that prevents an absent TASK from promoting them to owner.
+    location_only = {
+        "HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_WORKSPACES_ROOT",
+    }
+    sample = {key: "fixture" for key in injected}
+    scrubbed = scrub_kanban_env(sample)
+    assert all(key not in scrubbed for key in KANBAN_ENV_KEYS)
+    assert all(scrubbed[key] == "fixture" for key in location_only)
+    assert scrubbed[DELEGATED_CHILD_ENV_MARKER] == "1"
+    uncovered = injected - set(KANBAN_ENV_KEYS) - behaviour_only - location_only
     assert not uncovered, (
         f"dispatcher injects {sorted(uncovered)} which is neither in "
-        "KANBAN_ENV_KEYS nor explicitly classified as behaviour-only"
+        "KANBAN_ENV_KEYS nor explicitly classified as behaviour/location-only"
     )

@@ -112,8 +112,8 @@ class TestRunningJobGuard:
         monkeypatch.setattr(sched, "_get_parallel_pool", lambda _workers: DeferredPool())
         monkeypatch.setattr(
             sched,
-            "create_execution",
-            lambda *_a, **_kw: {"id": "execution-1"},
+            "admit_execution",
+            lambda *_a, **_kw: ({"id": "execution-1"}, True, "owner-token-1"),
         )
         monkeypatch.setattr(
             sched,
@@ -171,7 +171,7 @@ class TestRunningJobGuard:
 
         called = []
 
-        def admit_execution_side_effect(job_id, source):
+        def admit_execution_side_effect(job_id, source, **kwargs):
             if job_id == "failing-job":
                 raise RuntimeError("execution ledger unavailable")
             return {"id": f"{job_id}-execution"}, True, f"tok-{job_id}"

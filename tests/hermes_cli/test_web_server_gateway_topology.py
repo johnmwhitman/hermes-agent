@@ -8,10 +8,9 @@ gateway detection, and per-platform port resolution.
 import pytest
 
 from hermes_cli import web_server
-from hermes_cli.web_server import (
-    _collect_profile_gateway_topology,
-    _profile_platform_ports,
-)
+import gateway.status as _gw_status
+import hermes_cli.web_server_gateway as _web_server_gateway
+from hermes_cli.web_server_gateway import _collect_profile_gateway_topology, _profile_platform_ports
 
 
 _A2A_ADJACENT_SOURCE_PAIRS = (
@@ -272,7 +271,7 @@ class TestCollectProfileGatewayTopology:
         )
         identities = {tmp_path / "d": (100, 111), tmp_path / "c": (200, 222)}
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_profile_gateway_writer_identity",
             lambda home, runtime: identities.get(home),
         )
@@ -341,7 +340,7 @@ class TestCollectProfileGatewayTopology:
             monkeypatch, homes, running={"coder"}, runtimes=runtimes
         )
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_profile_gateway_writer_identity",
             lambda home, runtime: (200, 222),
         )
@@ -365,7 +364,7 @@ class TestCollectProfileGatewayTopology:
         }
         _patch_topology(monkeypatch, homes, running={"coder"}, runtimes=runtimes)
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_profile_gateway_writer_identity",
             lambda home, runtime: None,
         )
@@ -414,7 +413,7 @@ class TestStatusEndpointTopology:
 
     def test_status_includes_full_topology_on_loopback(self, monkeypatch):
         monkeypatch.setattr(
-            web_server, "_collect_profile_gateway_topology",
+            _web_server_gateway, "_collect_profile_gateway_topology",
             lambda: {
                 "profiles": ["default", "coder"],
                 "gateway_mode": "single",
@@ -430,9 +429,9 @@ class TestStatusEndpointTopology:
         assert data["gateways"] == [{"profile": "default", "ports": {}}]
 
     def test_status_preserves_secondary_profile_platform_errors(self, monkeypatch):
-        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 123)
         monkeypatch.setattr(
-            web_server,
+            _gw_status,
             "read_runtime_status",
             lambda path=None: {
                 "gateway_state": "running",
@@ -447,7 +446,7 @@ class TestStatusEndpointTopology:
             },
         )
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_load_configured_gateway_platforms",
             lambda: {"telegram"},
         )
@@ -460,9 +459,9 @@ class TestStatusEndpointTopology:
         assert platforms["reviewer:discord"]["error_code"] == "duplicate_credential"
 
     def test_status_rejects_malformed_namespaced_platform_key(self, monkeypatch):
-        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 123)
         monkeypatch.setattr(
-            web_server,
+            _gw_status,
             "read_runtime_status",
             lambda path=None: {
                 "gateway_state": "running",
@@ -472,7 +471,7 @@ class TestStatusEndpointTopology:
             },
         )
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_load_configured_gateway_platforms",
             lambda: {"telegram"},
         )
@@ -488,9 +487,9 @@ class TestStatusEndpointTopology:
         # validated against the key grammar. A config-load failure must not
         # let malformed keys from a process-local JSON file reach the public
         # endpoint.
-        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 123)
         monkeypatch.setattr(
-            web_server,
+            _gw_status,
             "read_runtime_status",
             lambda path=None: {
                 "gateway_state": "running",
@@ -507,7 +506,7 @@ class TestStatusEndpointTopology:
             raise RuntimeError("config unreadable")
 
         monkeypatch.setattr(
-            web_server, "_load_configured_gateway_platforms", _boom
+            _web_server_gateway, "_load_configured_gateway_platforms", _boom
         )
 
         resp = self.client.get("/api/status")
@@ -524,9 +523,9 @@ class TestStatusEndpointTopology:
         # names are lowercased directory names; the Platform enum accepts
         # them). A valid ``reviewer:foo-bar`` fatal entry must survive the
         # public filter.
-        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 123)
         monkeypatch.setattr(
-            web_server,
+            _gw_status,
             "read_runtime_status",
             lambda path=None: {
                 "gateway_state": "running",
@@ -539,7 +538,7 @@ class TestStatusEndpointTopology:
             },
         )
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_load_configured_gateway_platforms",
             lambda: {"telegram"},
         )
@@ -557,9 +556,9 @@ class TestStatusEndpointTopology:
         # them in as <profile>:<platform> so NAS health monitoring sees them.
         import hermes_cli.profiles as profiles_mod
 
-        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 123)
         monkeypatch.setattr(
-            web_server,
+            _gw_status,
             "read_runtime_status",
             lambda path=None: {
                 "gateway_state": "running",
@@ -573,7 +572,7 @@ class TestStatusEndpointTopology:
             },
         )
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_load_configured_gateway_platforms",
             lambda: {"telegram"},
         )
@@ -581,7 +580,7 @@ class TestStatusEndpointTopology:
             profiles_mod, "get_active_profile_name", lambda: "default"
         )
         monkeypatch.setattr(
-            web_server, "_collect_profile_gateway_topology",
+            _web_server_gateway, "_collect_profile_gateway_topology",
             lambda: {
                 "profiles": ["default", "lead-gen-outreach"],
                 "gateway_mode": "multiple",
@@ -633,9 +632,9 @@ class TestStatusEndpointTopology:
         # profile's failures into it would misattribute state.
         import hermes_cli.profiles as profiles_mod
 
-        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 123)
         monkeypatch.setattr(
-            web_server,
+            _gw_status,
             "read_runtime_status",
             lambda path=None: {
                 "gateway_state": "running",
@@ -643,7 +642,7 @@ class TestStatusEndpointTopology:
             },
         )
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_load_configured_gateway_platforms",
             lambda: {"telegram"},
         )
@@ -651,7 +650,7 @@ class TestStatusEndpointTopology:
             profiles_mod, "get_active_profile_name", lambda: "default"
         )
         monkeypatch.setattr(
-            web_server, "_collect_profile_gateway_topology",
+            _web_server_gateway, "_collect_profile_gateway_topology",
             lambda: {
                 "profiles": ["default", "coder"],
                 "gateway_mode": "multiple",
@@ -673,7 +672,7 @@ class TestStatusEndpointTopology:
         # Hermes Cloud Portal reads /api/status over the network (a gated bind)
         # to render the profile list, so they must survive the auth gate.
         monkeypatch.setattr(
-            web_server, "_collect_profile_gateway_topology",
+            _web_server_gateway, "_collect_profile_gateway_topology",
             lambda: {
                 "profiles": ["default", "coder"],
                 "gateway_mode": "multiplex",

@@ -52,16 +52,38 @@ from typing import Any, Dict, Optional
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    MessageEvent,
-    MessageType,
-    ProcessingOutcome,
     SendResult,
 )
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms._shared import profile_scoped as _profile_scoped
 from gateway.config import Platform
 
 from . import _listener_policy, posture, protocol, security
 
 logger = logging.getLogger(__name__)
+
+_ok = protocol.jsonrpc_result
+_err = protocol.jsonrpc_error
+
+# (adapter handler, v1.0 PascalCase method per §5.3/§9.4, *legacy slash aliases still accepted)
+_METHOD_TABLE = (
+    ("_rpc_message_send", "SendMessage", "message/send"),
+    ("_rpc_message_stream", "SendStreamingMessage", "message/stream"),
+    ("_rpc_tasks_get", "GetTask", "tasks/get"),
+    ("_rpc_tasks_list", "ListTasks", "tasks/list"),
+    ("_rpc_tasks_cancel", "CancelTask", "tasks/cancel"),
+    ("_rpc_tasks_subscribe", "SubscribeToTask", "tasks/subscribe"),
+    ("_rpc_push_config_create", "CreateTaskPushNotificationConfig", "tasks/pushNotificationConfig/create",
+     "tasks/pushNotificationConfig/set", "tasks/pushNotification/set"),
+    ("_rpc_push_config_get", "GetTaskPushNotificationConfig", "tasks/pushNotificationConfig/get"),
+    ("_rpc_push_config_list", "ListTaskPushNotificationConfigs", "tasks/pushNotificationConfig/list"),
+    ("_rpc_push_config_delete", "DeleteTaskPushNotificationConfig", "tasks/pushNotificationConfig/delete"),
+)
+# JSON-RPC method -> (adapter handler name, is_v1)
+_METHODS: dict[str, tuple[str, bool]] = {
+    m: (handler, i == 0) for handler, *methods in _METHOD_TABLE for i, m in enumerate(methods)
+}
+
 
 _DEFAULT_PORT = 9900
 _ORPHAN_TIMEOUT = 300  # floor: seconds before a pending task is considered orphaned
@@ -104,7 +126,8 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _default_agent_name() -> str:
-    name = os.getenv("A2A_AGENT_NAME", "").strip()
+    # Scope-aware: a secondary multiplex profile must not borrow the default profile's A2A_AGENT_NAME.
+    name = "" if _profile_scoped() else os.getenv("A2A_AGENT_NAME", "").strip()
     if name:
         return name
     try:
@@ -442,139 +465,77 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         scheme = (self.headers.get("X-Forwarded-Proto", "") or "http").split(",")[0].strip()
         return f"{scheme}://{host}/"
 
+
+    def _error(self, http_code: int, req_id: Any, code: int, message: str):
+        self._json(http_code, _err(req_id, code, message))
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else ""
+
     def do_GET(self):  # noqa: N802
-        route = self.adapter._route_for_path(self.path)
+        adapter = self.adapter
+        route = adapter._route_for_path(self.path)
         agent = route["agent"]
         subpath = route["subpath"].rstrip("/") or "/"
+        public_url = self._request_public_url() or None
         if subpath in ("/.well-known/agent.json", "/.well-known/agent-card.json"):
-            public_url = self._request_public_url() or None
-            self._json(200, self.adapter._build_card(public_url, agent=agent))
-            return
-        if subpath in ("/", "/health"):
-            payload = {
-                "status": "ok",
-                "agent": agent.get("name") or self.adapter.agent_name,
-            }
-            # Do not leak profile/tenant topology on remote unauthenticated GETs.
-            # Agent Cards are intentionally public; health topology is not.
-            if security.localhost_only() or security.authenticate(
-                self.headers.get("Authorization"),
-                self.client_address[0] if self.client_address else "",
-            ) is not None:
-                payload["served_agents"] = self.adapter._served_agent_summary(
-                    public_url=self._request_public_url() or None)
-            self._json(200, payload)
-            return
+            return self._json(200, adapter._build_card(public_url, agent=agent))
         if subpath == "/metrics":
-            self._json(200, protocol.metrics.snapshot())
-            return
-        self._json(404, {"error": "not found"})
+            return self._json(200, protocol.metrics.snapshot())
+        if subpath not in ("/", "/health"):
+            return self._json(404, {"error": "not found"})
+        payload = {"status": "ok", "agent": agent.get("name") or adapter.agent_name}
+        # Agent Cards are public; profile/tenant topology is not leaked on remote unauthenticated GETs.
+        sec = adapter._security_context
+        if sec.localhost_only() or sec.authenticate(self.headers.get("Authorization"), self._client_ip()) is not None:
+            payload["served_agents"] = adapter._served_agent_summary(public_url=public_url)
+        self._json(200, payload)
 
     def do_POST(self):  # noqa: N802
         adapter = self.adapter
-        client_ip = self.client_address[0] if self.client_address else ""
-
-        # Identity comes from the presented credential (or the socket in
-        # localhost-only mode) — never from the request body.
-        identity = security.authenticate(self.headers.get("Authorization"), client_ip)
+        # Identity comes from the credential (or the socket in localhost-only mode) — never the body.
+        identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())
         if identity is None:
-            self._json(401, protocol.jsonrpc_error(None, protocol.ERR_UNAUTHORIZED, "unauthorized"))
-            return
-
+            return self._error(401, None, protocol.ERR_UNAUTHORIZED, "unauthorized")
         try:
             length = int(self.headers.get("Content-Length", 0))
             if length > _MAX_BODY:
-                self._json(413, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "payload too large"))
-                return
-            raw = self.rfile.read(length) if length else b"{}"
-            req = json.loads(raw.decode("utf-8"))
+                return self._error(413, None, protocol.ERR_PARSE, "payload too large")
+            req = json.loads((self.rfile.read(length) if length else b"{}").decode("utf-8"))
         except Exception:
-            self._json(400, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "parse error"))
-            return
-
+            return self._error(400, None, protocol.ERR_PARSE, "parse error")
         if not isinstance(req, dict):
-            self._json(400, protocol.jsonrpc_error(None, protocol.ERR_INVALID_PARAMS, "JSON-RPC request must be an object"))
-            return
-
-        req_id = req.get("id")
-        method = str(req.get("method", ""))
-        params = req.get("params", {})
-        if params is None:
-            params = {}
-        if not isinstance(params, dict):
-            self._json(200, protocol.jsonrpc_error(req_id, protocol.ERR_INVALID_PARAMS, "params must be an object"))
-            return
-
+            return self._error(400, None, protocol.ERR_INVALID_PARAMS, "JSON-RPC request must be an object")
+        req_id, method = req.get("id"), str(req.get("method", ""))
+        params = req["params"] if req.get("params") is not None else {}
         version = (self.headers.get("A2A-Version") or "").strip()
-        if version and version not in {"1.0", "1.0.0"}:
-            self._json(200, protocol.jsonrpc_error(req_id, protocol.ERR_INVALID_PARAMS, f"unsupported A2A-Version: {version}"))
-            return
-
-        operation, is_v1 = _method_info(method)
-        route = adapter._route_for_request(self.path, params)
-        if route.get("error"):
-            self._json(400, protocol.jsonrpc_error(req_id, protocol.ERR_INVALID_PARAMS, route["error"]))
-            return
+        route = adapter._route_for_request(self.path, params) if isinstance(params, dict) else {}
+        handler_name, is_v1 = _METHODS.get(method, ("", False))
+        # Ordered, lazily-evaluated checks -> (http status, error code, message); first failure wins
+        # (the rate limiter must not be consulted for requests rejected before it).
+        checks = (
+            (lambda: not isinstance(params, dict), 200, protocol.ERR_INVALID_PARAMS, "params must be an object"),
+            (lambda: version and version not in {"1.0", "1.0.0"}, 200, protocol.ERR_INVALID_PARAMS, f"unsupported A2A-Version: {version}"),
+            (lambda: route.get("error"), 400, protocol.ERR_INVALID_PARAMS, route.get("error")),
+            (lambda: not security.is_authorized_for_agent(identity, route.get("agent")), 403, protocol.ERR_UNTRUSTED_PEER, "peer is not authorized for this served agent"),
+            (lambda: not adapter._rate_limiter.allow(identity), 429, protocol.ERR_RATE_LIMITED, "rate limit exceeded"),
+            (lambda: not adapter._security_context.is_trusted_peer(identity), 403, protocol.ERR_UNTRUSTED_PEER, f"peer '{identity}' not trusted"),
+            (lambda: not handler_name, 200, protocol.ERR_METHOD_NOT_FOUND, f"method not found: {method}"),
+        )
+        for failed, http, code, msg in checks:
+            if failed():
+                if code == protocol.ERR_RATE_LIMITED:
+                    protocol.metrics.rate_limit_triggers += 1
+                return self._error(http, req_id, code, msg)
         agent = route["agent"]
-
-        if not security.is_authorized_for_agent(identity, agent):
-            self._json(403, protocol.jsonrpc_error(
-                req_id, protocol.ERR_UNTRUSTED_PEER,
-                f"peer '{identity}' is not authorized for this served agent",
-            ))
-            return
-
-        if not adapter._rate_limiter.allow(identity):
-            protocol.metrics.rate_limit_triggers += 1
-            self._json(429, protocol.jsonrpc_error(req_id, protocol.ERR_RATE_LIMITED, "rate limit exceeded"))
-            return
-
-        if not security.is_trusted_peer(identity):
-            self._json(403, protocol.jsonrpc_error(
-                req_id, protocol.ERR_UNTRUSTED_PEER, f"peer '{identity}' not trusted"))
-            return
-
-        if not operation:
-            self._json(200, protocol.jsonrpc_error(
-                req_id, protocol.ERR_METHOD_NOT_FOUND, f"method not found: {method}"))
-            return
-
-        if operation == "send":
-            self._json(200, adapter._rpc_message_send(
-                req_id, params, identity, agent=agent, v1_response=is_v1,
-                credential_authenticated=not security.localhost_only(),
-            ))
-            return
-        if operation == "stream":
-            adapter._rpc_message_stream(
-                self, req_id, params, identity, agent=agent,
-                credential_authenticated=not security.localhost_only(),
-            )
-            return
-        if operation == "get":
-            self._json(200, adapter._rpc_tasks_get(req_id, params, agent=agent, peer=identity))
-            return
-        if operation == "list":
-            self._json(200, adapter._rpc_tasks_list(req_id, params, agent=agent, peer=identity))
-            return
-        if operation == "cancel":
-            self._json(200, adapter._rpc_tasks_cancel(req_id, params, agent=agent, peer=identity))
-            return
-        if operation == "subscribe":
+        if handler_name == "_rpc_message_send":
+            self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1, credential_authenticated=not adapter._security_context.localhost_only()))
+        elif handler_name == "_rpc_message_stream":
+            adapter._rpc_message_stream(self, req_id, params, identity, agent=agent, credential_authenticated=not adapter._security_context.localhost_only())
+        elif handler_name == "_rpc_tasks_subscribe":
             adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent, peer=identity)
-            return
-        if operation == "push_create":
-            self._json(200, adapter._rpc_push_config_create(req_id, params, agent=agent, peer=identity))
-            return
-        if operation == "push_get":
-            self._json(200, adapter._rpc_push_config_get(req_id, params, agent=agent, peer=identity))
-            return
-        if operation == "push_list":
-            self._json(200, adapter._rpc_push_config_list(req_id, params, agent=agent, peer=identity))
-            return
-        if operation == "push_delete":
-            self._json(200, adapter._rpc_push_config_delete(req_id, params, agent=agent, peer=identity))
-            return
+        else:  # plain JSON task / push-config queries
+            self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent, peer=identity))
 
 
 
@@ -586,6 +547,7 @@ class A2AAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=platform)
 
         extra = getattr(config, "extra", {}) or {}
+        self._security_context = security.A2ASecurityContext.capture()
         self._inbound_enabled, self._listener_mode_error = _listener_policy(extra)
         # Outbound-only profiles never consume bind configuration.  In
         # particular, a stale inherited A2A_PORT must not break a remote client
@@ -593,8 +555,8 @@ class A2AAdapter(BasePlatformAdapter):
         self.port = 0
         self.host = ""
         if self._inbound_enabled and self._listener_mode_error is None:
-            self.port = int(os.getenv("A2A_PORT") or extra.get("port", _DEFAULT_PORT))
-            self.host = security.resolve_bind_host()
+            self.port = int((None if _profile_scoped() else os.getenv("A2A_PORT")) or extra.get("port", _DEFAULT_PORT))
+            self.host = self._security_context.resolve_bind_host()
         self.agent_name = _default_agent_name()
         self._advertised_toolsets = [
             t.strip() for t in (
@@ -783,7 +745,7 @@ class A2AAdapter(BasePlatformAdapter):
 
         self._mark_connected()
 
-        exposure = "localhost-only" if security.localhost_only() else "REMOTE (bearer auth)"
+        exposure = "localhost-only" if self._security_context.localhost_only() else "REMOTE (bearer auth)"
         logger.info(
             "A2A: serving Agent Card + JSON-RPC on http://%s:%s (%s) as %r; %d routed agent(s)",
             self.host, self.port, exposure, self.agent_name, len(self._agents),
@@ -904,7 +866,7 @@ class A2AAdapter(BasePlatformAdapter):
             raw = cfg.get("a2a_served_agents") or (cfg.get("a2a") or {}).get("served_agents")
 
         agents: dict[str, dict] = {}
-        default_desc = os.getenv(
+        default_desc = "Hermes Agent — a general-purpose agent reachable over A2A." if _profile_scoped() else os.getenv(
             "A2A_AGENT_DESCRIPTION",
             "Hermes Agent — a general-purpose agent reachable over A2A.",
         )
@@ -1082,7 +1044,7 @@ class A2AAdapter(BasePlatformAdapter):
             skills=self._advertised_skills(agent),
             streaming=bool(agent.get("local", True)),
             push_notifications=True,
-            auth_required=not security.localhost_only(),
+            auth_required=not self._security_context.localhost_only(),
             tenant=str(agent.get("tenant") or ""),
         )
 
@@ -1731,7 +1693,7 @@ class A2AAdapter(BasePlatformAdapter):
                 state=protocol.STATE_REJECTED,
                 agent_text="invalid served A2A agent route",
             ), None
-        if not security.is_trusted_peer(peer):
+        if not self._security_context.is_trusted_peer(peer):
             return protocol.build_task(
                 task_id=protocol.new_task_id(),
                 context_id=protocol.extract_context_id(params) or protocol.new_context_id(),
@@ -3084,7 +3046,7 @@ class A2AAdapter(BasePlatformAdapter):
         if not callback_url:
             return
 
-        if not security.is_safe_callback_url(callback_url):
+        if not security.is_safe_callback_url(callback_url, localhost_mode=self._security_context.localhost_only()):
             logger.warning("A2A: push notification for task %s blocked — unsafe callback URL: %s",
                            task_id, callback_url)
             protocol.metrics.push_failed += 1
@@ -3095,7 +3057,7 @@ class A2AAdapter(BasePlatformAdapter):
             task_id, context_id, state, security.redact_outbound(reply or "")[:2000],
         )
 
-        signature = security.sign_push_payload(payload)
+        signature = self._security_context.sign_push_payload(payload)
         headers = {"Content-Type": "application/json"}
         if signature:
             headers["X-A2A-Signature"] = signature

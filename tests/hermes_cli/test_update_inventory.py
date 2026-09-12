@@ -4,12 +4,14 @@ import json
 import os
 import socket
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import hermes_cli.update_inventory as ui
+from hermes_cli.process_identity import ledger_entries as _real_ledger_entries
 from hermes_cli.gateway import (
     find_profile_gateway_processes as _real_find_profile_gateway_processes,
 )
@@ -53,7 +55,7 @@ def fleet(monkeypatch, tmp_path):
         "hermes_cli.gateway.find_profile_gateway_processes",
         lambda exclude_pids=None, **_kwargs: [],
     )
-    monkeypatch.setattr("hermes_cli.process_identity.ledger_entries", lambda: [])
+    monkeypatch.setattr("hermes_cli.process_identity.ledger_entries", lambda **kwargs: [])
     monkeypatch.setattr(
         ui,
         "_iter_process_cmdlines",
@@ -70,6 +72,38 @@ def fleet(monkeypatch, tmp_path):
 
 
 class TestCollectInventory:
+    def test_corrupt_ledger_is_incomplete_without_quarantine(self, fleet, monkeypatch):
+        from hermes_cli import process_identity as pi
+
+        ledger = fleet / "readonly-ledger.json"
+        original = b"{invalid-ledger"
+        ledger.write_bytes(original)
+        monkeypatch.setattr(pi, "_ledger_path", lambda: ledger)
+        # The fleet fixture stubs discovery; exercise the real strict reader.
+        with pytest.raises(RuntimeError, match="runtime ledger unavailable"):
+            _real_ledger_entries(read_only=True)
+        monkeypatch.setattr(pi, "ledger_entries", _real_ledger_entries)
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.inventory_complete is False
+        assert ledger.read_bytes() == original
+        assert not ledger.with_suffix(".json.corrupt").exists()
+
+    def test_ledger_command_arguments_never_enter_plan_receipt(self, fleet, monkeypatch):
+        secret = "synthetic-token-must-not-be-in-receipt"
+        monkeypatch.setattr("hermes_cli.process_identity.ledger_entries", lambda **kwargs: [{
+            "pid": 4321, "purpose": "serve", "profile": "work",
+            "argv": "hermes serve --token " + secret,
+            "host": "127.0.0.1", "port": 9119, "create_time": 100.0,
+        }])
+        monkeypatch.setattr("hermes_cli.process_identity.spawner_is_dead", lambda entry: None)
+
+        plan = ui.collect_runtime_inventory()
+
+        assert secret not in json.dumps(plan.to_dict())
+        assert "argv" not in next(row.detail for row in plan.runtimes if row.pid == 4321)
+
     def test_two_profile_fleet(self, fleet):
         plan = ui.collect_runtime_inventory()
         assert plan.install_method == "git"
@@ -460,7 +494,7 @@ class TestCollectInventory:
         assert serve.code_version == "9.8.7"
         assert serve.detail["code_identity_source"] == "git"
         assert "desktop-env" in serve.detail["ownership_evidence"]
-        serialized = json.dumps(serve.to_dict())
+        serialized = json.dumps(asdict(serve))
         assert secret_path not in serialized
         assert "ssh-session-token-file" not in serialized
 

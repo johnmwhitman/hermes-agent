@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from agent import conversation_loop
+from agent import turn_usage
 
 
 class _RecordingDB:
@@ -25,7 +25,7 @@ def test_record_api_call_without_usage_preserves_truthful_zero_token_accounting(
         base_url="http://127.0.0.1:4356/v1",
     )
 
-    helper = getattr(conversation_loop, "_record_api_call_without_usage", None)
+    helper = getattr(turn_usage, "_record_api_call_without_usage", None)
     assert helper is not None
     assert helper(agent) is True
 
@@ -52,5 +52,5 @@ def test_record_api_call_without_usage_updates_memory_without_session_store():
         session_api_calls=0,
     )
 
-    assert conversation_loop._record_api_call_without_usage(agent) is False
+    assert turn_usage._record_api_call_without_usage(agent) is False
     assert agent.session_api_calls == 1

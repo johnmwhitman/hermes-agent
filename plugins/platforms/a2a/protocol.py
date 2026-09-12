@@ -1,28 +1,13 @@
-"""
-A2A protocol helpers — Agent Card construction, JSON-RPC framing, task store,
-and disk-backed conversation persistence.
-
-Wire shape follows A2A Protocol v1.0 (JSON-RPC 2.0 binding over HTTP):
-  - Agent Card served at GET /.well-known/agent-card.json (canonical v1.0; legacy agent.json also answers)
-  - Tasks via POST {jsonrpc:"2.0", method:"message/send", params:{...}}
-  - Streaming via ``message/stream`` → SSE; events are StreamResponse objects
-    discriminated by member presence (``statusUpdate`` / ``artifactUpdate``),
-    stream closure signals the terminal state (no ``final`` field in v1.0)
-  - Task states / message roles are v1.0 SCREAMING_SNAKE_CASE enums
-  - Parts are the v1.0 unified shape ({"text": ..., "mediaType": ...}),
-    discriminated by member presence (no ``kind`` field)
-  - Push notification configs carry ``configId`` + ``createdAt`` and can be
-    passed inline in ``message/send`` via configuration.taskPushNotificationConfig
-
-We deliberately implement the subset of A2A needed for text task exchange with
-stdlib only (no a2a-sdk). ``extract_text`` stays tolerant of v0.3 peers.
-"""
+"""A2A protocol helpers — Agent Card, JSON-RPC framing, task store, conversation persistence.
+Wire shape is A2A v1.0: SCREAMING_SNAKE_CASE states/roles; Parts and StreamResponse events are
+discriminated by member presence (no ``kind``/``final``); SSE closure signals the terminal state.
+Stdlib only. ``extract_text`` stays tolerant of v0.3 peers."""
 
 from __future__ import annotations
 
-import json
 import copy
 import hashlib
+import json
 import os
 import threading
 import time
@@ -33,67 +18,40 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from gateway.platforms._shared import coerce_port as _coerce_int
+
 PROTOCOL_VERSION = "1.0"
-
-# A2A v1.0 task lifecycle states.
-STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
-STATE_WORKING = "TASK_STATE_WORKING"
-STATE_INPUT_REQUIRED = "TASK_STATE_INPUT_REQUIRED"
-STATE_AUTH_REQUIRED = "TASK_STATE_AUTH_REQUIRED"
-STATE_COMPLETED = "TASK_STATE_COMPLETED"
-STATE_FAILED = "TASK_STATE_FAILED"
-STATE_CANCELED = "TASK_STATE_CANCELED"
-STATE_REJECTED = "TASK_STATE_REJECTED"
-# Non-terminal marker: a cancel was requested; the underlying worker is being
-# stopped. The terminal CAS winner (see adapter._rpc_tasks_cancel) performs
-# the actual stop confirmation, then transitions to CANCELED. Side-effect
-# paths must not fire while a task sits in this state.
 STATE_CANCEL_REQUESTED = "TASK_STATE_CANCEL_REQUESTED"
-
-TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
-
-# A cancel holds CANCEL_REQUESTED (non-terminal) until its exact worker
-# confirms stop. Only a POSITIVE confirmation may transition to terminal
-# CANCELED and emit terminal side effects. An UNCONFIRMED stop must leave the
-# task non-terminal (CANCEL_REQUESTED, quarantined) with no terminal effects;
-# the watchdog later surfaces the stuck cancel as a containment failure.
 CANCEL_SETTLE_TIMEOUT = 10.0
 
-# A2A v1.0 message roles.
-ROLE_USER = "ROLE_USER"
-ROLE_AGENT = "ROLE_AGENT"
+# A2A v1.0 task lifecycle states + message roles.
+STATE_SUBMITTED, STATE_WORKING, STATE_INPUT_REQUIRED = "TASK_STATE_SUBMITTED", "TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED"
+STATE_COMPLETED, STATE_FAILED = "TASK_STATE_COMPLETED", "TASK_STATE_FAILED"
+STATE_CANCELED, STATE_REJECTED = "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"
+TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
+ROLE_USER, ROLE_AGENT = "ROLE_USER", "ROLE_AGENT"
 
-# The agent starts its reply with this marker when it needs clarification from
-# the peer before it can complete the task; the adapter maps such replies to
-# TASK_STATE_INPUT_REQUIRED (marker stripped, text in status.message).
+# A reply starting with this marker is a clarification request -> TASK_STATE_INPUT_REQUIRED (marker stripped).
 INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
 
-# JSON-RPC / A2A error codes.
-# -32001..-32003 are A2A spec-defined and used only with their spec semantics.
-# Custom errors live at -32050..-32059 (JSON-RPC implementation-defined server
-# error space, clear of the A2A-reserved block).
-ERR_PARSE = -32700
-ERR_INVALID_PARAMS = -32602
-ERR_METHOD_NOT_FOUND = -32601
-ERR_TASK_NOT_FOUND = -32001        # A2A spec: TaskNotFoundError
-ERR_TASK_NOT_CANCELABLE = -32002   # A2A spec: TaskNotCancelableError
-ERR_PUSH_NOT_SUPPORTED = -32003    # A2A spec: PushNotificationNotSupportedError
-ERR_UNAUTHORIZED = -32050
-ERR_RATE_LIMITED = -32051
-ERR_UNTRUSTED_PEER = -32052
+# JSON-RPC / A2A error codes. -32001..-32003 are A2A spec-defined; custom errors
+# live at -32050..-32059 (implementation-defined space, clear of the A2A block).
+ERR_PARSE, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND = -32700, -32602, -32601
+ERR_TASK_NOT_FOUND, ERR_TASK_NOT_CANCELABLE = -32001, -32002  # A2A spec: TaskNotFoundError / TaskNotCancelableError
+ERR_UNAUTHORIZED, ERR_RATE_LIMITED, ERR_UNTRUSTED_PEER = -32050, -32051, -32052
 
-# Maximum turns an A2A conversation can have before anti-loop kicks in.
-# Default 5, configurable via A2A_MAX_PINGPONG_TURNS env (max 20).
-_DEFAULT_MAX_PINGPONG = 5
-_HARD_MAX_PINGPONG = 20
+# Anti-loop: max inbound turns per context. A2A_MAX_PINGPONG_TURNS env, capped at 20.
+_DEFAULT_MAX_PINGPONG, _HARD_MAX_PINGPONG = 5, 20
+_RATE_LIMIT_DEFAULT, _RATE_WINDOW = 60, 60.0  # requests per minute, window seconds
+
+
+def _env_int(name: str, default: int) -> int:
+    return _coerce_int(os.getenv(name, default), default)
 
 
 def max_pingpong_turns() -> int:
-    try:
-        v = int(os.getenv("A2A_MAX_PINGPONG_TURNS", str(_DEFAULT_MAX_PINGPONG)))
-        return max(1, min(v, _HARD_MAX_PINGPONG))
-    except (ValueError, TypeError):
-        return _DEFAULT_MAX_PINGPONG
+    v = _env_int("A2A_MAX_PINGPONG_TURNS", _DEFAULT_MAX_PINGPONG)
+    return max(1, min(v, _HARD_MAX_PINGPONG))
 
 
 def now_iso() -> str:
@@ -101,9 +59,13 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-# --------------------------------------------------------------------------
-# Agent Card (v1.0)
-# --------------------------------------------------------------------------
+def _hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes"))
+
 
 def build_agent_card(
     *,
@@ -165,43 +127,14 @@ def build_agent_card(
 
 
 def skills_from_toolsets(toolsets: "list[str] | dict[str, list[str]] | None") -> list[dict]:
-    """Derive A2A skill descriptors from the agent's toolsets.
+    """A2A skill descriptors from toolset names or a toolset -> tool-names mapping (tool names
+    become tags, max 10)."""
+    if not isinstance(toolsets, dict):
+        toolsets = {ts: [] for ts in set(toolsets or [])}
+    skills = [{"id": f"toolset.{name}", "name": name, "description": f"Hermes '{name}' capabilities",
+               "tags": [name] + [str(t) for t in (toolsets[name] or [])][:10]} for name in sorted(toolsets)]
+    return skills or [{"id": "general", "name": "general", "description": "General-purpose conversational agent", "tags": ["general"]}]
 
-    Accepts either a plain list of toolset names, or a mapping of toolset name
-    → tool names (built from the live tool registry for dynamic Agent Cards —
-    tool names become tags so peers can match tasks to us).
-    """
-    skills = []
-    if isinstance(toolsets, dict):
-        for ts_name in sorted(toolsets.keys()):
-            tool_names = [str(t) for t in (toolsets[ts_name] or [])]
-            skills.append({
-                "id": f"toolset.{ts_name}",
-                "name": ts_name,
-                "description": f"Hermes '{ts_name}' capabilities",
-                "tags": [ts_name] + tool_names[:10],
-            })
-    else:
-        for ts in sorted(set(toolsets or [])):
-            skills.append({
-                "id": f"toolset.{ts}",
-                "name": ts,
-                "description": f"Hermes '{ts}' capabilities",
-                "tags": [ts],
-            })
-    if not skills:
-        skills.append({
-            "id": "general",
-            "name": "general",
-            "description": "General-purpose conversational agent",
-            "tags": ["general"],
-        })
-    return skills
-
-
-# --------------------------------------------------------------------------
-# JSON-RPC framing
-# --------------------------------------------------------------------------
 
 def jsonrpc_result(req_id: Any, result: Any) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -212,19 +145,14 @@ def jsonrpc_error(req_id: Any, code: int, message: str) -> dict:
 
 
 def send_message_response(payload: dict) -> dict:
-    """A2A v1.0 SendMessageResponse oneof wrapper.
-
-    The JSON-RPC ``SendMessage`` result is not a bare Task/Message; it is a
-    wrapper containing exactly one of ``task`` or ``message``. Legacy methods
-    still return bare payloads for compatibility.
-    """
+    """v1.0 SendMessageResponse oneof: exactly one of ``task`` / ``message``."""
     if isinstance(payload, dict) and payload.get("status") and payload.get("id"):
         return {"task": payload}
     return {"message": payload}
 
 
 def unwrap_send_message_response(result: Any) -> Any:
-    """Return the Task/Message inside a v1.0 response, or pass legacy through."""
+    """Task/Message inside a v1.0 response; legacy bare payloads pass through."""
     if isinstance(result, dict):
         if isinstance(result.get("task"), dict):
             return result["task"]
@@ -238,11 +166,6 @@ def stream_task(task: dict) -> dict:
     return {"task": task}
 
 
-def stream_message(message: dict) -> dict:
-    """v1.0 StreamResponse with a message member."""
-    return {"message": message}
-
-
 def new_task_id() -> str:
     return "task-" + uuid.uuid4().hex[:16]
 
@@ -252,173 +175,70 @@ def new_context_id() -> str:
 
 
 def text_part(text: str) -> dict:
-    """Build a v1.0 text Part (member-presence discriminated, no ``kind``)."""
+    """v1.0 text Part (member-presence discriminated, no ``kind``)."""
     return {"text": text, "mediaType": "text/plain"}
 
 
-def file_part(url: str = "", raw: str = "", filename: str = "",
-              media_type: str = "application/octet-stream") -> dict:
-    """Build a v1.0 file Part.
-
-    Either ``url`` (file reference) or ``raw`` (base64-encoded bytes) must be
-    provided. Discrimination is by member presence — no ``kind`` field.
-    """
-    part: dict[str, Any] = {"mediaType": media_type}
-    if filename:
-        part["filename"] = filename
-    if url:
-        part["url"] = url
-    elif raw:
-        part["raw"] = raw
-    return part
-
-
-def data_part(data: Any, media_type: str = "application/json") -> dict:
-    """Build a v1.0 data Part (structured data, no ``kind`` field)."""
-    return {"data": data, "mediaType": media_type}
-
-
 def text_message(role: str, text: str, context_id: str = "") -> dict:
-    """Build an A2A v1.0 Message with a single text Part."""
-    msg: dict[str, Any] = {
-        "role": role,  # ROLE_USER | ROLE_AGENT
-        "parts": [text_part(text)],
-        "messageId": uuid.uuid4().hex,
-    }
+    """A2A v1.0 Message with a single text Part."""
+    msg: dict[str, Any] = {"role": role, "parts": [text_part(text)], "messageId": uuid.uuid4().hex}
     if context_id:
         msg["contextId"] = context_id
     return msg
 
 
-def message_with_parts(role: str, parts: list[dict], context_id: str = "") -> dict:
-    """Build an A2A v1.0 Message with arbitrary Parts (text, file, data)."""
-    msg: dict[str, Any] = {
-        "role": role,
-        "parts": parts,
-        "messageId": uuid.uuid4().hex,
-    }
-    if context_id:
-        msg["contextId"] = context_id
-    return msg
+def _file_note(fname: str, body: str, mtype: str) -> str:
+    label = f"[file: {fname}]" if fname else "[file]"
+    return f"{label} {body}" + (f" ({mtype})" if mtype else "")
+
+
+def _json_or_str(data: Any) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(data)
 
 
 def extract_text(message_or_params: dict) -> str:
-    """Pull concatenated text from an A2A Message / Task-result / params payload.
-
-    v1.0 Parts carry a ``text`` member directly; v0.3 used ``kind: "text"``
-    and some pre-0.3 peers used ``type``. All three shapes put the payload in
-    ``part["text"]``, so presence of a string ``text`` member is the test.
-
-    File and data Parts are rendered into the text stream so the agent sees
-    them: file Parts with a URL include the URL and filename; data Parts
-    include their JSON-serialised content. Raw (base64) file Parts are noted
-    but not decoded (the agent can't act on binary inline).
-    """
+    """Concatenated text from an A2A Message / Task-result / params payload. v1.0, v0.3
+    (``kind``) and pre-0.3 (``type``) Parts all carry ``text``; file Parts render as
+    URL/filename (raw base64 noted, not decoded); data Parts render their JSON."""
     msg = message_or_params.get("message", message_or_params)
-    parts = msg.get("parts", []) if isinstance(msg, dict) else []
     chunks = []
-    for part in parts:
+    for part in msg.get("parts", []) if isinstance(msg, dict) else []:
         if not isinstance(part, dict):
             continue
-        # v1.0 text part (member-presence discrimination)
-        txt = part.get("text")
-        if isinstance(txt, str):
+        if isinstance(txt := part.get("text"), str):
             chunks.append(txt)
-            continue
-        # v0.3 compatibility: kind == "text"
-        if part.get("kind") == "text" and isinstance(part.get("text"), str):
-            chunks.append(part["text"])
-            continue
-        # v1.0 file part with URL
-        url = part.get("url")
-        if isinstance(url, str) and url:
-            fname = part.get("filename") or part.get("name") or ""
-            mtype = part.get("mediaType") or part.get("mimeType") or ""
-            label = f"[file: {fname}]" if fname else "[file]"
-            chunks.append(f"{label} {url}" + (f" ({mtype})" if mtype else ""))
-            continue
-        # v0.3 file part with nested file.fileWithUri
-        v03_file = part.get("file")
-        if isinstance(v03_file, dict) and isinstance(v03_file.get("fileWithUri"), str):
-            uri = v03_file["fileWithUri"]
-            fname = v03_file.get("name") or ""
-            mtype = v03_file.get("mimeType") or ""
-            label = f"[file: {fname}]" if fname else "[file]"
-            chunks.append(f"{label} {uri}" + (f" ({mtype})" if mtype else ""))
-            continue
-        # v1.0 file part with raw bytes (base64) — note but don't decode
-        if isinstance(part.get("raw"), str):
-            fname = part.get("filename") or ""
-            mtype = part.get("mediaType") or ""
-            label = f"[file: {fname}]" if fname else "[file]"
-            size_note = f"{len(part['raw'])} bytes base64-encoded"
-            chunks.append(f"{label} {size_note}" + (f" ({mtype})" if mtype else ""))
-            continue
-        # v1.0 data part — include JSON content
-        data = part.get("data")
-        if data is not None:
-            try:
-                rendered = json.dumps(data, ensure_ascii=False, default=str)
-            except (TypeError, ValueError):
-                rendered = str(data)
-            mtype = part.get("mediaType") or "application/json"
-            chunks.append(f"[data ({mtype})]\n{rendered}")
-            continue
-        # v0.3 data part: kind == "data"
-        if part.get("kind") == "data" and part.get("data") is not None:
-            try:
-                rendered = json.dumps(part["data"], ensure_ascii=False, default=str)
-            except (TypeError, ValueError):
-                rendered = str(part["data"])
-            chunks.append(f"[data]\n{rendered}")
-            continue
+        elif isinstance(url := part.get("url"), str) and url:
+            chunks.append(_file_note(part.get("filename") or part.get("name") or "", url,
+                                     part.get("mediaType") or part.get("mimeType") or ""))
+        elif isinstance(v03 := part.get("file"), dict) and isinstance(v03.get("fileWithUri"), str):
+            chunks.append(_file_note(v03.get("name") or "", v03["fileWithUri"], v03.get("mimeType") or ""))
+        elif isinstance(part.get("raw"), str):
+            chunks.append(_file_note(part.get("filename") or "", f"{len(part['raw'])} bytes base64-encoded",
+                                     part.get("mediaType") or ""))
+        elif (data := part.get("data")) is not None:
+            chunks.append(f"[data ({part.get('mediaType') or 'application/json'})]\n{_json_or_str(data)}")
     return "\n".join(chunks).strip()
 
 
 def extract_context_id(params: dict) -> str:
     """v1.0 puts contextId inside the Message; tolerate legacy top-level."""
     msg = params.get("message") or {}
-    ctx = ""
-    if isinstance(msg, dict):
-        ctx = str(msg.get("contextId") or "")
-    return ctx or str(params.get("contextId") or "")
+    return (str(msg.get("contextId") or "") if isinstance(msg, dict) else "") or str(params.get("contextId") or "")
 
 
-def build_task(
-    task_id: str,
-    context_id: str,
-    state: str,
-    agent_text: str = "",
-    *,
-    created_at: str = "",
-) -> dict:
-    """Build an A2A v1.0 Task object for a message/send result.
-
-    ``created_at`` is accepted for call-site compatibility but not serialized —
-    the A2A v1.0 ``Task`` proto (``lf.a2a.v1.Task``) has no ``createdAt`` or
-    ``lastModified`` field.  Strict ProtoJSON parsers (e.g. a2a-sdk 1.1.0)
-    reject unknown fields, so we must not include them.  The spec's §5.6.1
-    timestamp-format example mentions them but they are not in the proto.
-    """
-    now = now_iso()
-    task: dict[str, Any] = {
-        "id": task_id,
-        "contextId": context_id,
-        "status": {"state": state, "timestamp": now},
-    }
+def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
+    """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
+    createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
+    task: dict[str, Any] = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": now_iso()}}
     if agent_text:
         task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
         if state == STATE_COMPLETED:
-            task["artifacts"] = [{
-                "artifactId": uuid.uuid4().hex,
-                "parts": [text_part(agent_text)],
-            }]
+            task["artifacts"] = [{"artifactId": uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
     return task
 
-
-# --------------------------------------------------------------------------
-# Streaming (v1.0 StreamResponse events)
-# --------------------------------------------------------------------------
 
 def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
     """v1.0 StreamResponse with a statusUpdate member."""
@@ -430,93 +250,43 @@ def status_update(task_id: str, context_id: str, state: str, text: str = "") -> 
 
 def artifact_update(task_id: str, context_id: str, text: str) -> dict:
     """v1.0 StreamResponse with an artifactUpdate member."""
-    return {
-        "artifactUpdate": {
-            "taskId": task_id,
-            "contextId": context_id,
-            "artifact": {
-                "artifactId": uuid.uuid4().hex,
-                "parts": [text_part(text)],
-            },
-        }
-    }
+    artifact = {"artifactId": uuid.uuid4().hex, "parts": [text_part(text)]}
+    return {"artifactUpdate": {"taskId": task_id, "contextId": context_id, "artifact": artifact}}
 
 
 def sse_data(payload: dict, req_id: Any = None) -> str:
-    """Encode one StreamResponse as a JSON-RPC-wrapped SSE data frame.
-
-    A2A v1.0 §9.4 requires each SSE frame to be a full JSON-RPC response:
-    ``{"jsonrpc":"2.0","id":<req_id>,"result":{StreamResponse}}``.  Emitting a
-    bare StreamResponse (the REST binding shape) breaks JSON-RPC clients that
-    expect the envelope, including the official a2a-sdk.
-    """
-    if req_id is not None:
-        envelope = jsonrpc_result(req_id, payload)
-    else:
-        envelope = payload  # legacy/fallback — no envelope
+    """One StreamResponse as an SSE data frame. §9.4 requires a full JSON-RPC envelope (a2a-sdk
+    breaks on bare StreamResponses); ``req_id=None`` is the legacy no-envelope fallback."""
+    envelope = jsonrpc_result(req_id, payload) if req_id is not None else payload
     return f"data: {json.dumps(envelope, ensure_ascii=False)}\n\n"
 
 
 def sse_done() -> str:
-    """SSE stream-closure marker — a comment, not a parseable data frame.
-
-    A2A v1.0 signals terminal state by closing the stream.  Emitting
-    ``data: {}`` causes JSON-RPC clients to try parsing an empty response and
-    fail.  An SSE comment line (``: done``) is ignored by all SSE parsers.
-    """
+    """Stream-closure marker as an SSE *comment* — ``data: {}`` would make JSON-RPC clients parse."""
     return ": done\n\n"
 
 
-# --------------------------------------------------------------------------
-# Anti-loop ping-pong protection (per-adapter instance)
-# --------------------------------------------------------------------------
-
 class TurnTracker:
-    """Counts inbound turns per context_id to stop infinite agent↔agent loops.
-
-    A "turn" is one inbound message/send from a peer. When the count exceeds
-    max_pingpong_turns(), the adapter rejects further messages for that context.
-    """
+    """Counts inbound turns per context_id; beyond max_pingpong_turns() the adapter rejects."""
 
     _TTL = 3600  # prune contexts idle longer than 1 hour
 
     def __init__(self) -> None:
-        self._counts: dict[str, int] = defaultdict(int)
-        self._timestamps: dict[str, float] = {}
+        self._turns: dict[str, tuple[int, float]] = {}  # context_id -> (count, last_seen)
         self._lock = threading.Lock()
 
     def track(self, context_id: str) -> int:
         """Increment and return the turn count; prunes stale contexts."""
         with self._lock:
             now = time.time()
-            stale = [cid for cid, ts in self._timestamps.items() if now - ts > self._TTL]
-            for cid in stale:
-                self._counts.pop(cid, None)
-                self._timestamps.pop(cid, None)
-            self._counts[context_id] += 1
-            self._timestamps[context_id] = now
-            return self._counts[context_id]
+            self._turns = {cid: v for cid, v in self._turns.items() if now - v[1] <= self._TTL}
+            count = self._turns.get(context_id, (0, now))[0] + 1
+            self._turns[context_id] = (count, now)
+            return count
 
     def reset(self, context_id: str) -> None:
-        """Reset turn count for a context (e.g. after explicit cancel)."""
         with self._lock:
-            self._counts.pop(context_id, None)
-            self._timestamps.pop(context_id, None)
-
-
-# --------------------------------------------------------------------------
-# Rate limiting (sliding window per authenticated peer identity)
-# --------------------------------------------------------------------------
-
-_RATE_LIMIT_DEFAULT = 60  # requests per minute
-_RATE_WINDOW = 60.0  # seconds
-
-
-def _rate_limit_per_minute() -> int:
-    try:
-        return max(1, int(os.getenv("A2A_RATE_LIMIT", str(_RATE_LIMIT_DEFAULT))))
-    except (ValueError, TypeError):
-        return _RATE_LIMIT_DEFAULT
+            self._turns.pop(context_id, None)
 
 
 class RateLimiter:
@@ -528,7 +298,7 @@ class RateLimiter:
 
     def allow(self, identity: str) -> bool:
         with self._lock:
-            limit = _rate_limit_per_minute()
+            limit = max(1, _env_int("A2A_RATE_LIMIT", _RATE_LIMIT_DEFAULT))
             now = time.time()
             bucket = self._buckets[identity]
             while bucket and now - bucket[0] > _RATE_WINDOW:
@@ -539,60 +309,32 @@ class RateLimiter:
             return True
 
 
-# --------------------------------------------------------------------------
-# Metrics collection
-# --------------------------------------------------------------------------
-
-# Module-level singleton shared by the inbound adapter and the outbound client
-# tools so /metrics and a2a_list report both directions. Not persisted.
 class Metrics:
-    """Simple counters for A2A operations."""
+    """Counters for A2A operations (module singleton ``metrics`` shared by the inbound adapter
+    and outbound tools; not persisted)."""
+
+    _COUNTERS = ("inbound_total", "outbound_total", "streams_started", "push_sent", "push_failed",
+                 "tasks_completed", "tasks_failed", "anti_loop_triggers", "rate_limit_triggers")
 
     def __init__(self) -> None:
-        self.inbound_total = 0
-        self.outbound_total = 0
-        self.streams_started = 0
-        self.push_sent = 0
-        self.push_failed = 0
-        self.tasks_completed = 0
-        self.tasks_failed = 0
-        self.anti_loop_triggers = 0
-        self.rate_limit_triggers = 0
+        for name in self._COUNTERS:
+            setattr(self, name, 0)
         self._start_time = time.time()
-        # Rolling latency tracking (last 100 completed inbound tasks)
-        self._latencies: deque[float] = deque(maxlen=100)
+        self._latencies: deque[float] = deque(maxlen=100)  # last 100 completed inbound tasks
 
     def record_latency(self, seconds: float) -> None:
         self._latencies.append(seconds)
 
     def avg_latency(self) -> float:
-        if not self._latencies:
-            return 0.0
-        return sum(self._latencies) / len(self._latencies)
+        return sum(self._latencies) / len(self._latencies) if self._latencies else 0.0
 
     def snapshot(self) -> dict[str, Any]:
-        uptime = time.time() - self._start_time
-        return {
-            "uptime_seconds": round(uptime, 1),
-            "inbound_total": self.inbound_total,
-            "outbound_total": self.outbound_total,
-            "streams_started": self.streams_started,
-            "push_sent": self.push_sent,
-            "push_failed": self.push_failed,
-            "tasks_completed": self.tasks_completed,
-            "tasks_failed": self.tasks_failed,
-            "anti_loop_triggers": self.anti_loop_triggers,
-            "rate_limit_triggers": self.rate_limit_triggers,
-            "avg_latency_ms": round(self.avg_latency() * 1000, 1),
-        }
+        return {"uptime_seconds": round(time.time() - self._start_time, 1), **{n: getattr(self, n) for n in self._COUNTERS},
+                "avg_latency_ms": round(self.avg_latency() * 1000, 1)}
 
 
 metrics = Metrics()
 
-
-# --------------------------------------------------------------------------
-# Task store — pending AND completed tasks (queryable via tasks/get, tasks/list)
-# --------------------------------------------------------------------------
 
 class TaskStore:
     """In-memory store of A2A tasks, kept after completion for tasks/get.
@@ -872,37 +614,10 @@ class TaskStore:
             task.pop("history", None)
         return copy.deepcopy(task)
 
-# --------------------------------------------------------------------------
-# Conversation persistence (outside the context-compaction pipeline)
-# --------------------------------------------------------------------------
 
-def _conv_dir() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        base = Path(get_hermes_home())
-    except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
-    return base / "a2a_conversations"
-
-
-def _safe_name(context_id: str) -> str:
-    return "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
-
-
-def _conversation_path(context_id: str, peer: str = "", agent_slug: str = "") -> Path:
-    """Return the collision-resistant v2 path for one exact scoped context."""
-    identity = json.dumps(
-        {
-            "agent_slug": str(agent_slug),
-            "context_id": str(context_id),
-            "peer": str(peer),
-            "version": 2,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    return _conv_dir() / f"v2-{digest}.jsonl"
+def _conv_path(context_id: str) -> Path:
+    safe = "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
+    return _hermes_home() / "a2a_conversations" / f"{safe}.jsonl"
 
 
 def persist_message(
@@ -932,28 +647,6 @@ def persist_message(
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
-
-
-def _load_v2_file(path: Path, context_id: str, peer: str, agent_slug: str) -> list[dict]:
-    out: list[dict] = []
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    rec = json.loads(line)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if (
-                    isinstance(rec, dict)
-                    and rec.get("version") == 2
-                    and rec.get("context_id") == context_id
-                    and rec.get("peer", "") == peer
-                    and rec.get("agent_slug", "") == agent_slug
-                ):
-                    out.append(rec)
-    except Exception:
-        return []
-    return out
 
 
 def load_conversation(
@@ -1058,3 +751,101 @@ def list_conversations(
             if not p.name.startswith("v2-") and _safe_name(p.stem) == p.stem
         )
     return sorted(contexts)
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import copy  # noqa: F401,E402
+
+ERR_PUSH_NOT_SUPPORTED = -32003    # A2A spec: PushNotificationNotSupportedError
+
+STATE_AUTH_REQUIRED = "TASK_STATE_AUTH_REQUIRED"
+
+def data_part(data: Any, media_type: str = "application/json") -> dict:
+    """Build a v1.0 data Part (structured data, no ``kind`` field)."""
+    return {"data": data, "mediaType": media_type}
+
+def file_part(url: str = "", raw: str = "", filename: str = "",
+              media_type: str = "application/octet-stream") -> dict:
+    """Build a v1.0 file Part.
+
+    Either ``url`` (file reference) or ``raw`` (base64-encoded bytes) must be
+    provided. Discrimination is by member presence — no ``kind`` field.
+    """
+    part: dict[str, Any] = {"mediaType": media_type}
+    if filename:
+        part["filename"] = filename
+    if url:
+        part["url"] = url
+    elif raw:
+        part["raw"] = raw
+    return part
+
+def message_with_parts(role: str, parts: list[dict], context_id: str = "") -> dict:
+    """Build an A2A v1.0 Message with arbitrary Parts (text, file, data)."""
+    msg: dict[str, Any] = {
+        "role": role,
+        "parts": parts,
+        "messageId": uuid.uuid4().hex,
+    }
+    if context_id:
+        msg["contextId"] = context_id
+    return msg
+
+def stream_message(message: dict) -> dict:
+    """v1.0 StreamResponse with a message member."""
+    return {"message": message}
+# ---- END PLUGIN-COMPAT ----
+
+
+def _conv_dir() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        base = Path(get_hermes_home())
+    except Exception:
+        base = Path(os.path.expanduser("~/.hermes"))
+    return base / "a2a_conversations"
+
+
+def _safe_name(context_id: str) -> str:
+    return "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
+
+
+def _conversation_path(context_id: str, peer: str = "", agent_slug: str = "") -> Path:
+    """Return the collision-resistant v2 path for one exact scoped context."""
+    identity = json.dumps(
+        {
+            "agent_slug": str(agent_slug),
+            "context_id": str(context_id),
+            "peer": str(peer),
+            "version": 2,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return _conv_dir() / f"v2-{digest}.jsonl"
+
+
+def _load_v2_file(path: Path, context_id: str, peer: str, agent_slug: str) -> list[dict]:
+    out: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    isinstance(rec, dict)
+                    and rec.get("version") == 2
+                    and rec.get("context_id") == context_id
+                    and rec.get("peer", "") == peer
+                    and rec.get("agent_slug", "") == agent_slug
+                ):
+                    out.append(rec)
+    except Exception:
+        return []
+    return out

@@ -13,6 +13,7 @@ import pytest
 def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
     """Losing a fire claim must stop both the script and its descendants."""
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     scripts_dir = tmp_path / "scripts"
@@ -39,7 +40,7 @@ def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
     def _run() -> None:
         try:
             result.append(
-                scheduler._run_job_script(
+                sched_script._run_job_script(
                     str(script),
                     workdir=str(tmp_path),
                     cancel_event=cancel,
@@ -73,6 +74,7 @@ def test_cancel_event_kills_sigterm_ignoring_descendant(tmp_path, monkeypatch):
     the tree kill escalates to SIGKILL for surviving group members, and the
     pipe drain is bounded even if a descendant still holds the write ends."""
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     scripts_dir = tmp_path / "scripts"
@@ -99,7 +101,7 @@ def test_cancel_event_kills_sigterm_ignoring_descendant(tmp_path, monkeypatch):
     def _run() -> None:
         try:
             result.append(
-                scheduler._run_job_script(
+                sched_script._run_job_script(
                     str(script),
                     workdir=str(tmp_path),
                     cancel_event=cancel,
@@ -129,6 +131,7 @@ def test_cancel_event_kills_sigterm_ignoring_descendant(tmp_path, monkeypatch):
 
 def test_no_agent_forwards_cancel_event_to_script_runner(monkeypatch):
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     cancel = threading.Event()
     observed = []
@@ -177,6 +180,7 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
     """
     import cron.jobs as jobs
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     profile_home = tmp_path / "profile"
     default_cron = tmp_path / "default" / "cron"
@@ -242,11 +246,11 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
         return True, script_output
 
     monkeypatch.setattr(scheduler, "heartbeat_run_claim", _observed_heartbeat)
-    monkeypatch.setattr(scheduler, "_run_job_script", _blocking_script)
+    monkeypatch.setattr(sched_script, "_run_job_script", _blocking_script)
 
     with (
         jobs.use_cron_store(profile_home),
-        patch("hermes_state.SessionDB", return_value=MagicMock()),
+        patch("hermes_state_registry.acquire", return_value=MagicMock()),
     ):
         success, _doc, _response, error = scheduler.run_job(claimed_job)
         profile_claim = jobs.get_job("long-script")["run_claim"]
@@ -266,6 +270,7 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
     """A stale script runner cannot refresh a replacement owner's claim."""
     import cron.jobs as jobs
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     profile_home = tmp_path / "profile"
     profile_home.mkdir()
@@ -303,7 +308,7 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
 
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
     monkeypatch.setattr(scheduler, "heartbeat_run_claim", _observed_heartbeat)
-    monkeypatch.setattr(scheduler, "_run_job_script", _blocking_script)
+    monkeypatch.setattr(sched_script, "_run_job_script", _blocking_script)
 
     with jobs.use_cron_store(profile_home):
         assert scheduler._run_job_script_with_claim_heartbeat(job, "watchdog.py") == (
@@ -320,6 +325,7 @@ def test_run_one_job_refreshes_fire_claim_in_profile_store(tmp_path, monkeypatch
     """The shared execute/save/deliver body keeps its durable fire claim alive."""
     import cron.jobs as jobs
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     profile_home = tmp_path / "profile"
     profile_home.mkdir()
@@ -357,6 +363,7 @@ def test_run_one_job_refreshes_fire_claim_in_profile_store(tmp_path, monkeypatch
 def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
     """A runner that loses its durable owner must not deliver its stale result."""
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     lost_seen = threading.Event()
     heartbeat_calls = 0
@@ -416,20 +423,22 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
 def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatch):
     """A stale claimed snapshot rejected before body entry must close its ledger row.
 
-    Ownerless legacy snapshot: the job carries no ``_execution_owner_token``,
-    so the fail-closed close-out MUST pass ``owner_token=None so the transition
-    gate refuses to mutate the un-owned row instead of silently succeeding.
+    The admitted ledger owner may still lose its separate fire-claim lease.
     """
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     run_body = MagicMock(return_value=True)
     finish = MagicMock()
     job = {
         "id": "already-reclaimed",
         "execution_id": "stale-execution",
+        "_execution_owner_token": "tok-stale-execution",
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "stale-owner"},
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: False)
+    monkeypatch.setattr(scheduler, "execution_owned_by", lambda _id, _token: True)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "finish_execution", finish)
 
@@ -440,21 +449,25 @@ def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatc
         "stale-execution",
         success=False,
         error="Fire claim ownership lost before execution started.",
-        owner_token=None,
+        owner_token="tok-stale-execution",
     )
 
 
 def test_initially_lost_claim_does_not_run_when_ledger_write_fails(monkeypatch):
     """A ledger I/O error cannot turn a confirmed ownership loss into execution."""
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     run_body = MagicMock(return_value=True)
     job = {
         "id": "already-reclaimed",
         "execution_id": "stale-execution",
+        "_execution_owner_token": "tok-stale-execution",
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "stale-owner"},
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: False)
+    monkeypatch.setattr(scheduler, "execution_owned_by", lambda _id, _token: True)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(
         scheduler,
@@ -469,17 +482,17 @@ def test_initially_lost_claim_does_not_run_when_ledger_write_fails(monkeypatch):
 def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
     """Unconfirmed initial ownership must fail closed before any side effect.
 
-    Ownerless legacy snapshot: the job carries no ``_execution_owner_token``,
-    so the fail-closed close-out MUST pass ``owner_token=None so the transition
-    gate refuses to mutate the un-owned row instead of silently succeeding.
+    The admitted ledger owner may still lose its separate fire-claim lease.
     """
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     run_body = MagicMock(return_value=True)
     finish = MagicMock()
     job = {
         "id": "validation-error",
         "execution_id": "validation-execution",
+        "_execution_owner_token": "tok-validation-execution",
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
     }
     monkeypatch.setattr(
@@ -487,6 +500,8 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
         "heartbeat_fire_claim",
         MagicMock(side_effect=OSError("store unavailable")),
     )
+    monkeypatch.setattr(scheduler, "execution_owned_by", lambda _id, _token: True)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "finish_execution", finish)
 
@@ -497,27 +512,29 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
         "validation-execution",
         success=False,
         error="Fire claim ownership could not be validated before execution started.",
-        owner_token=None,
+        owner_token="tok-validation-execution",
     )
 
 
 def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
     """A claimed job cannot run when no renewal monitor protects its lease.
 
-    Ownerless legacy snapshot: same fail-closed contract as the initial
-    validation-loss case above - no token carried, transition gate must be
-    passed ``owner_token=None and refused.
+    The admitted ledger owner may still lose its separate fire-claim lease.
     """
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     run_body = MagicMock(return_value=True)
     finish = MagicMock()
     job = {
         "id": "thread-start-error",
         "execution_id": "thread-execution",
+        "_execution_owner_token": "tok-thread-execution",
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True)
+    monkeypatch.setattr(scheduler, "execution_owned_by", lambda _id, _token: True)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "finish_execution", finish)
     monkeypatch.setattr(
@@ -533,13 +550,14 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
         "thread-execution",
         success=False,
         error="Fire claim heartbeat could not be started; execution was not run.",
-        owner_token=None,
+        owner_token="tok-thread-execution",
     )
 
 
 def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     """Store uncertainty cannot let a run outlive its last confirmed lease forever."""
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     calls = 0
 
@@ -570,6 +588,7 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     """A replacement owner cannot leave the stale ledger recorded as success."""
     import cron.scheduler as scheduler
+    from cron import scheduler_script as sched_script
 
     @contextlib.contextmanager
     def owned_fence(*_args, **_kwargs):
