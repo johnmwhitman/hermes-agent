@@ -436,7 +436,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           default="running",
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                               "to skip the brief running-to-blocked "
+                               "transition. When set to 'blocked', --kind is "
+                               "REQUIRED so the card is typeable from its "
+                               "first row (block_kind is what a triage sweep "
+                               "filters on — NULL blocks hide from "
+                               "needs_input/capability/dependency queries).")
+    p_create.add_argument(
+        "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
+        dest="block_kind",
+        help=(
+            "Typed block reason. REQUIRED when --initial-status is blocked; "
+            "ignored otherwise. Same vocabulary as `hermes kanban block "
+            "--kind`: 'dependency' (wait on another task — never enters the "
+            "human blocked bucket), 'needs_input' (human decision), "
+            "'capability' (missing tool/access), 'transient' (maybe-flaky). "
+            "Lets the card surface in kind-filtered triage from creation, "
+            "fixing the untyped-blocked-cards gap (t_19c3e315)."
+        ),
+    )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -673,6 +691,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "blocked for a human; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
+        ),
+    )
+    p_block.add_argument(
+        "--retype", action="store_true", dest="retype_only",
+        help=(
+            "Repair an already-blocked card's block_kind WITHOUT rewriting "
+            "status, claim_lock, block_recurrences, or emitting a fresh "
+            "'blocked' transition event. Used to fix cards minted untyped by "
+            "`hermes kanban create --initial-status blocked` before "
+            "--kind existed (t_19c3e315). Appends an audit comment. Refuses "
+            "to touch cards whose status is not 'blocked' (use --kind "
+            "without --retype for the normal path)."
         ),
     )
 
@@ -1712,6 +1742,26 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    initial_status = getattr(args, "initial_status", "running")
+    initial_block_kind = getattr(args, "block_kind", None)
+    if initial_status == "blocked" and not initial_block_kind:
+        print(
+            "kanban: --kind is required when --initial-status is blocked "
+            "(VALID_BLOCK_KINDS: " + ", ".join(sorted(kb.VALID_BLOCK_KINDS))
+            + "). Untyped blocked cards are invisible to kind-filtered triage "
+            "queries; t_19c3e315 has 68 of them on the board right now.",
+            file=sys.stderr,
+        )
+        return 2
+    if initial_status != "blocked" and initial_block_kind is not None:
+        # Don't silently drop the value — surface it loudly so callers learn.
+        print(
+            f"kanban: --kind {initial_block_kind!r} is only meaningful with "
+            "--initial-status blocked (got "
+            f"{initial_status!r}); ignoring.",
+            file=sys.stderr,
+        )
+        initial_block_kind = None
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1735,7 +1785,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=initial_status,
+            initial_block_kind=initial_block_kind,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2487,11 +2538,42 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    retype_only = bool(getattr(args, "retype_only", False))
+    if retype_only and kind is None:
+        print(
+            "kanban: --retype requires --kind (nothing to retype to).",
+            file=sys.stderr,
+        )
+        return 2
+    if retype_only and reason is None:
+        # Make retype loud on purpose — every kind-fix should leave a comment
+        # so a future investigator can see the rationale without reading the
+        # task_events table.
+        print(
+            "kanban: --retype requires a reason (appended as an audit "
+            "comment). Quote a short note describing why this kind fits.",
+            file=sys.stderr,
+        )
+        return 2
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            if retype_only:
+                ok, why = kb.retype_block_kind(
+                    conn, tid, kind=kind, reason=reason,
+                )
+                if not ok:
+                    failed.append(tid)
+                    print(f"cannot retype {tid}: {why}", file=sys.stderr)
+                else:
+                    kb.add_comment(
+                        conn, tid, author,
+                        f"BLOCK_KIND_RETYPED: {reason} (-> kind={kind})",
+                    )
+                    print(f"Re-typed {tid} block_kind={kind}: {reason}")
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(

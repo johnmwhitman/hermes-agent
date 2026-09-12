@@ -1971,6 +1971,13 @@ class A2AAdapter(BasePlatformAdapter):
                         "mutation_enabled": mutable,
                         "allowed_tool_names": sorted(allowed),
                         "binding": binding,
+                        # The forward-time identity gate compares the served
+                        # route's CURRENT identity against these exact fields;
+                        # without them the policy is all-None and every
+                        # non-local route fails closed 100% of the time.
+                        "served_profile": binding.get("served_profile"),
+                        "served_tenant": binding.get("served_tenant"),
+                        "profile_home_identity": binding.get("profile_home_identity"),
                     },
                 )
             finally:

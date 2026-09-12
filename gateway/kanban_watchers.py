@@ -51,6 +51,19 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     return reason
 
 
+def _resolve_profile_limit_overrides(
+    load_config: Callable[[], Any], validate: Callable[[Any], dict[str, int]],
+) -> dict[str, int]:
+    """Refresh exact profile overrides each tick; bad reads retain the base cap."""
+    try:
+        cfg = load_config()
+        kcfg = cfg.get("kanban", {})
+        return validate(kcfg.get("max_in_progress_per_profile_overrides"))
+    except Exception:
+        logger.warning("kanban dispatcher: invalid profile overrides; retaining base cap")
+        return {}
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1606,6 +1619,8 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
+        last_profile_limit_overrides: Optional[dict[str, int]] = None
+
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
@@ -1615,6 +1630,7 @@ class GatewayKanbanWatchersMixin:
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
             """
+            nonlocal last_profile_limit_overrides
             conn = None
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)
@@ -1647,6 +1663,15 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                profile_limit_overrides = _resolve_profile_limit_overrides(
+                    _load_config, _kb._validate_profile_limit_overrides,
+                )
+                if profile_limit_overrides != last_profile_limit_overrides:
+                    logger.info(
+                        "kanban dispatcher: effective profile overrides=%s; base cap=%s",
+                        profile_limit_overrides, max_in_progress_per_profile,
+                    )
+                    last_profile_limit_overrides = dict(profile_limit_overrides)
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
@@ -1656,6 +1681,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    max_in_progress_per_profile_overrides=profile_limit_overrides,
                     reconcile_orphans=reconcile_orphans,
                 )
             except sqlite3.DatabaseError as exc:
