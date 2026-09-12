@@ -242,6 +242,118 @@ def _receipt_sha_resolves(sha: str, repo: Path = _RECEIPT_AI_ROOT) -> bool:
         return False
 
 
+def _receipt_repo_top_level(path: Path) -> Path | None:
+    """Return the top-level of the git repo at ``path`` (or any ancestor
+    inside it), or ``None`` if ``path`` is not inside a git repo.
+
+    Used by the multi-repo candidate resolver: when a card's
+    ``workspace_path`` is a worktree, we want to resolve SHAs against the
+    worktree's own git dir, not the portfolio umbrella ``~/AI`` root.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    top = (r.stdout or "").strip()
+    return Path(top) if top else None
+
+
+def _receipt_repo_candidates(
+    workspace_path: str | None,
+    project_repo: str | None = None,
+    *,
+    fallback: Path | None = _RECEIPT_AI_ROOT,
+) -> list[Path]:
+    """Return the ordered list of git repos ``_receipt_classify`` should
+    consult when deciding whether a SHA resolves.
+
+    Order matters: the first repo that claims a SHA wins. The default
+    fallback (the historical ``~/AI`` umbrella) is appended LAST so it
+    remains a safety net for legacy cards whose receipt SHA lives there,
+    but never shadows the card's own repo.
+
+    Resolution chain:
+
+    1. ``workspace_path`` (when set and inside a git repo) — the
+       worktree the card actually committed to.
+    2. ``project_repo`` (when ``project_id`` resolves to a Project row
+       with a ``primary_repo_path``) — the project's primary repo, which
+       may differ from ``workspace_path`` for shared-project tasks.
+    3. ``fallback`` — the historical default, kept for backwards compat.
+
+    Returns the de-duplicated list in resolution order.
+    """
+    seen: set[str] = set()
+    out: list[Path] = []
+
+    def _add(p: Path | None) -> None:
+        if p is None:
+            return
+        try:
+            key = str(p)
+        except Exception:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    # 1) Workspace (card's own worktree, when present)
+    if workspace_path:
+        wp = Path(os.path.expanduser(workspace_path))
+        if wp.exists():
+            # Prefer the git top-level so a worktree subdir resolves
+            # against the right git-dir (handles bare-repo and linked
+            # worktree layouts uniformly).
+            top = _receipt_repo_top_level(wp)
+            if top is not None:
+                _add(top)
+            else:
+                # Path exists but is not inside a git repo — record it
+                # anyway so a SHA lookup is still attempted against the
+                # literal dir (defensive; the cat-file probe will simply
+                # fail and we move to the next candidate).
+                _add(wp)
+
+    # 2) Project primary repo (when provided)
+    if project_repo:
+        pr = Path(os.path.expanduser(project_repo))
+        top = _receipt_repo_top_level(pr) if pr.exists() else None
+        _add(top if top is not None else pr)
+
+    # 3) Historical fallback (always last, kept for legacy ~/AI cards)
+    _add(fallback)
+
+    return out
+
+
+def _receipt_sha_resolves_in(
+    sha: str, repos: list[Path]
+) -> bool:
+    """Return True iff ``sha`` resolves as a commit object in any of the
+    supplied git repos.
+
+    Tries ``<sha>^{commit}`` first (tag→commit peel) and falls back to a
+    bare ``cat-file -e`` so loose/annotated-tag handles still resolve.
+    Short-circuits on the first hit; this is the same gate the
+    ``_receipt_sha_resolves`` single-repo helper performs, just over a
+    candidate list.
+    """
+    for repo in repos:
+        if _receipt_sha_resolves(sha, repo):
+            return True
+    return False
+
+
 def _receipt_existing_attachments(
     conn: sqlite3.Connection, task_id: str
 ) -> list[str]:
@@ -262,15 +374,35 @@ def _receipt_existing_attachments(
 
 
 def _receipt_classify(
-    text: str, attachments: list[str]
+    text: str,
+    attachments: list[str],
+    *,
+    repos: list[Path] | None = None,
 ) -> dict:
     """Return the same evidence dict shape the after-the-fact verifier uses,
-    so the gate and the audit cannot disagree."""
+    so the gate and the audit cannot disagree.
+
+    ``repos`` (added for t_cca67626) is the ordered list of git repos the
+    SHA resolver should consult. When omitted, the function falls back
+    to the historical single-root default (``~/AI``) so callers that
+    pre-date the multi-repo fix keep working unchanged. The kanban
+    ``build_envelope`` path always supplies a candidate list derived
+    from the card row (``workspace_path``, then ``project_id``, then
+    ``~/AI`` last).
+    """
     paths = _receipt_extract_paths(text)
     shas = _receipt_extract_shas(text)
     existing_paths = [p for p in paths if _receipt_expand_path(p).exists()]
     missing_paths = [p for p in paths if p not in existing_paths]
-    existing_shas = [s for s in shas if _receipt_sha_resolves(s)]
+    if repos is None:
+        # Backwards-compat: preserve the original single-root resolver
+        # for callers that don't supply a candidate list (gate layer,
+        # dashboard verifier, legacy tool-layer callers).
+        existing_shas = [
+            s for s in shas if _receipt_sha_resolves(s, _RECEIPT_AI_ROOT)
+        ]
+    else:
+        existing_shas = [s for s in shas if _receipt_sha_resolves_in(s, repos)]
     has_verified = bool(_RECEIPT_VERIFIED_RE.search(text or ""))
     has_cmd = bool(_RECEIPT_CMD_RE.search(text or ""))
     return {

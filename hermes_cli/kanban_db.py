@@ -1544,6 +1544,28 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Phase 2 (t_2d7fd66c): durable outbox for kanban receipt envelopes.
+-- Written atomically inside complete_task's write_txn so a crash between
+-- the done transition and the outbox insert cannot strand the task as
+-- done-with-no-receipt. UNIQUE(task_id, run_id) is the idempotency
+-- surface for replayed closes (same kanban kernel may retry; the wire
+-- consumer also may call validate_envelope twice on the same row).
+-- status values: pending | sent | failed | dead-letter.
+CREATE TABLE IF NOT EXISTS kanban_receipt_outbox (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL,
+    run_id          INTEGER NOT NULL,
+    payload_sha256  TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER,
+    last_error      TEXT,
+    lease_expires_at INTEGER,
+    UNIQUE(task_id, run_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2970,6 +2992,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    # Phase 2 (t_2d7fd66c): idempotent outbox-table creation for legacy
+    # boards whose SCHEMA_SQL was pinned before the outbox existed. The
+    # CREATE TABLE block above already covers fresh DBs; this pass is the
+    # backstop for boards upgraded from a Phase1-only baseline.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kanban_receipt_outbox ("
+        " id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " task_id         TEXT NOT NULL,"
+        " run_id          INTEGER NOT NULL,"
+        " payload_sha256  TEXT NOT NULL,"
+        " payload_json    TEXT NOT NULL,"
+        " created_at      INTEGER NOT NULL,"
+        " status          TEXT NOT NULL DEFAULT 'pending',"
+        " attempt_count   INTEGER NOT NULL DEFAULT 0,"
+        " last_attempt_at INTEGER,"
+        " last_error      TEXT,"
+        " lease_expires_at INTEGER,"
+        " UNIQUE(task_id, run_id))"
+    )
+
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
 # ``kanban_notify_subs``, a nullable ``TEXT last_event_id``). The current
@@ -3313,6 +3355,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    initial_block_kind: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -3369,6 +3412,20 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    if initial_block_kind is not None:
+        if initial_block_kind not in VALID_BLOCK_KINDS:
+            raise ValueError(
+                f"initial_block_kind must be one of {sorted(VALID_BLOCK_KINDS)} "
+                "or None"
+            )
+        if initial_status != "blocked":
+            # Block-kind is meaningful only for blocked cards. Surfacing this
+            # upstream (CLI arg parser does the same) keeps the contract
+            # self-documenting for any other surface that calls create_task.
+            raise ValueError(
+                "initial_block_kind is only meaningful with initial_status="
+                f"'blocked' (got {initial_status!r})"
+            )
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -3631,8 +3688,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        block_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3658,6 +3716,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        initial_block_kind if task_status == "blocked" else None,
                     ),
                 )
                 for pid in parents:
@@ -3700,7 +3759,11 @@ def create_task(
                         conn,
                         task_id,
                         "blocked",
-                        {"initial": True},
+                        {
+                            "initial": True,
+                            "kind": initial_block_kind,
+                            "source_status": task_status,
+                        },
                     )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -4531,6 +4594,167 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+
+
+# Phase 2 (t_2d7fd66c): enqueue a v1 receipt envelope into the durable
+# outbox. Designed to be called from inside the ``complete_task``
+# write_txn — the outbox row and the ``done`` transition land together
+# or roll back together, so a crash cannot strand the task as done
+# without a wire-shaped receipt. Idempotency is owned by the
+# ``UNIQUE(task_id, run_id)`` index on ``kanban_receipt_outbox``;
+# ``ON CONFLICT DO NOTHING`` is what makes a replayed close (same
+# kanban kernel retry, or the same envelope re-emitted by the worker
+# via :func:`edit_completed_task_result`) safe.
+#
+# The helper is intentionally narrow: Phase 2 does NOT wire a
+# reconciler / delivery worker / transport readback — those land in
+# Phase 3 (t_c4a5ef09 convergence, blocked on the verifier fix in
+# t_7076ec8b). Until then the outbox accumulates ``pending``
+# entries; a human-side ``SELECT * FROM kanban_receipt_outbox WHERE
+# status='pending'`` is the operational read surface.
+def _extract_artifact_paths(metadata: Optional[dict]) -> list[str]:
+    """Return the cleaned list of artifact paths from ``metadata['artifacts']``.
+
+    Mirrors the cleanup :func:`complete_task` already performs on the
+    ``completed`` event payload: drop non-strings, drop empty strings
+    after ``str.strip()``, dedupe via ``set`` so a duplicate path
+    cited by both summary and ``artifacts=`` doesn't bloat the
+    envelope. Returns ``[]`` when ``metadata`` is None or doesn't
+    carry an ``artifacts`` list.
+    """
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get("artifacts")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        s = entry.strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        cleaned.append(s)
+    return cleaned
+
+
+def _enqueue_receipt_outbox(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    summary: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+    completed_at: int,
+) -> Optional[str]:
+    """Build the v1 envelope and INSERT it into ``kanban_receipt_outbox``.
+
+    Returns the canonical ``payload_sha256`` on success (including a
+    no-op ``ON CONFLICT`` skip — same digest either way), or ``None``
+    on a hard failure (schema missing, envelope rejected by
+    ``validate_envelope``). The caller MUST be inside the same
+    ``write_txn`` as the ``done`` UPDATE so the two rows commit
+    atomically.
+    """
+    try:
+        # Local import keeps the kanban_db module importable even when
+        # ``hermes_cli.kanban_receipt`` is partially installed or has a
+        # transient syntax error — surfaces a clear ImportError inside
+        # the txn instead of breaking the entire kanban CLI on import.
+        from hermes_cli.kanban_receipt import (  # noqa: WPS433
+            build_envelope,
+            compute_payload_sha256,
+            validate_envelope,
+        )
+    except Exception as exc:  # pragma: no cover - import guard
+        _append_event(
+            conn, task_id, "receipt_outbox_skipped",
+            {"reason": "import_error", "error": repr(exc)},
+            run_id=run_id,
+        )
+        return None
+    # Resolve the assignee up-front — the envelope's idempotency surface
+    # depends on it and a NULL would silently break byte-for-byte replay.
+    trow = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    # Coalesce ``None`` (NULL column — e.g. system-created probe cards
+    # like ``kanban-rtt-probe-*`` that have no assignee) to ``"system"``
+    # so ``build_envelope`` does not reject the envelope with
+    # ``assignee must be a non-empty string, got None``.
+    assignee = (trow["assignee"] if trow else "") or "system"
+    try:
+        envelope = build_envelope(
+            conn, task_id,
+            run_id=run_id,
+            assignee=assignee,
+            completed_at=completed_at,
+            summary=summary,
+            result=result,
+            metadata=metadata,
+            artifacts=_extract_artifact_paths(metadata),
+            task_status="done",
+        )
+    except Exception as exc:
+        # ``build_envelope`` raises ``ResultContractError`` only on
+        # cross-field contradictions. Surface the rejection as an
+        # auditable event so a manual replay can debug without a
+        # crash-loop on the same task.
+        _append_event(
+            conn, task_id, "receipt_outbox_rejected",
+            {"reason": "build_failed", "error": repr(exc)},
+            run_id=run_id,
+        )
+        return None
+    reasons = validate_envelope(envelope)
+    if reasons:
+        # The Phase1 gate would already have refused the close; we are
+        # belt-and-suspenders here in case the gate is bypassed (e.g. a
+        # manual ``UPDATE tasks SET status='done'``).
+        _append_event(
+            conn, task_id, "receipt_outbox_rejected",
+            {"reason": "validate_failed", "reasons": reasons},
+            run_id=run_id,
+        )
+        return None
+    digest = compute_payload_sha256(envelope)
+    payload_json = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
+    # ``ON CONFLICT DO NOTHING`` preserves the idempotency invariant for
+    # replayed closes: the original row wins, the duplicate insert is
+    # silently dropped, and the digest is identical either way (Phase1
+    # build_envelope is deterministic over the same inputs).
+    cur = conn.execute(
+        """
+        INSERT INTO kanban_receipt_outbox
+            (task_id, run_id, payload_sha256, payload_json, created_at, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        ON CONFLICT(task_id, run_id) DO NOTHING
+        """,
+        (task_id, int(run_id), digest, payload_json, int(completed_at)),
+    )
+    return digest if cur.rowcount else _existing_outbox_digest(
+        conn, task_id, int(run_id)
+    )
+
+
+def _existing_outbox_digest(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> Optional[str]:
+    """Return the canonical digest for an existing outbox row.
+
+    Used after a duplicate ``INSERT ... ON CONFLICT DO NOTHING`` so
+    the caller sees the same digest it would have written. Pure SELECT,
+    never mutates state.
+    """
+    row = conn.execute(
+        "SELECT payload_sha256 FROM kanban_receipt_outbox "
+        "WHERE task_id = ? AND run_id = ?",
+        (task_id, run_id),
+    ).fetchone()
+    return row["payload_sha256"] if row else None
 
 
 def _synthesize_ended_run(
@@ -6247,6 +6471,25 @@ def complete_task(
                 summary=synth_summary,
                 metadata=synth_metadata,
             )
+        # Phase 2 (t_2d7fd66c): atomically enqueue the v1 receipt
+        # envelope into ``kanban_receipt_outbox`` while the write_txn
+        # is still open. The ``done`` UPDATE above and this INSERT
+        # commit or fail together — a crash between the two is
+        # structurally impossible because we are inside the same
+        # ``write_txn``. A no-op ``ON CONFLICT`` skip preserves the
+        # idempotency invariant for replayed closes; the digest is
+        # still returned so the ``completed`` event below can carry it.
+        outbox_digest: Optional[str] = None
+        if run_id is not None:
+            outbox_digest = _enqueue_receipt_outbox(
+                conn,
+                task_id=task_id,
+                run_id=int(run_id),
+                summary=summary,
+                result=result,
+                metadata=metadata if isinstance(metadata, dict) else None,
+                completed_at=int(now),
+            )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
@@ -6276,6 +6519,16 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+        # Phase 2 (t_2d7fd66c): surface the receipt digest on the
+        # ``completed`` event so gateway notifiers and dashboard WS
+        # consumers can join outbox ↔ event without a second SQL
+        # round-trip. ``outbox_digest`` is None when validation/build
+        # failed (the outbox row was skipped + an event captured the
+        # reason); we still emit the ``completed`` event so the rest of
+        # the pipeline proceeds unchanged.
+        if outbox_digest is not None:
+            completed_payload["receipt_payload_sha256"] = outbox_digest
+            completed_payload["receipt_outbox_status"] = "enqueued"
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -7269,6 +7522,102 @@ def block_task(
     )
     return True
 
+
+
+def retype_block_kind(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Repair the ``block_kind`` on an already-blocked card WITHOUT
+    rewriting status, claim_lock, block_recurrences, or emitting a fresh
+    ``blocked`` transition event.
+
+    Closes the t_19c3e315 gap: 68 cards on the board were minted by
+    ``hermes kanban create --initial-status blocked`` before that path
+    accepted a ``--kind``; no supported command could set ``block_kind``
+    afterwards (``block_task`` refuses because the card is already
+    ``status='blocked'``).  Unblock -> re-block would rewrite the status
+    history and emit spurious transitions on mid-flight cards, which is
+    worse than the untyped state itself.
+
+    Returns ``(ok, reason)``:
+      * ``(False, "<explanation>")`` when ``kind`` is invalid, the task
+        does not exist, the task is not currently ``status='blocked'``,
+        or ``block_kind`` is already equal to ``kind`` (no-op).
+      * ``(True, None)`` on success -- the row's ``block_kind`` was
+        updated and a ``block_kind_retyped`` audit event was appended.
+
+    ``block_recurrences`` is deliberately NOT touched.  Retyping a
+    NULL-kind card to ``needs_input`` does not count as the first
+    same-cause re-block for loop-breaker purposes -- the recurrence
+    counter is meaningful only when a true
+    ``blocked -> unblocked -> blocked`` transition happens, and this
+    helper short-circuits that lifecycle.
+    """
+    if kind is None:
+        return False, "--kind is required"
+    if kind not in VALID_BLOCK_KINDS:
+        return False, (
+            f"invalid kind {kind!r}; must be one of "
+            f"{sorted(VALID_BLOCK_KINDS)}"
+        )
+    if reason is None or not reason.strip():
+        return False, "reason is required (audit trail)"
+    with write_txn(conn):
+        cur = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if cur is None:
+            return False, "task not found"
+        if cur["status"] != "blocked":
+            return False, (
+                f"task is status={cur['status']!r}, not 'blocked'; "
+                "use `hermes kanban block --kind` (no --retype) for the "
+                "normal path"
+            )
+        prev_kind = cur["block_kind"] if "block_kind" in cur.keys() else None
+        if prev_kind == kind:
+            return False, (
+                f"task already has block_kind={kind!r}; no change"
+            )
+        cur2 = conn.execute(
+            "UPDATE tasks SET block_kind = ? "
+            "WHERE id = ? AND status = 'blocked'",
+            (kind, task_id),
+        )
+        if cur2.rowcount != 1:
+            # Lost a race -- re-read once to give a useful error.
+            after = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            return False, (
+                f"update did not affect 1 row (status now "
+                f"{after['status'] if after else 'gone'!r})"
+            )
+        _append_event(
+            conn,
+            task_id,
+            "block_kind_retyped",
+            {
+                "prev_kind": prev_kind,
+                "kind": kind,
+                "reason": reason,
+            },
+        )
+        repaired = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_block_kind_retyped",
+        task_id,
+        board=get_current_board(),
+        assignee=repaired.assignee if repaired else None,
+        run_id=None,
+        reason=reason,
+    )
+    return True, None
 
 
 def redact_review_value(value: Any) -> Any:
@@ -9631,7 +9980,7 @@ def _error_fingerprint(error_text: str) -> str:
 # below-budget violation does not tick the unified counter either. A per-task
 # ``max_retries`` overrides this bound — the same "task override wins"
 # precedence ``_record_task_failure`` documents for every other failure kind.
-_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
+_PROTOCOL_VIOLATION_FAILURE_LIMIT = 2
 
 # How far back to walk a task's closed runs when counting the violation
 # streak. The streak trips at a handful of violations, so anything beyond a
@@ -9682,7 +10031,11 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
                 except (ValueError, TypeError):
                     is_violation = False
             if not is_violation:
-                is_violation = "protocol violation" in (row["error"] or "")
+                err = row["error"] or ""
+                is_violation = (
+                    "protocol violation" in err
+                    or " not alive" in err
+                )
             if is_violation:
                 streak += 1
                 continue
@@ -9805,15 +10158,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "exit_code": code,
                 }
             else:
-                protocol_violation = False
                 if kind == "nonzero_exit":
+                    protocol_violation = False
                     error_text = f"pid {pid} exited with code {code}"
+                    event_kind = "crashed"
+                    event_payload = {"pid": pid, "claimer": row["claim_lock"]}
                 elif kind == "signaled":
+                    protocol_violation = False
                     error_text = f"pid {pid} killed by signal {code}"
+                    event_kind = "crashed"
+                    event_payload = {"pid": pid, "claimer": row["claim_lock"]}
                 else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
+                    protocol_violation = True
+                    error_text = (
+                        f"pid {pid} not alive — treated as protocol "
+                        "violation (vanished before waitpid)"
+                    )
+                    event_kind = "protocol_violation"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "protocol_violation": True,
+                    }
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
@@ -10731,6 +11097,22 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _validate_profile_limit_overrides(value: Any) -> dict[str, int]:
+    """Validate exact profile caps without permitting wildcard or unbounded values."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("profile limit overrides must be a mapping")
+    result: dict[str, int] = {}
+    for profile, cap in value.items():
+        if not isinstance(profile, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", profile):
+            raise ValueError("profile limit override requires an exact profile name")
+        if type(cap) is not int or cap < 1:
+            raise ValueError("profile limit override must be a positive integer")
+        result[profile] = cap
+    return result
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10744,6 +11126,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile_overrides: Optional[dict[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -10779,6 +11162,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_profile_overrides=max_in_progress_per_profile_overrides,
             reconcile_orphans=reconcile_orphans,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -10799,6 +11183,7 @@ def dispatch_once(
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_profile_overrides=max_in_progress_per_profile_overrides,
                 reconcile_orphans=reconcile_orphans,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
@@ -10826,6 +11211,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile_overrides: Optional[dict[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -10863,6 +11249,8 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    _profile_caps = _validate_profile_limit_overrides(max_in_progress_per_profile_overrides)
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -11068,8 +11456,9 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
+    _track_profile_counts = _per_profile_cap is not None or bool(_profile_caps)
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
+    if _track_profile_counts:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
@@ -11168,9 +11557,10 @@ def _dispatch_once_locked(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        if _per_profile_cap is not None:
+        profile_cap = _profile_caps.get(row_assignee, _per_profile_cap)
+        if profile_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
+            if current >= profile_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
@@ -11203,7 +11593,7 @@ def _dispatch_once_locked(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
+            if _track_profile_counts and row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
@@ -11313,7 +11703,7 @@ def _dispatch_once_locked(
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
+            if _track_profile_counts and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
@@ -11358,9 +11748,10 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        if _per_profile_cap is not None:
+        profile_cap = _profile_caps.get(row["assignee"], _per_profile_cap)
+        if profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
+            if current >= profile_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
                 )
@@ -11378,7 +11769,7 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
-            if _per_profile_cap is not None:
+            if _track_profile_counts:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
@@ -11433,7 +11824,7 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
+            if _track_profile_counts and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
