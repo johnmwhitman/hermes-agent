@@ -403,6 +403,15 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Absolute path for 'dir' or 'worktree' workspace. "
                 "Relative paths are rejected at dispatch."
         )),
+        "branch_name": _prop("string", (
+                "Optional git branch_name for worktree workspaces. Same "
+                "semantics as ``hermes kanban create --branch``: stored on "
+                "the task row, only valid with workspace_kind=worktree. "
+                "Omit to keep the default (project inheritance, or "
+                "wt/<task-id> when the claim resolver materializes a "
+                "worktree). Pass an existing recovery branch to stay in "
+                "that registered checkout instead of falling back."
+        )),
         "project": _prop("string", (
                 "Optional project id or slug to link the task to. When "
                 "set, the task becomes a git worktree under the project's "
