@@ -803,15 +803,26 @@ def _worker_stderr_tail(
     return "\n".join(lines)
 
 
-def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
+def _classify_dead_worker(pid: int, claimer: Optional[str], stderr_tail: str = "") -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping."""
     kind, code = _classify_worker_exit(pid)
     if kind in {"clean_exit", "unknown"}:
         # rc=0 while still ``running``: usually the work succeeded and only the
         # paperwork was skipped; the corrective sentence reaches the retry
         # worker via ``build_worker_context``.
+        error_text = (_PROTOCOL_VIOLATION_ERROR if kind == "clean_exit"
+                      else f"pid {pid} not alive without a terminal kanban call — protocol violation")
+        # When the stderr tail shows all providers failed (no LLM response),
+        # prepend the root cause so the retry worker and operator see why the
+        # turn never produced a tool call (DEC-H028, t_ec3f475e deliverable 4).
+        if stderr_tail and "every provider in the fallback chain kept failing" in stderr_tail:
+            error_text = (
+                "All LLM providers failed before any tool call — worker could not "
+                "produce a reply and exited without kanban_complete. "
+                + error_text
+            )
         return _DeadWorker(
-            kind, code, (_PROTOCOL_VIOLATION_ERROR if kind == "clean_exit" else f"pid {pid} not alive without a terminal kanban call — protocol violation"), "protocol_violation",
+            kind, code, error_text, "protocol_violation",
             # ``protocol_violation`` is the durable marker for
             # _protocol_violation_streak: _end_run copies this payload into the
             # run metadata.
@@ -1036,13 +1047,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"])
+            stderr_tail = _worker_stderr_tail(row["id"])
+            dead = _classify_dead_worker(pid, row["claim_lock"], stderr_tail=stderr_tail)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             dead.event_payload["exit_kind"] = dead.kind
             if "exit_code" not in dead.event_payload:
                 dead.event_payload["exit_code"] = dead.code
-            stderr_tail = _worker_stderr_tail(row["id"])
             if stderr_tail:
                 dead.event_payload["stderr_tail"] = stderr_tail
             # Only rc=0 clean-exit protocol violations are salvage-eligible.
