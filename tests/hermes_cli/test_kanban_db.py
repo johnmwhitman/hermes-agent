@@ -1445,7 +1445,7 @@ def test_dispatch_skips_spawn_when_skills_preflight_refuses(
     # patch THE DISPATCHER'S module. Easier: monkey-patch
     # ``kb._skills_preflight_check`` itself with a wrapper that calls
     # our rooted validate.
-    real_preflight_check = kb._skills_preflight_check
+    real_preflight_check = kbd._skills_preflight_check
 
     def rooted_preflight_check(task):
         requested = list(task.skills or [])
@@ -1464,7 +1464,7 @@ def test_dispatch_skips_spawn_when_skills_preflight_refuses(
             reason_blob = f"{reason_blob}: {first_remediation}"
         return ",".join(unresolved), reason_blob
 
-    monkeypatch.setattr(kb, "_skills_preflight_check", rooted_preflight_check)
+    monkeypatch.setattr(kbd, "_skills_preflight_check", rooted_preflight_check)
 
     with kb.connect() as conn:
         task = kb.create_task(conn, title="vela sweep", assignee="alice")
@@ -1487,9 +1487,8 @@ def test_dispatch_skips_spawn_when_skills_preflight_refuses(
     assert res.skills_refused, (
         f"expected skills_refused to be non-empty; got {res.skills_refused}"
     )
-    refused_id, unresolved_csv, reason_blob = res.skills_refused[0]
+    refused_id, reason_blob = res.skills_refused[0]
     assert refused_id == task
-    assert "design-review" in unresolved_csv
     assert reason_blob, "reason_blob must carry a remediation hint"
     # An event with kind ``skills_preflight_refused`` must be on the
     # task's event trail so ``hermes kanban show`` can show the
@@ -1590,7 +1589,7 @@ def test_dispatch_refuses_when_skills_preflight_ambiguous(
             reason_blob = f"{reason_blob}: {first_remediation}"
         return ",".join(unresolved), reason_blob
 
-    monkeypatch.setattr(kb, "_skills_preflight_check", rooted_preflight_check)
+    monkeypatch.setattr(kbd, "_skills_preflight_check", rooted_preflight_check)
 
     with kb.connect() as conn:
         task = kb.create_task(conn, title="ambiguous card", assignee="alice")
@@ -1610,9 +1609,9 @@ def test_dispatch_refuses_when_skills_preflight_ambiguous(
         f"skills_refused must be populated for ambiguous skills; "
         f"got {res.skills_refused}"
     )
-    refused_id, unresolved_csv, _reason = res.skills_refused[0]
+    refused_id, reason_blob = res.skills_refused[0]
     assert refused_id == task
-    assert "design-review" in unresolved_csv
+    assert reason_blob
 
     # Task must be re-claimable: status=ready, no claim, no failure bump.
     refused_task = kb.get_task(conn, task)
@@ -1668,7 +1667,7 @@ def test_dispatch_still_spawns_when_skills_preflight_passes(
 
     monkeypatch.setattr(sp, "validate_task_skills", _rooted_validate)
 
-    real_preflight_check = kb._skills_preflight_check
+    real_preflight_check = kbd._skills_preflight_check
 
     def rooted_preflight_check(task):
         requested = list(task.skills or [])
@@ -1687,7 +1686,7 @@ def test_dispatch_still_spawns_when_skills_preflight_passes(
             reason_blob = f"{reason_blob}: {first_remediation}"
         return ",".join(unresolved), reason_blob
 
-    monkeypatch.setattr(kb, "_skills_preflight_check", rooted_preflight_check)
+    monkeypatch.setattr(kbd, "_skills_preflight_check", rooted_preflight_check)
 
     with kb.connect() as conn:
         task = kb.create_task(conn, title="good card", assignee="alice")
@@ -1703,6 +1702,114 @@ def test_dispatch_still_spawns_when_skills_preflight_passes(
     assert not res.skills_refused, (
         f"skills_refused should be empty when skills resolve; got {res.skills_refused}"
     )
+
+
+def test_dispatch_blocks_after_three_consecutive_skills_preflight_refusals(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Three consecutive skills_preflight_refused outcomes park the task.
+
+    Replay of the review-lane hot loop (t_040d1405 / t_d2c8f921 /
+    t_fb7fa3a3): the dispatcher used to restore the source lane on every
+    refusal, so the next tick re-claimed the same doomed card. After N=3
+    consecutive refusals it must block kind=capability with
+    reason=preflight:<skill> naming the unresolved skill, and never spawn.
+    """
+    spawn_calls = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawn_calls.append(task.id)
+        return 42
+
+    def refuse_preflight(task):
+        return "sdlc-review", "not_found: skill missing"
+
+    monkeypatch.setattr(kbd, "_skills_preflight_check", refuse_preflight)
+
+    with kb.connect() as conn:
+        task = kb.create_task(conn, title="hot loop card", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET skills = ? WHERE id = ?",
+            (json.dumps(["sdlc-review"]), task),
+        )
+        statuses = []
+        auto_blocked = []
+        for _ in range(4):
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=5)
+            row = kb.get_task(conn, task)
+            statuses.append(row.status)
+            auto_blocked.append(list(res.auto_blocked))
+
+        events = list(conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            (task,),
+        ).fetchall())
+        refusal_kinds = [e[0] for e in events if e[0] == "skills_preflight_refused"]
+        blocked_events = [e[0] for e in events if e[0] == "blocked"]
+        final = kb.get_task(conn, task)
+
+    assert spawn_calls == [], f"must never spawn a refused card: {spawn_calls}"
+    assert statuses[:2] == ["ready", "ready"], statuses
+    assert statuses[2] == "blocked", statuses
+    assert statuses[3] == "blocked", statuses
+    assert auto_blocked[0] == []
+    assert auto_blocked[1] == []
+    assert auto_blocked[2] == [task]
+    assert len(refusal_kinds) == 3, refusal_kinds
+    assert blocked_events, "expected a blocked event on the third refusal"
+    assert final.status == "blocked"
+    assert final.block_kind == "capability"
+    assert (final.last_failure_error or "").startswith("preflight:sdlc-review")
+
+
+def test_dispatch_blocks_review_lane_after_three_preflight_refusals(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Review-status cards are the live hot-loop shape: restore review twice,
+    then park blocked so kanban block / the dispatcher can both stop them.
+    """
+    import hermes_cli.config as cfgmod
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    monkeypatch.setattr(kbd, "_skills_preflight_check", lambda task: ("sdlc-review", "not_found"))
+
+    spawn_calls = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawn_calls.append(task.id)
+        return 99
+
+    with kb.connect() as conn:
+        task = kb.create_task(conn, title="review hot loop", assignee="alice")
+        claimed = kb.claim_task(conn, task)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, task, summary="ready for review",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, task).status == "review"
+        statuses = []
+        for _ in range(3):
+            kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=5)
+            statuses.append(kb.get_task(conn, task).status)
+        final = kb.get_task(conn, task)
+        events = list(conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (task,),
+        ).fetchall())
+
+    assert spawn_calls == []
+    assert statuses == ["review", "review", "blocked"], statuses
+    assert final.block_kind == "capability"
+    assert (final.last_failure_error or "").startswith("preflight:sdlc-review")
+    blocked = [e for e in events if e[0] == "blocked"]
+    assert blocked
+    payload = json.loads(blocked[-1][1] or "{}")
+    assert payload.get("source_status") == "review"
+    assert payload.get("skill") == "sdlc-review"
+    assert payload.get("field") == "skills"
 
 
 # Review column dispatch

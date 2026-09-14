@@ -101,6 +101,35 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_block_task_parks_review_status(kanban_home: Path) -> None:
+    """``kanban block`` must park a review-status card.
+
+    The seat could not quarantine t_040d1405 / t_d2c8f921 / t_fb7fa3a3
+    because block_task's WHERE clause ignored ``review``. Unblock must
+    restore review via source_status on the blocked event.
+    """
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="review park", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        claimed = kb.claim_task(conn, tid, claimer="worker")
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="handoff",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "review"
+        assert kb.block_task(
+            conn, tid, reason="preflight:sdlc-review", kind="capability",
+        )
+        parked = kb.get_task(conn, tid)
+        assert parked.status == "blocked"
+        assert parked.block_kind == "capability"
+        assert kb.unblock_task(conn, tid)
+        restored = kb.get_task(conn, tid)
+        assert restored.status == "review"
+
+
 # ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------

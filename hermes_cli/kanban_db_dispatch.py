@@ -33,6 +33,14 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# Skills-preflight refusals do not consume ``consecutive_failures`` (a
+# missing skill is operator-actionable, not a runtime crash). Without a
+# separate cap the dispatcher restores the source lane on every refusal
+# and re-claims the same doomed card forever — the review-lane hot loop
+# on t_040d1405 / t_d2c8f921 / t_fb7fa3a3. After this many consecutive
+# ``skills_preflight_refused`` runs, park kind=capability.
+SKILLS_PREFLIGHT_REFUSAL_LIMIT = 3
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -1624,11 +1632,63 @@ def _dispatch_lane_task(
     if skills_error is not None:
         unresolved, reason = skills_error
         result.skills_refused.append((claimed.id, reason))
+        skill = (unresolved.split(",")[0] or "unknown").strip() or "unknown"
+        park_reason = f"preflight:{skill}"
+        park_after = False
         with _kb.write_txn(conn):
-            payload = {"unresolved": unresolved, "reason": reason}
+            payload = {
+                "unresolved": unresolved,
+                "reason": reason,
+                "skill": skill,
+                "field": "skills",
+            }
             _kb._append_event(conn, claimed.id, "skills_preflight_refused", payload)
-            _kb._end_run(conn, claimed.id, outcome="skills_preflight_refused", error=reason, metadata=payload)
-            conn.execute("UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL WHERE id = ?", (lane, claimed.id))
+            _kb._end_run(
+                conn, claimed.id, outcome="skills_preflight_refused",
+                error=reason, metadata=payload,
+            )
+            conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                (lane, claimed.id),
+            )
+            streak = 0
+            for run_row in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (claimed.id, SKILLS_PREFLIGHT_REFUSAL_LIMIT),
+            ):
+                if run_row["outcome"] == "skills_preflight_refused":
+                    streak += 1
+                else:
+                    break
+            if streak >= SKILLS_PREFLIGHT_REFUSAL_LIMIT:
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (park_reason, claimed.id),
+                )
+                park_after = True
+        if park_after:
+            parked = _kb.block_task(
+                conn, claimed.id, reason=park_reason, kind="capability",
+            )
+            if parked:
+                result.auto_blocked.append(claimed.id)
+                with _kb.write_txn(conn):
+                    ev = conn.execute(
+                        "SELECT id, payload FROM task_events "
+                        "WHERE task_id = ? AND kind = 'blocked' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (claimed.id,),
+                    ).fetchone()
+                    if ev is not None:
+                        extra = _kb._json_dict(ev["payload"])
+                        extra["skill"] = skill
+                        extra["field"] = "skills"
+                        conn.execute(
+                            "UPDATE task_events SET payload = ? WHERE id = ?",
+                            (_kb._json_or_null(extra), ev["id"]),
+                        )
         return False
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)

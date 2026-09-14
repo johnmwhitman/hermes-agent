@@ -3246,9 +3246,12 @@ def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``transient`` still counts toward the loop breaker
-    so a forever-flaky task escalates. True on any transition."""
+    """``running``/``ready``/``review`` -> ``blocked`` (or ``todo`` / ``triage``,
+    see :func:`_route_block`). Review-lane cards must be parkable: a preflight
+    refusal used to bounce them back to ``review``, and ``kanban block``
+    ignored that status, so the dispatcher re-claimed them forever.
+    ``transient`` still counts toward the loop breaker so a forever-flaky
+    task escalates. True on any transition."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
@@ -3257,7 +3260,13 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        cur_status = cur_row["status"]
+        if cur_status == "running":
+            source_status = _retry_status_for_run(conn, task_id)
+        elif cur_status == "review":
+            source_status = "review"
+        else:
+            source_status = "ready"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
@@ -3270,7 +3279,7 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """
         params = (*params, task_id)
         if expected_run_id is not None:
@@ -3300,11 +3309,12 @@ def _route_block(
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
     as something to "unblock". Every other kind counts unblock-loop
-    recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    recurrences: block_task fires from running/ready/review (AFTER an
+    unblock returned the task to the pool), so a stored ``block_kind``
+    equal to the incoming one means blocked -> unblocked -> re-block for
+    the same cause (un-typed None compares equal to a prior un-typed
+    block). At ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage``
+    for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
