@@ -471,6 +471,18 @@ KANBAN_CREATE_SCHEMA = _schema(
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
+        "production_effect": {
+            "type": "string",
+            "enum": ["production", "enabling", "internal"],
+            "description": (
+                "Classify the card's user-facing effect: production (completing "
+                "it changes what a user/customer sees — done receipt must cite "
+                "a deploy id, release tag, or live URL), enabling (unblocks a "
+                "named production card), or internal (default, NULL). A "
+                "production card cannot close without a production artifact in "
+                "its receipt. Roll back with HERMES_KANBAN_PRODUCTION_EFFECT=off."
+            ),
+        },
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
                 "continuation turns the worker may take before the task "

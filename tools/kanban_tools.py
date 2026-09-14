@@ -907,7 +907,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract production_effect last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
@@ -1166,6 +1166,32 @@ def _handle_complete(args: dict, **kw) -> str:
         )
         if receipt_err:
             return receipt_err
+        # production_effect gate (t_066aaaae): a production card must cite a
+        # deploy_id / release_tag / live_url / phase05_receipt; an enabling
+        # card must name the production card it unblocks. NULL/internal and
+        # HERMES_KANBAN_PRODUCTION_EFFECT=off skip this gate (old path).
+        from hermes_cli.kanban_production_effect import enforce_on_complete as _enforce_production_effect
+
+        def _lookup_task_for_pe(task_id: str):
+            row = kb.get_task(conn, task_id)
+            if row is None:
+                return None
+            return {"id": row.id, "production_effect": getattr(row, "production_effect", None)}
+
+        pe_receipt = _enforce_production_effect(
+            getattr(task, "production_effect", None) if task else None,
+            summary=summary or "",
+            result=result or "",
+            metadata=metadata if isinstance(metadata, dict) else {},
+            artifacts=artifacts,
+            lookup_task=_lookup_task_for_pe,
+        )
+        if not pe_receipt["ok"]:
+            return tool_error(
+                f"kanban_complete refused: production_effect={pe_receipt['effect']} "
+                f"{pe_receipt['classification']}: {pe_receipt['detail']} {pe_receipt.get('recovery', '')} "
+                "Card not moved to done."
+            )
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
@@ -1464,6 +1490,7 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            production_effect=args.get("production_effect"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
