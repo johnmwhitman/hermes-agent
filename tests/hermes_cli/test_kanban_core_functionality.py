@@ -241,6 +241,42 @@ def test_read_worker_log_tail(kanban_home):
     assert kb.read_worker_log("t_missing") is None
 
 
+def test_reclaim_stamps_stderr_tail_and_exit_code(kanban_home):
+    """A dead worker without a terminal kanban call must leave its last
+    log lines + exit_code on the closed run (t_87955f05 / t_374acf97).
+
+    Fleetopus deaths at 65s were classified as protocol violations with
+    ``exit_code=null`` and empty summary even though the worker log
+    already said ``Error: Unknown skill(s): product-cycle``.
+    """
+    log_dir = kanban_home / "kanban" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="stderr capture", assignee="fleetopus")
+        (log_dir / f"{tid}.log").write_text(
+            "Query: work kanban task t_374acf97\n"
+            "Initializing agent...\n"
+            "Error: Unknown skill(s): product-cycle\n"
+        )
+        crashed = _drive_protocol_violation(conn, tid, fake_pid=424242)
+        assert crashed == [tid]
+        run = conn.execute(
+            "SELECT summary, error, metadata FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run is not None
+        meta = json.loads(run["metadata"] or "{}")
+        assert meta.get("exit_code") == 0
+        assert meta.get("exit_kind") == "clean_exit"
+        assert "Unknown skill(s): product-cycle" in (meta.get("stderr_tail") or "")
+        assert "Unknown skill(s): product-cycle" in (run["summary"] or "")
+        assert "protocol violation" in (run["error"] or "")
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # CLI bulk verbs
 # ---------------------------------------------------------------------------

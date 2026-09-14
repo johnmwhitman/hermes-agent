@@ -37,6 +37,13 @@ DEFAULT_FAILURE_LIMIT = 2
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
 
+# Last N worker-log lines (stdout+stderr merged at spawn) stamped onto a
+# crashed run so an exit without a terminal kanban call is diagnosable.
+# 20 lines / 4 KiB matches the original "last 20 log lines as the run
+# summary" contract and ``_CTX_MAX_FIELD_BYTES``.
+_WORKER_LOG_TAIL_LINES = 20
+_WORKER_LOG_TAIL_BYTES = 4 * 1024
+
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and call kanban_block/kanban_complete before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
@@ -754,6 +761,32 @@ class _DeadWorker:
         return "rate_limited" if self.rate_limited else "crashed"
 
 
+def _worker_stderr_tail(
+    task_id: str,
+    *,
+    n: int = _WORKER_LOG_TAIL_LINES,
+    board: Optional[str] = None,
+) -> str:
+    """Last ``n`` lines of the per-task worker log (stdout+stderr merged).
+
+    Empty string when the log is missing or unreadable. Caps the read at
+    ``_WORKER_LOG_TAIL_BYTES`` so a multi-megabyte log cannot enter the
+    run-metadata JSON.
+    """
+    try:
+        text = _kb.read_worker_log(
+            task_id, tail_bytes=_WORKER_LOG_TAIL_BYTES, board=board,
+        )
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if len(lines) > n:
+        lines = lines[-n:]
+    return "\n".join(lines)
+
+
 def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping."""
     kind, code = _classify_worker_exit(pid)
@@ -832,6 +865,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             dead = _classify_dead_worker(pid, row["claim_lock"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            dead.event_payload["exit_kind"] = dead.kind
+            if "exit_code" not in dead.event_payload:
+                dead.event_payload["exit_code"] = dead.code
+            stderr_tail = _worker_stderr_tail(row["id"])
+            if stderr_tail:
+                dead.event_payload["stderr_tail"] = stderr_tail
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -844,6 +883,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             run_id = _kb._end_run(
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,
+                summary=stderr_tail or None,
                 error=dead.error_text,
                 metadata=dict(dead.event_payload),
             )
