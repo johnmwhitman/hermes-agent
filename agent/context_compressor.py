@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import re
 import time
@@ -1784,6 +1785,17 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 config_context_length=self._config_context_length, provider=self.provider,
                 custom_providers=self.custom_providers,
             )
+            # Kanban workers (source=kanban) cap the window so a 500k catalog
+            # model still compresses before a 2-5 min CLI-cleanup death
+            # (t_42212ef1). Spawn sets HERMES_KANBAN_WORKER_CONTEXT_CAP.
+            if os.environ.get("HERMES_SESSION_SOURCE") == "kanban":
+                raw = os.environ.get("HERMES_KANBAN_WORKER_CONTEXT_CAP", "")
+                try:
+                    cap = int(raw)
+                except (TypeError, ValueError):
+                    cap = 131072
+                if cap > 0:
+                    self._resolved_context_length = min(self._resolved_context_length, cap)
             # Raise-only small-context floor; must run after context_length resolves and before threshold_tokens derives.
             self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent)
             self._emit_init_summary_once()

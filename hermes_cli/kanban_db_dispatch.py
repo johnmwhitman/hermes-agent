@@ -52,6 +52,14 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 _WORKER_LOG_TAIL_LINES = 20
 _WORKER_LOG_TAIL_BYTES = 4 * 1024
 
+# Worker-only context cap (tokens). xai/grok-4.6 catalog is 500_000; class-A
+# deaths still arrived at 163k-183k because that window never compressed
+# before CLI cleanup. Cap the *worker* window at 128k so compression
+# (profile threshold) fires well below a 2-5 min death. Does not edit
+# conductor config.yaml. Overridable via HERMES_KANBAN_WORKER_CONTEXT_CAP.
+DEFAULT_WORKER_CONTEXT_CAP = 131072
+_RESUME_ARGV = frozenset({"--resume", "-r", "--continue", "-c"})
+
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and call kanban_block/kanban_complete before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
@@ -2241,7 +2249,14 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    # Cattle, not pets: never resume a prior session id (t_021dcee8).
+    # ``chat -q`` without ``--resume``/``-c`` mints a fresh session_id.
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    if any(tok in _RESUME_ARGV for tok in cmd):
+        raise RuntimeError(
+            "kanban worker argv must not resume a prior session "
+            f"(got resume flag in {cmd!r})"
+        )
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the
@@ -2319,6 +2334,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     for key in _VAR_MAP:
         env.pop(key, None)
     env.pop("HERMES_SESSION_OWNER_HANDLE", None)
+    # Belt-and-braces: even if a future _VAR_MAP drop misses these, a
+    # kanban worker must not inherit a parent/gateway session id
+    # (Mnemosyne would bind to it; t_021dcee8).
+    env.pop("HERMES_SESSION_ID", None)
+    env.pop("HERMES_UI_SESSION_ID", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml:
     # without it the child's get_hermes_home() falls back to the DEFAULT
@@ -2335,8 +2355,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the session `kanban` so session-browsing surfaces filter it out by
-    # source instead of rendering one sidebar row per attempt.
+    # source instead of rendering one sidebar row per attempt. Do not set
+    # HERMES_SESSION_ID — the child CLI mints a fresh id.
     env["HERMES_SESSION_SOURCE"] = "kanban"
+    env.setdefault("HERMES_KANBAN_WORKER_CONTEXT_CAP", str(DEFAULT_WORKER_CONTEXT_CAP))
     # TERMINAL_CWD takes precedence over process cwd in file_tools and
     # build_context_files_prompt; without it relative writes land in the gateway
     # user's home and workers load the gateway's AGENTS.md. file_tools rejects

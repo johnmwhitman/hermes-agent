@@ -269,3 +269,41 @@ def test_spawn_strips_session_routing_leak(monkeypatch, tmp_path):
         )
     # HERMES_SESSION_SOURCE is the one exception — the dispatcher tags it "kanban".
     assert env.get("HERMES_SESSION_SOURCE") == "kanban"
+    assert env.get("HERMES_UI_SESSION_ID") is None
+    assert env.get("HERMES_KANBAN_WORKER_CONTEXT_CAP") == str(kbd.DEFAULT_WORKER_CONTEXT_CAP)
+    cmd = captured[0]["cmd"]
+    assert "--resume" not in cmd and "-r" not in cmd
+    assert "--continue" not in cmd and "-c" not in cmd
+    # session id is minted by the child CLI, never inherited
+    assert "HERMES_SESSION_ID" not in env
+
+
+def test_worker_argv_never_resumes_prior_session(tmp_path, monkeypatch):
+    """_worker_argv is chat -q only — no --resume / -c, even if Task.session_id is set."""
+    _setup_hermes_home(tmp_path, monkeypatch)
+    task = kb.Task(
+        id="t_fresh",
+        title="fresh",
+        body=None,
+        assignee="w",
+        status="running",
+        priority=0,
+        created_by="t",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock="l",
+        claim_expires=None,
+        tenant=None,
+        session_id="20260823_110628_7c083e",
+    )
+    argv = kbd._worker_argv(task, "w", None)
+    assert "--resume" not in argv and "-r" not in argv
+    assert "--continue" not in argv and "-c" not in argv
+    assert "20260823_110628_7c083e" not in argv
+    assert argv[-2:] == ["-q", "work kanban task t_fresh"] or (
+        argv[-3] == "-q" or "chat" in argv
+    )
+    assert "chat" in argv and "-q" in argv

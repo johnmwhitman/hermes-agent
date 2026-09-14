@@ -3700,3 +3700,25 @@ class TestSanitizeToolPairsWhitespace:
         tool_call_ids = [m.get("tool_call_id") for m in out if m.get("role") == "tool"]
         assert "call_orphan" not in tool_call_ids, "genuinely orphaned result must be removed"
         assert " call_orphan " not in tool_call_ids, "original whitespace form must also be gone"
+
+
+class TestKanbanWorkerContextCap:
+    """t_42212ef1: source=kanban workers cap the window at 128k by default."""
+
+    def test_kanban_source_caps_below_catalog(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_CONTEXT_CAP", "131072")
+        with patch("agent.context_compressor.get_model_context_length", return_value=500000):
+            c = ContextCompressor(model="xai/grok-4.6", threshold_percent=0.15, quiet_mode=True)
+            assert c.context_length == 131072
+            # Cap is 128k; even the default 0.75 trigger (~98k) is well below
+            # the 163k-183k class-A death window.
+            assert c.threshold_tokens <= 131072
+            assert c.threshold_tokens < 163000
+
+    def test_non_kanban_source_keeps_catalog(self, monkeypatch):
+        monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_WORKER_CONTEXT_CAP", raising=False)
+        with patch("agent.context_compressor.get_model_context_length", return_value=500000):
+            c = ContextCompressor(model="xai/grok-4.6", threshold_percent=0.15, quiet_mode=True)
+            assert c.context_length == 500000
