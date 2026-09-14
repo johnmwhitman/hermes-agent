@@ -3705,6 +3705,8 @@ class TestSanitizeToolPairsWhitespace:
 class TestKanbanWorkerContextCap:
     """t_42212ef1: source=kanban workers cap the window at 128k by default."""
 
+    CLASS_A_DEATH_TOKENS = 163000
+
     def test_kanban_source_caps_below_catalog(self, monkeypatch):
         monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
         monkeypatch.setenv("HERMES_KANBAN_WORKER_CONTEXT_CAP", "131072")
@@ -3714,7 +3716,46 @@ class TestKanbanWorkerContextCap:
             # Cap is 128k; even the default 0.75 trigger (~98k) is well below
             # the 163k-183k class-A death window.
             assert c.threshold_tokens <= 131072
-            assert c.threshold_tokens < 163000
+            assert c.threshold_tokens < self.CLASS_A_DEATH_TOKENS
+            assert c.should_compress(self.CLASS_A_DEATH_TOKENS) is True
+
+    def test_empty_cap_env_fail_closes_to_128k(self, monkeypatch):
+        """Restart-less workers may inherit SOURCE=kanban without the cap env."""
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        monkeypatch.delenv("HERMES_KANBAN_WORKER_CONTEXT_CAP", raising=False)
+        with patch("agent.context_compressor.get_model_context_length", return_value=500000):
+            c = ContextCompressor(model="xai/grok-4.6", threshold_percent=0.15, quiet_mode=True)
+            assert c.context_length == 131072
+            assert c.should_compress(self.CLASS_A_DEATH_TOKENS) is True
+
+    def test_invalid_cap_env_fail_closes_to_128k(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_CONTEXT_CAP", "not-an-int")
+        with patch("agent.context_compressor.get_model_context_length", return_value=500000):
+            c = ContextCompressor(model="xai/grok-4.6", threshold_percent=0.15, quiet_mode=True)
+            assert c.context_length == 131072
+
+    def test_fallback_update_model_recaps_500k_catalog(self, monkeypatch):
+        """Class-A path: openai-codex 429 then fallback xai/grok-4.6 at 500k."""
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_CONTEXT_CAP", "131072")
+        with patch("agent.context_compressor.get_model_context_length", return_value=128000):
+            c = ContextCompressor(model="openai-codex", threshold_percent=0.15, quiet_mode=True)
+            assert c.context_length == 128000
+        c.update_model("xai/grok-4.6", context_length=500000, provider="xai")
+        assert c.context_length == 131072
+        assert c.threshold_tokens < self.CLASS_A_DEATH_TOKENS
+        assert c.should_compress(self.CLASS_A_DEATH_TOKENS) is True
+        # Direct setter (plugin engines / restore_primary) must not reopen 500k.
+        c.context_length = 500000
+        assert c.context_length == 131072
+
+    def test_zero_cap_disables_clamp(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_CONTEXT_CAP", "0")
+        with patch("agent.context_compressor.get_model_context_length", return_value=500000):
+            c = ContextCompressor(model="xai/grok-4.6", threshold_percent=0.15, quiet_mode=True)
+            assert c.context_length == 500000
 
     def test_non_kanban_source_keeps_catalog(self, monkeypatch):
         monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
@@ -3722,3 +3763,6 @@ class TestKanbanWorkerContextCap:
         with patch("agent.context_compressor.get_model_context_length", return_value=500000):
             c = ContextCompressor(model="xai/grok-4.6", threshold_percent=0.15, quiet_mode=True)
             assert c.context_length == 500000
+            # Uncapped 500k + 0.75 small-window floor → 375k trigger; 163k would
+            # NOT compress (the class-A death). Cap is what closes that hole.
+            assert c.should_compress(self.CLASS_A_DEATH_TOKENS) is False

@@ -1680,6 +1680,27 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
 
+    # Fail-closed worker window when HERMES_KANBAN_WORKER_CONTEXT_CAP is empty
+    # or unparsable. Must match hermes_cli.kanban_db_dispatch.DEFAULT_WORKER_CONTEXT_CAP.
+    _KANBAN_WORKER_CONTEXT_CAP_DEFAULT = 131072
+
+    @staticmethod
+    def _kanban_worker_context_cap() -> int | None:
+        """Worker-only context cap, or None for non-kanban sessions.
+
+        Spawn sets HERMES_KANBAN_WORKER_CONTEXT_CAP. An empty or invalid value
+        still fail-closes to 128k so a restart-less worker cannot inherit a
+        500k catalog window. cap<=0 disables the clamp (operator override).
+        """
+        if os.environ.get("HERMES_SESSION_SOURCE") != "kanban":
+            return None
+        raw = os.environ.get("HERMES_KANBAN_WORKER_CONTEXT_CAP", "")
+        try:
+            cap = int(raw)
+        except (TypeError, ValueError):
+            cap = ContextCompressor._KANBAN_WORKER_CONTEXT_CAP_DEFAULT
+        return cap if cap > 0 else None
+
     @property
     def name(self) -> str:
         return "compressor"
@@ -1787,15 +1808,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             )
             # Kanban workers (source=kanban) cap the window so a 500k catalog
             # model still compresses before a 2-5 min CLI-cleanup death
-            # (t_42212ef1). Spawn sets HERMES_KANBAN_WORKER_CONTEXT_CAP.
-            if os.environ.get("HERMES_SESSION_SOURCE") == "kanban":
-                raw = os.environ.get("HERMES_KANBAN_WORKER_CONTEXT_CAP", "")
-                try:
-                    cap = int(raw)
-                except (TypeError, ValueError):
-                    cap = 131072
-                if cap > 0:
-                    self._resolved_context_length = min(self._resolved_context_length, cap)
+            # (t_42212ef1). Also applied in update_model / the setter because
+            # Codex 429 → grok-4.6 fallback rewrites the window via update_model.
+            cap = self._kanban_worker_context_cap()
+            if cap is not None:
+                self._resolved_context_length = min(self._resolved_context_length, cap)
             # Raise-only small-context floor; must run after context_length resolves and before threshold_tokens derives.
             self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent)
             self._emit_init_summary_once()
@@ -1808,6 +1825,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     @context_length.setter
     def context_length(self, value: int) -> None:
         # Re-assigning the SAME window must not wipe runtime corrections to derived budgets.
+        cap = self._kanban_worker_context_cap()
+        if cap is not None:
+            value = min(value, cap)
         if value == getattr(self, "_resolved_context_length", None):
             return
         self._resolved_context_length = value
@@ -2194,6 +2214,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         api_mode: str = "", max_tokens: int | None = None,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
+        # Cap BEFORE deriving thresholds. Class-A deaths were openai-codex 429
+        # then fallback xai/grok-4.6 (catalog 500k); without this clamp the
+        # 0.75 small-window floor on 500k yields a 375k trigger, so a 163k
+        # prompt never compresses and the CLI cleanup-kills the worker.
+        cap = self._kanban_worker_context_cap()
+        if cap is not None:
+            context_length = min(int(context_length), cap)
         runtime_changed = (model, provider, base_url, api_mode) != (self.model, self.provider, self.base_url, self.api_mode)
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         self.context_length = context_length
