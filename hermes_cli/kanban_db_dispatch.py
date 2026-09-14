@@ -2211,10 +2211,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         inherit_profile_home=True,
     )
     # The dispatcher is detached from every conversation; its worker must never
-    # inherit routing mirrored by a previous gateway turn.
+    # inherit routing mirrored by a previous gateway turn. ``_VAR_MAP`` covers the
+    # context-bound session vars; ``HERMES_SESSION_OWNER_HANDLE`` is set by the
+    # gateway chrome (not bound via ContextVars) and must also be stripped so a
+    # worker does not impersonate the gateway's owner when it calls kanban tools.
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    env.pop("HERMES_SESSION_OWNER_HANDLE", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml:
     # without it the child's get_hermes_home() falls back to the DEFAULT
