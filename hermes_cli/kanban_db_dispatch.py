@@ -2100,6 +2100,15 @@ def _dispatch_once_locked(
         exempt = _disk_governor_exempt_profiles()
         ready_rows = [r for r in ready_rows if (r["assignee"] or default_assignee) in exempt]
         review_rows = [r for r in review_rows if r["assignee"] in exempt]
+    # Product-profile reservation (DEC-H028, t_ec3f475e): internal cards must
+    # not starve production heads.  Partition ready_rows into product-profile
+    # cards and internal cards; dispatch product cards first so they are
+    # never buried behind internal cards in priority order.
+    product_assignees = _product_profile_assignees()
+    if product_assignees:
+        product_rows = [r for r in ready_rows if (r["assignee"] or default_assignee) in product_assignees]
+        internal_rows = [r for r in ready_rows if (r["assignee"] or default_assignee) not in product_assignees]
+        ready_rows = product_rows + internal_rows
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2107,6 +2116,34 @@ def _dispatch_once_locked(
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(review_rows):
         ready_budget = max(spawn_budget - 1, 0)
+    # Product-slot reservation: if at least one product card is ready and no
+    # product profile is currently running, hold one additional slot back so
+    # internal cards cannot consume the entire budget before a product head
+    # is dispatched on this tick (or a future tick).
+    product_running = 0
+    has_product_ready = False
+    if product_assignees and ready_rows:
+        has_product_ready = any(
+            (r["assignee"] or default_assignee) in product_assignees
+            for r in ready_rows
+        )
+        if has_product_ready:
+            for prow in conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL "
+                f"AND assignee IN ({','.join('?' for _ in product_assignees)})",
+                tuple(product_assignees),
+            ):
+                product_running = int(prow["n"])
+    # When the reservation is active (product card ready, none running),
+    # internal cards are limited to ready_budget - 1 so one slot is held for
+    # the product head.  Product cards may use the full ready_budget.  The
+    # spawned counter is shared, so the effective cap for a row depends on
+    # whether it is a product card.
+    if has_product_ready and product_running == 0 and ready_budget is not None and ready_budget > 0:
+        internal_budget = max(ready_budget - 1, 0)
+    else:
+        internal_budget = ready_budget
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     per_profile_cap = max_in_progress_per_profile if (
@@ -2132,8 +2169,23 @@ def _dispatch_once_locked(
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
-    for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
+    product_spawned = 0
+    internal_spawned = 0
+    # Two-phase dispatch: product cards first, then internal cards. The
+    # product phase can use the full ready_budget (it includes the reserved
+    # slot); the internal phase is capped at internal_budget so at least one
+    # slot remains for a product head when the reservation is active.
+    product_ready = [r for r in ready_rows if product_assignees and (r["assignee"] or default_assignee) in product_assignees]
+    internal_ready = [r for r in ready_rows if not (product_assignees and (r["assignee"] or default_assignee) in product_assignees)]
+    for row in product_ready + internal_ready:
+        is_product = product_assignees and (row["assignee"] or default_assignee) in product_assignees
+        if is_product and product_running == 0:
+            effective_budget = ready_budget
+            current_count = product_spawned
+        else:
+            effective_budget = internal_budget
+            current_count = internal_spawned
+        if effective_budget is not None and current_count >= effective_budget:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -2148,6 +2200,10 @@ def _dispatch_once_locked(
             result.auto_assigned_default.append(row["id"])
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
+            if is_product:
+                product_spawned += 1
+            else:
+                internal_spawned += 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
@@ -2688,6 +2744,16 @@ from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
 DISPATCH_GOVERNOR_MAX_BYTES = 1048576
 DISPATCH_GOVERNOR_DEFAULT_EXEMPT_PROFILES = frozenset({"conductor", "overwatch"})
 
+# Product-profile assignees: dispatch must reserve at least one slot for these
+# profiles so internal cards (conductor, overwatch, platformops, researcher,
+# career-steward, etc.) cannot starve production heads under priority-ordered
+# dispatch.  See DEC-H028 (t_ec3f475e, 2026-09-14).
+DISPATCH_PRODUCT_PROFILE_ASSIGNEES = frozenset({
+    "hool", "solreign", "solreignweb", "yourbrief", "fleetopus",
+    "spritefactory", "wickhand", "arkfunk", "noel", "thumbprinted",
+    "continuity",
+})
+
 def _configured_dispatch_governor_state_path() -> Optional[Path]:
     """Return the opt-in Kanban dispatch-governor state path.
 
@@ -2757,6 +2823,31 @@ def _disk_governor_exempt_profiles() -> "frozenset[str]":
         return frozenset(str(p).strip() for p in raw if str(p).strip())
     except Exception:
         return DISPATCH_GOVERNOR_DEFAULT_EXEMPT_PROFILES
+
+
+def _product_profile_assignees() -> "frozenset[str]":
+    """Return the set of product-profile assignees that reserve a dispatch slot.
+
+    ``kanban.product_profile_assignees`` (list of strings) overrides the
+    default set; an explicit empty list disables the reservation entirely.
+    Invalid values fail closed to the default so a typo cannot silently
+    re-strand production heads.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        kanban = config.get("kanban", {})
+        if not isinstance(kanban, Mapping):
+            return DISPATCH_PRODUCT_PROFILE_ASSIGNEES
+        raw = kanban.get("product_profile_assignees")
+        if raw is None:
+            return DISPATCH_PRODUCT_PROFILE_ASSIGNEES
+        if not isinstance(raw, (list, tuple)):
+            return DISPATCH_PRODUCT_PROFILE_ASSIGNEES
+        return frozenset(str(p).strip() for p in raw if str(p).strip())
+    except Exception:
+        return DISPATCH_PRODUCT_PROFILE_ASSIGNEES
 
 
 def _validate_profile_limit_overrides(value: Any) -> dict[str, int]:
