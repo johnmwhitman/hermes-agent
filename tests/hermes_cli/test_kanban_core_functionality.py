@@ -1409,6 +1409,212 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(
         conn.close()
 
 
+def test_clean_exit_receipt_ok_salvages(kanban_home, tmp_path):
+    """rc=0 + observable attachment → done via salvage, no protocol_violation."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="salvage-ok", assignee="worker")
+        evidence = tmp_path / "evidence.txt"
+        evidence.write_text("observable receipt")
+        kb.add_attachment(
+            conn, tid, filename="evidence.txt", stored_path=str(evidence),
+            size=evidence.stat().st_size,
+        )
+        crashed = _drive_protocol_violation(conn, tid, 424243)
+        assert crashed == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.last_failure_error is None
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" not in kinds
+        salvage = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "completed_via_clean_exit_salvage"
+        ]
+        assert len(salvage) == 1
+        assert (salvage[0].payload or {}).get("source") == "salvage"
+        assert (salvage[0].payload or {}).get("salvaged_clean_exit") is True
+        run = conn.execute(
+            "SELECT outcome, status, summary, metadata FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "completed"
+        assert "salvaged_clean_exit" in (run["summary"] or "")
+        meta = json.loads(run["metadata"] or "{}")
+        assert meta.get("source") == "salvage"
+        assert meta.get("salvaged_clean_exit") is True
+    finally:
+        conn.close()
+
+
+def test_clean_exit_hollow_stays_protocol_violation(kanban_home):
+    """Empty leftover prose on clean-exit keeps today's violation + retry."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="hollow-exit", assignee="worker")
+        crashed = _drive_protocol_violation(conn, tid, 424244)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds
+        assert "completed_via_clean_exit_salvage" not in kinds
+        assert "gave_up" not in kinds
+        from hermes_cli import kanban_db_dispatch as _kbd
+        assert _kbd._protocol_violation_streak(conn, tid) == 1
+    finally:
+        conn.close()
+
+
+def test_clean_exit_unobservable_fail_closed(kanban_home):
+    """A missing claimed path is unobservable, not salvage."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="unobs", assignee="worker")
+        log_dir = kanban_home / "kanban" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / f"{tid}.log").write_text(
+            "/tmp/does-not-exist-kanban-salvage-xyz\n"
+        )
+        crashed = _drive_protocol_violation(conn, tid, 424245)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds
+        assert "completed_via_clean_exit_salvage" not in kinds
+    finally:
+        conn.close()
+
+
+def test_clean_exit_classifier_exception_fail_closed(kanban_home, monkeypatch):
+    """Classifier raise → hollow (today's protocol_violation path)."""
+    import hermes_cli.kanban_receipt as kr
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("classifier exploded")
+
+    monkeypatch.setattr(kr, "_classify_prose", _boom)
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="boom", assignee="worker")
+        crashed = _drive_protocol_violation(conn, tid, 424246)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds
+        assert "completed_via_clean_exit_salvage" not in kinds
+    finally:
+        conn.close()
+
+
+def test_nonzero_and_unknown_exits_do_not_salvage(kanban_home, tmp_path):
+    """Only clean_exit is salvage-eligible; crash/unknown stay crashed."""
+    evidence = tmp_path / "evidence.txt"
+    evidence.write_text("would have been receipt_ok")
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="nonzero", assignee="worker")
+        kb.add_attachment(
+            conn, tid, filename="evidence.txt", stored_path=str(evidence),
+            size=evidence.stat().st_size,
+        )
+        crashed = _drive_nonzero_crash(conn, tid, 424247)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "crashed" in kinds
+        assert "completed_via_clean_exit_salvage" not in kinds
+    finally:
+        conn.close()
+
+
+def test_unknown_pid_dead_does_not_salvage(kanban_home, tmp_path):
+    """pid-dead / unknown is not clean_exit; never salvage."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    evidence = tmp_path / "evidence.txt"
+    evidence.write_text("would have been receipt_ok")
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="pid-dead", assignee="worker")
+        kb.add_attachment(
+            conn, tid, filename="evidence.txt", stored_path=str(evidence),
+            size=evidence.stat().st_size,
+        )
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+        claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+        assert claimed is not None
+        _kbd._set_worker_pid(conn, tid, 424249)
+        original_alive = _kb._pid_alive
+        _kb._pid_alive = lambda p: False
+        try:
+            crashed = _kbd.detect_crashed_workers(conn)
+        finally:
+            _kb._pid_alive = original_alive
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds
+        assert "completed_via_clean_exit_salvage" not in kinds
+    finally:
+        conn.close()
+
+
+def test_rate_limited_exit_does_not_salvage(kanban_home, tmp_path):
+    """Quota-wall rc is not clean_exit even with an observable attachment."""
+    import hermes_cli.kanban_db as _kb
+
+    evidence = tmp_path / "evidence.txt"
+    evidence.write_text("would have been receipt_ok")
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="rl-no-salvage", assignee="worker")
+        kb.add_attachment(
+            conn, tid, filename="evidence.txt", stored_path=str(evidence),
+            size=evidence.stat().st_size,
+        )
+        raw = _kb.KANBAN_RATE_LIMIT_EXIT_CODE << 8
+        crashed = _drive_worker_exit(conn, tid, 424250, raw)
+        assert crashed == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "rate_limited" in kinds
+        assert "completed_via_clean_exit_salvage" not in kinds
+        assert "protocol_violation" not in kinds
+    finally:
+        conn.close()
+
+
+def test_clean_exit_verified_cmd_salvages_from_worker_log(kanban_home):
+    """VERIFIED + command-shaped log line is receipt_ok without attachments."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="verified-cmd", assignee="worker")
+        log_dir = kanban_home / "kanban" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / f"{tid}.log").write_text(
+            "VERIFIED: work landed\n"
+            "git cat-file -e HEAD\n"
+        )
+        crashed = _drive_protocol_violation(conn, tid, 424251)
+        assert crashed == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "protocol_violation" not in kinds
+        assert "completed_via_clean_exit_salvage" in kinds
+    finally:
+        conn.close()
+
+
 
 
 

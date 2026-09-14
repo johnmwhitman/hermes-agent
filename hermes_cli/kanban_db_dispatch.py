@@ -855,9 +855,167 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+def _clean_exit_salvage_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    stderr_tail: str,
+) -> str:
+    """Close-time receipt classifier over the dead worker's leftover prose.
+
+    Returns ``receipt_ok`` / ``hollow`` / ``unobservable``. Any import or
+    classifier exception is hollow — fail closed onto today's protocol-
+    violation path. Never invent a second agent-side nudge.
+    """
+    try:
+        from hermes_cli.kanban_receipt import adapter_verdict_for
+        from hermes_cli.kanban_receipt import _classify_prose
+        from tools.kanban_tools import _receipt_existing_attachments
+    except Exception:
+        return "hollow"
+    try:
+        attachments = _receipt_existing_attachments(conn, task_id)
+        last_summary = ""
+        row = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None:
+            last_summary = row["summary"] or ""
+        prose = _classify_prose(
+            conn,
+            task_id,
+            stderr_tail or "",
+            last_summary or "",
+            attachments,
+        )
+        card = {"result": last_summary or stderr_tail or ""}
+        return adapter_verdict_for(card, prose, attachments)
+    except Exception:
+        return "hollow"
+
+
+def _try_clean_exit_salvage(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    stderr_tail: str,
+) -> bool:
+    """Complete a clean-exit card when the leftover prose is ``receipt_ok``.
+
+    Must run *outside* the reclaim ``write_txn``: ``complete_task`` opens
+    its own write transaction and refuses to nest (post-commit hooks).
+    Returns True only when the card actually moved to ``done``.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running":
+        return False
+    if _clean_exit_salvage_verdict(conn, task_id, stderr_tail) != "receipt_ok":
+        return False
+    summary = (
+        f"salvaged_clean_exit run_id={run_id} source=salvage"
+    )
+    if stderr_tail:
+        summary = f"{summary}\n{stderr_tail}"
+    metadata = {
+        "source": "salvage",
+        "salvaged_clean_exit": True,
+        "salvaged_run_id": run_id,
+    }
+    try:
+        ok = _kb.complete_task(
+            conn,
+            task_id,
+            result=summary,
+            summary=summary,
+            metadata=metadata,
+            expected_run_id=run_id,
+        )
+    except Exception:
+        return False
+    if not ok:
+        return False
+    payload = {
+        "source": "salvage",
+        "salvaged_clean_exit": True,
+        "salvaged_run_id": run_id,
+        "run_id": run_id,
+    }
+    try:
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, task_id, "completed_via_clean_exit_salvage", payload, run_id=run_id,
+            )
+    except Exception:
+        # Card is already done; the salvage event is audit-only.
+        pass
+    return True
+
+
+def _book_dead_worker_crash(
+    conn: sqlite3.Connection,
+    sweep: "_CrashSweep",
+    *,
+    task_id: str,
+    pid: int,
+    claimer: Optional[str],
+    assignee: Optional[str],
+    dead: "_DeadWorker",
+    retry_status: str,
+    stderr_tail: str,
+) -> None:
+    """Close the run as a crash/rate-limit and record it on ``sweep``.
+
+    Caller holds the write txn (or a follow-up txn after a failed salvage).
+    """
+    run_id = _kb._end_run(
+        conn, task_id,
+        outcome=dead.run_outcome, status=dead.run_outcome,
+        summary=stderr_tail or None,
+        error=dead.error_text,
+        metadata=dict(dead.event_payload),
+    )
+    _kb._append_event(conn, task_id, dead.event_kind, dead.event_payload, run_id=run_id)
+    sweep.exited_hook_payloads.append({
+        "task_id": task_id,
+        "assignee": assignee,
+        "run_id": run_id,
+        "worker_pid": pid,
+        "exit_kind": dead.kind,
+        "exit_code": dead.code,
+        "outcome": dead.run_outcome,
+        "retry_status": retry_status,
+    })
+    if dead.rate_limited or dead.protocol_violation:
+        # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
+        # a rate-limited requeue must show ``check_respawn_guard`` a quota
+        # blocker; a below-budget protocol violation never reaches
+        # ``_record_task_failure`` (which stamps this column), yet the
+        # board UI and retry worker need the corrective message.
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            (dead.error_text[:500], task_id),
+        )
+    if dead.rate_limited:
+        sweep.rate_limited.append(task_id)
+    else:
+        sweep.crashed.append(task_id)
+        sweep.crash_details.append(
+            (task_id, pid, claimer, dead.protocol_violation, dead.error_text)
+        )
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
+    # Clean-exit candidates whose CAS already released the claim, but whose
+    # run is still open so ``complete_task`` can close it. Classified *after*
+    # this txn: the receipt classifier does git/fs I/O and ``complete_task``
+    # must not nest inside write_txn.
+    salvage_pending: list[dict] = []
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
@@ -887,6 +1045,22 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             stderr_tail = _worker_stderr_tail(row["id"])
             if stderr_tail:
                 dead.event_payload["stderr_tail"] = stderr_tail
+            # Only rc=0 clean-exit protocol violations are salvage-eligible.
+            # Leave the card ``running`` so complete_task can close it; the
+            # crash CAS would race a sibling dispatcher if we released first.
+            # rate_limited / signaled / nonzero_exit / unknown fall through.
+            if dead.kind == "clean_exit" and dead.protocol_violation:
+                salvage_pending.append({
+                    "task_id": row["id"],
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "assignee": row["assignee"],
+                    "dead": dead,
+                    "retry_status": retry_status,
+                    "stderr_tail": stderr_tail,
+                    "run_id": _kb._current_run_id(conn, row["id"]),
+                })
+                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -896,41 +1070,50 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             )
             if cur.rowcount != 1:
                 continue
-            run_id = _kb._end_run(
-                conn, row["id"],
-                outcome=dead.run_outcome, status=dead.run_outcome,
-                summary=stderr_tail or None,
-                error=dead.error_text,
-                metadata=dict(dead.event_payload),
+            _book_dead_worker_crash(
+                conn, sweep,
+                task_id=row["id"], pid=pid, claimer=row["claim_lock"],
+                assignee=row["assignee"], dead=dead,
+                retry_status=retry_status, stderr_tail=stderr_tail,
             )
-            _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+    for pending in salvage_pending:
+        if _try_clean_exit_salvage(
+            conn,
+            pending["task_id"],
+            run_id=pending["run_id"],
+            stderr_tail=pending["stderr_tail"],
+        ):
             sweep.exited_hook_payloads.append({
-                "task_id": row["id"],
-                "assignee": row["assignee"],
-                "run_id": run_id,
-                "worker_pid": pid,
-                "exit_kind": dead.kind,
-                "exit_code": dead.code,
-                "outcome": dead.run_outcome,
-                "retry_status": retry_status,
+                "task_id": pending["task_id"],
+                "assignee": pending["assignee"],
+                "run_id": pending["run_id"],
+                "worker_pid": pending["pid"],
+                "exit_kind": pending["dead"].kind,
+                "exit_code": pending["dead"].code,
+                "outcome": "completed",
+                "retry_status": "done",
             })
-            if dead.rate_limited or dead.protocol_violation:
-                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
-                # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
-                conn.execute(
-                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                    (dead.error_text[:500], row["id"]),
-                )
-            if dead.rate_limited:
-                sweep.rate_limited.append(row["id"])
-            else:
-                sweep.crashed.append(row["id"])
-                sweep.crash_details.append(
-                    (row["id"], pid, row["claim_lock"], dead.protocol_violation, dead.error_text)
-                )
+            continue
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND worker_pid = ? AND claim_lock IS ?",
+                (
+                    pending["retry_status"], pending["task_id"],
+                    pending["pid"], pending["claimer"],
+                ),
+            )
+            if cur.rowcount != 1:
+                continue
+            _book_dead_worker_crash(
+                conn, sweep,
+                task_id=pending["task_id"], pid=pending["pid"],
+                claimer=pending["claimer"], assignee=pending["assignee"],
+                dead=pending["dead"], retry_status=pending["retry_status"],
+                stderr_tail=pending["stderr_tail"],
+            )
     return sweep
 
 

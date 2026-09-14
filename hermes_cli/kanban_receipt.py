@@ -296,7 +296,36 @@ def _classify_prose(
     receipt_text = "\n".join(part for part in receipt_text_parts if part)
     if repos is None:
         repos = _task_repo_candidates(conn, task_id)
-    return receipt_classify(receipt_text, attachments, repos=repos)
+    classified = receipt_classify(receipt_text, attachments, repos=repos)
+    # Classifier historically omitted attachments; keep both keys populated
+    # so adapter_verdict_for can use either the returned dict or the
+    # explicit attachments list from this wrapper.
+    classified.setdefault("attachments", list(attachments))
+    return classified
+
+
+def adapter_verdict_for(
+    card: dict[str, Any],
+    ev: dict[str, Any],
+    attachments: Iterable[str] | None = None,
+) -> str:
+    """Map ``_receipt_classify`` evidence onto receipt_ok / hollow / unobservable.
+
+    Same mapping as ``profiles/conductor/scripts/kanban_completion_verifier.py``
+    (t_02d3dba9 / 2026-09-13 triage). Installed here so the dispatcher salvage
+    path and the after-the-fact verifier cannot drift.
+    """
+    atts = list(attachments) if attachments is not None else list(ev.get("attachments") or [])
+    if ev.get("existing_paths") or ev.get("existing_shas") or atts:
+        return "receipt_ok"
+    if ev.get("has_verified") and ev.get("has_cmd"):
+        return "receipt_ok"
+    if ev.get("missing_paths"):
+        return "unobservable"
+    result = (card or {}).get("result") or ""
+    if not ev.get("has_verified") and len(str(result).strip()) < 80:
+        return "hollow"
+    return "hollow"
 
 
 # ---------------------------------------------------------------------------
