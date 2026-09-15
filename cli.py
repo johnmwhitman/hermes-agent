@@ -2648,6 +2648,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         )
         # resume must not clobber an explicit -m with the session's stored model.
         self._explicit_model_override = bool(model)
+        self._explicit_provider_override = bool(provider)
         self.model = model or _config_model or ""
         _cfg_provider = _model_config.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER")
         _startup_provider_override = _startup_base_url_override = _startup_api_key_override = ""
@@ -2804,7 +2805,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             except (TypeError, ValueError):
                 pass
 
-        self._fallback_model = [] if model is not None or provider is not None else get_fallback_chain(CLI_CONFIG)
+        self._fallback_model = [] if self._explicit_model_override or self._explicit_provider_override else get_fallback_chain(CLI_CONFIG)
 
     def _init_runtime_state(self, resume):
         """Session store + all per-run mutable state (queues, overlays, pet/voice/status-bar fields)."""

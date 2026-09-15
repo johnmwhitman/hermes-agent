@@ -132,6 +132,44 @@ class TestFallbackChainInit:
 
         assert cli._fallback_model == []
 
+    # Regression for 9e3d6ebda0: _init_prompt_and_reasoning referenced bare
+    # ``model`` / ``provider`` (local names not in scope) instead of
+    # ``self.model`` / ``self.provider``, raising NameError on every
+    # HermesCLI construction that reached the fallback-chain line.
+    # The crash path is: main → _try_fast_chat_launch → cmd_chat →
+    # _build_cli_from_args → HermesCLI.__init__ → _init_model_routing →
+    # _init_prompt_and_reasoning (line 2807).
+    def test_no_model_provider_does_not_raise_NameError(self):
+        """HermesCLI(model=None, provider=None) must not raise NameError.
+
+        Before the fix the fallback-chain line used bare ``model`` /
+        ``provider`` which are not defined in _init_prompt_and_reasoning,
+        causing NameError on every default-model launch.
+        """
+        # This call itself is the regression test — if the bug is present
+        # it raises NameError: name 'model' is not defined at line 2807.
+        cli = _make_cli(config_overrides={
+            "fallback_providers": [
+                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
+            ],
+        })
+        # With no explicit model/provider, the fallback chain should be
+        # loaded (non-empty), proving we reached the else-branch without
+        # crashing AND that config-default model does not suppress fallbacks.
+        assert isinstance(cli._fallback_model, list)
+        assert len(cli._fallback_model) > 0, \
+            "fallback chain must load when no explicit --model/--provider given"
+
+    def test_explicit_model_only_disables_fallbacks(self):
+        """HermesCLI(model='foo', provider=None) — only model set, no crash."""
+        cli = _make_cli(model="test-model")
+        assert cli._fallback_model == []
+
+    def test_explicit_provider_only_disables_fallbacks(self):
+        """HermesCLI(model=None, provider='bar') — only provider set, no crash."""
+        cli = _make_cli(provider="test-provider")
+        assert cli._fallback_model == []
+
 
 class TestBusyInputMode:
     def test_default_busy_input_mode_is_interrupt(self):
