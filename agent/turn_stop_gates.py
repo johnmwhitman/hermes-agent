@@ -90,6 +90,25 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
         return None
 
 
+def _kanban_auto_block(agent, messages) -> Optional[Dict[str, Any]]:
+    """OPT-B: after the nudge budget is exhausted, synthesize a `kanban_block` tool call
+    (and persist it into the messages) so the worker exits with a terminal record —
+    the dispatcher will not re-spawn this task as a protocol_violation. Returns a dict
+    ``{task_id, reason, result}`` for the gate to record the synthetic assistant + tool
+    rows, or ``None`` when the budget is not exhausted / the worker already terminated /
+    the guard is disabled.
+    """
+    try:
+        from agent.kanban_stop import kanban_auto_block_after_exhaustion
+
+        return kanban_auto_block_after_exhaustion(
+            messages=messages, attempts=getattr(agent, "_kanban_stop_nudges", 0)
+        )
+    except Exception:
+        logger.warning("kanban auto-block after-exhaustion check failed", exc_info=True)
+        return None
+
+
 def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
     """Real content: persist and emit as interim so the user sees the attempted answer;
     only the nudge is flagged synthetic (#65919)."""
@@ -167,6 +186,54 @@ def apply_stop_gates(
             "kanban_complete/kanban_block — nudging to finish"
         )
         return verdict
+
+    # OPT-B: when the nudge budget is exhausted AND the worker still hasn't terminated,
+    # synthesize a `kanban_block` call so the conversation ends with a terminal record
+    # (dispatcher will not re-spawn this same task). See agent/kanban_stop.py.
+    _auto_block = _kanban_auto_block(agent, messages)
+    if _auto_block:
+        import json as _json
+        import uuid as _uuid
+        call_id = f"auto_block_{_uuid.uuid4().hex[:12]}"
+        append_message(messages, {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "kanban_block",
+                    "arguments": _json.dumps({
+                        "task_id": _auto_block["task_id"],
+                        "reason": _auto_block["reason"],
+                        "kind": "transient",
+                    }),
+                },
+            }],
+            "_kanban_auto_block_synthetic": True,
+        })
+        append_message(messages, {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": "kanban_block",
+            "content": _auto_block["result"],
+        })
+        final_msg["finish_reason"] = "kanban_auto_blocked"
+        final_msg["_kanban_auto_block_synthetic"] = True
+        logger.info(
+            "kanban auto-block fired (attempts=%d) task=%s — ending turn with synthesized kanban_block",
+            getattr(agent, "_kanban_stop_nudges", 0),
+            _auto_block["task_id"],
+        )
+        agent._emit_status(
+            "⛔ Kanban worker exhausted nudge budget — auto-blocked to prevent re-spawn loop"
+        )
+        return StopGateVerdict(
+            continue_turn=False, final_response=final_response,
+            pending_verification_response=pending_verification_response,
+            pending_verification_response_previewed=pending_verification_response_previewed,
+        )
+
     return StopGateVerdict(
         continue_turn=False, final_response=final_response,
         pending_verification_response=pending_verification_response,
