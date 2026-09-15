@@ -61,16 +61,18 @@ def test_create_blocked_with_kind_stamps_block_kind(kanban_home):
     assert row["block_kind"] == "needs_input"
 
 
-def test_create_blocked_without_kind_keeps_legacy_untyped_path(kanban_home):
-    """Initial-status=blocked without a kind is intentionally still
-    accepted at the create_task layer so older callers / migrations do
-    not break. The CLI arg parser enforces the new contract; the DB
-    layer keeps the schema invariant intact for any other surface.
+def test_create_blocked_without_kind_stamps_default_needs_input(kanban_home):
+    """Initial-status=blocked without a kind used to land as NULL block_kind,
+    which the audit query that filters by kind could not see (24 NULL rows
+    in production). The DB layer now stamps ``needs_input`` as a default so
+    fleet-health bridges, goal-mode judges, and dashboard creation all
+    produce a typed row. The CLI arg parser additionally enforces --kind;
+    this is the safety net for programmatic callers.
     """
     with kb.connect_closing() as conn:
         tid = kb.create_task(
             conn,
-            title="legacy card",
+            title="default-kind card",
             assignee="conductor",
             initial_status="blocked",
         )
@@ -78,7 +80,7 @@ def test_create_blocked_without_kind_keeps_legacy_untyped_path(kanban_home):
             "SELECT status, block_kind FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
     assert row["status"] == "blocked"
-    assert row["block_kind"] is None
+    assert row["block_kind"] == "needs_input"
 
 
 def test_create_with_kind_but_not_blocked_raises(kanban_home):
@@ -137,15 +139,23 @@ def test_create_blocked_event_payload_records_kind(kanban_home):
 
 
 def _make_blocked(conn, *, block_kind=None):
-    """Helper to mint a card in status=blocked via the legacy (untyped)
-    path, mirroring how the 68 NULL-kind cards on the board got there."""
-    return kb.create_task(
+    """Helper to mint a card in status=blocked. When ``block_kind`` is None
+    the helper bypasses the create_task safety net (which now stamps
+    ``needs_input`` by default) by writing NULL directly, so legacy
+    stragglers can still be simulated for retype tests.
+    """
+    tid = kb.create_task(
         conn,
         title="legacy blocked",
         assignee="conductor",
         initial_status="blocked",
         initial_block_kind=block_kind,  # may be None for legacy
     )
+    if block_kind is None:
+        conn.execute(
+            "UPDATE tasks SET block_kind = NULL WHERE id = ?", (tid,)
+        )
+    return tid
 
 
 def test_retype_sets_block_kind_on_untyped_blocked_card(kanban_home):
@@ -293,18 +303,26 @@ def test_cli_create_blocked_with_kind_succeeds(kanban_home):
 
 
 def test_cli_block_retype_repairs_untyped_card(kanban_home):
-    """End-to-end: create an untyped blocked card via the legacy path,
-    then `hermes kanban block --retype --kind` repairs it without
-    rewriting status history."""
+    """End-to-end: create a card via the legacy NULL-kind path (simulating
+    older DB rows that pre-date the schema-tightening patch), then
+    `hermes kanban block --retype --kind` repairs it without rewriting
+    status history. The fix is to backfill block_kind on legacy NULL rows
+    in production (see _record_task_failure / block_task fallbacks).
+    """
     from hermes_cli import kanban as kc
 
-    # Mint a legacy untyped card directly via the DB layer (the CLI
-    # parser now refuses this path; we test the legacy data that
-    # already exists on the board).
+    # Mint a NULL-kind card directly via the DB layer (the CLI parser
+    # now refuses this path; we test the legacy data that already
+    # exists on the board).
     with kb.connect_closing() as conn:
         tid = kb.create_task(
             conn, title="legacy", assignee="conductor",
             initial_status="blocked",
+        )
+        # The new create_task safety net stamps needs_input; force it back
+        # to NULL to simulate a row that pre-dates the safety net.
+        conn.execute(
+            "UPDATE tasks SET block_kind = NULL WHERE id = ?", (tid,)
         )
 
     parser = argparse.ArgumentParser(prog="hermes", add_help=False)
@@ -369,3 +387,85 @@ def test_cli_block_retype_requires_kind(kanban_home, capsys):
     captured = capsys.readouterr()
     assert rc == 2
     assert "--kind" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Schema-tightening fallbacks (t_3339b5b2):
+#   * block_task(kind=None) used to leave block_kind NULL; the goal-mode
+#     judge that ruled t_39a31cf3 unachievable hit this path.
+#   * _record_task_failure() used to flip status='blocked' but never
+#     stamped block_kind; 13 of the 17 NULL-block_kind rows on production
+#     came from there (crash / timeout / protocol-violation gave_up paths).
+#   * create_task(initial_status='blocked', initial_block_kind=None) used
+#     to leave block_kind NULL; 3 production rows came from the legacy path
+#     (fleet-health bridge, dashboard, programmatic).
+# All three fallbacks now stamp a default kind so the audit query that
+# filters by kind sees every blocked card.
+# ---------------------------------------------------------------------------
+
+
+def test_block_task_without_kind_stamps_needs_input(kanban_home):
+    """block_task(kind=None) (the goal-mode judge path) lands with
+    block_kind='needs_input' instead of NULL.
+    """
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="to-be-blocked", assignee="conductor",
+        )
+        ok = kb.block_task(conn, tid, reason="judge gave up", kind=None)
+        assert ok is True
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+    assert row["status"] == "blocked"
+    assert row["block_kind"] == "needs_input"
+
+
+def test_block_task_with_explicit_kind_preserves_it(kanban_home):
+    """The fallback must not overwrite an explicit kind."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="to-be-blocked-typed", assignee="conductor",
+        )
+        ok = kb.block_task(
+            conn, tid, reason="capability gate", kind="capability",
+        )
+        assert ok is True
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+    assert row["status"] == "blocked"
+    assert row["block_kind"] == "capability"
+
+
+def test_record_task_failure_stamps_transient(kanban_home):
+    """The dispatcher's failure breaker trips to status='blocked' but used
+    to leave block_kind NULL. The 13 NULL-kind gave_up rows on production
+    came from this path. Now stamps ``transient`` (the breaker-tripping
+    flavor — same vocabulary ``kanban_block(kind='transient')`` uses).
+    """
+    from hermes_cli.kanban_db_dispatch import _record_task_failure
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="crashing-task", assignee="conductor",
+        )
+        # Claim it (running + claim_lock) so release_claim semantics match.
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock='test', "
+            "current_run_id=1 WHERE id = ?", (tid,)
+        )
+        tripped = _record_task_failure(
+            conn, tid,
+            error="pid 999 not alive without a terminal kanban call",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        assert tripped is True
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+    assert row["status"] == "blocked"
+    assert row["block_kind"] == "transient"

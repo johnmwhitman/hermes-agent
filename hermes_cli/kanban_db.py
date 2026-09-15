@@ -1295,6 +1295,12 @@ def create_task(
                 "initial_block_kind is only meaningful with initial_status="
                 f"'blocked' (got {initial_status!r})"
             )
+    elif initial_status == "blocked":
+        # Programmatic callers that bypass the CLI's --kind gate (the fleet-health
+        # bridge, goal-mode judges, dashboard creation) used to land untyped
+        # blocked cards; stamp a default so the audit query that filters by kind
+        # sees them.
+        initial_block_kind = "needs_input"
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -3349,6 +3355,8 @@ def block_task(
     task escalates. True on any transition."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if kind is None:
+        kind = "needs_input"
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
