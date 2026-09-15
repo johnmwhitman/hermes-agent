@@ -902,8 +902,26 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+            try:
+                return kb.complete_task(
+                    conn, tid, result=args.result, summary=summary, metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    raise_on_production_effect=True,
+                )
+            except kb.ProductionEffectError as pe_err:
+                # Gate is universal — see hermes_cli/kanban_db.complete_task
+                # (t_3b87204e). Surface the structured detail in the CLI error
+                # channel so operators can fix the receipt without losing the
+                # card state.
+                _receipt = pe_err.receipt or {}
+                fail_msg[tid] = (
+                    f"kanban: production_effect gate refused {tid}: "
+                    f"effect={_receipt.get('effect')} "
+                    f"classification={_receipt.get('classification')}: "
+                    f"{_receipt.get('detail', '')} "
+                    f"{_receipt.get('recovery', '')}"
+                ).strip()
+                return False
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 

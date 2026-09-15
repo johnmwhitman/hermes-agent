@@ -7,10 +7,13 @@ Does not open the live kanban.db — all DB tests use in-memory sqlite.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from hermes_cli.kanban_production_effect import (  # noqa: E402
     classify_effect,
@@ -320,6 +323,280 @@ def test_dashboard_helper_does_not_break_when_column_absent():
     conn = _fresh_conn()
     counts = count_effects(conn)
     assert set(counts) == {"production", "enabling", "internal"}
+
+
+# ---------------------------------------------------------------------------
+# CLI / dispatcher path gate (t_3b87204e)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _prod_effect_db(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with a kanban DB that has the production_effect column."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        from hermes_cli.kanban_production_effect import migrate_add_column
+        migrate_add_column(conn)
+    return home
+
+
+def test_cli_complete_production_card_refused_without_deploy_evidence(_prod_effect_db):
+    """``hermes kanban complete <production card>`` must refuse when no
+    deploy evidence is provided — the gate now lives in ``complete_task``
+    itself, not only in the agent tool path.
+
+    This is the regression test for t_3b87204e: before the fix, the CLI
+    path (``hermes_cli/kanban.py:_cmd_complete``) called
+    ``kb.complete_task`` directly with no production_effect check, so a
+    production card could be closed from the CLI without any deploy
+    artifact.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="prod deploy", assignee="dev", production_effect="production")
+        # Simulate a running task so complete_task accepts the transition.
+        kb.claim_task(conn, tid)
+
+    with kbc.connect_closing() as conn:
+        ok = kb.complete_task(
+            conn, tid,
+            result="shipped to production",
+            summary="shipped to production",
+        )
+    assert not ok, (
+        "complete_task must refuse a production card with no deploy evidence; "
+        "this is the Q25 gate bypass (t_3b87204e)."
+    )
+
+
+def test_cli_complete_production_card_accepted_with_deploy_evidence(_prod_effect_db):
+    """When deploy evidence IS provided, the CLI path must succeed."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="prod deploy", assignee="dev", production_effect="production")
+        kb.claim_task(conn, tid)
+
+    with kbc.connect_closing() as conn:
+        ok = kb.complete_task(
+            conn, tid,
+            result="VERIFIED\ndeploy_id: dpl_abc123\ngit log --oneline -1",
+            summary="deploy_id: dpl_abc123",
+            metadata={"production_artifact": {"kind": "deploy_id", "value": "dpl_abc123"}},
+        )
+    assert ok, "complete_task must accept a production card with valid deploy evidence."
+
+
+def test_cli_complete_internal_card_unaffected(_prod_effect_db):
+    """Internal cards (NULL/internal production_effect) must pass the gate unchanged."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="internal task", assignee="dev")
+        kb.claim_task(conn, tid)
+
+    with kbc.connect_closing() as conn:
+        ok = kb.complete_task(
+            conn, tid,
+            result="VERIFIED\ndone with internal work\ngit log --oneline -1",
+            summary="internal task completed",
+        )
+    assert ok, "complete_task must accept internal cards without deploy evidence."
+
+
+def test_cli_complete_enabling_card_refused_without_unblocks(_prod_effect_db):
+    """An enabling card must name the production card it unblocks."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="enabling task", assignee="dev", production_effect="enabling")
+        kb.claim_task(conn, tid)
+
+    with kbc.connect_closing() as conn:
+        ok = kb.complete_task(
+            conn, tid,
+            result="VERIFIED\nwired the token\ngit log --oneline -1",
+            summary="enabling task done",
+        )
+    assert not ok, "complete_task must refuse an enabling card with no unblocks reference."
+
+
+def test_complete_task_emits_blocked_audit_event(_prod_effect_db):
+    """The gate must leave an auditable ``completion_blocked_production_effect``
+    event so operators can trace refusals even when the caller swallows the
+    receipt (dispatcher salvage path, scripts, batch completers). Without
+    this event the only evidence of a refusal would be a log line.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="prod deploy", assignee="dev", production_effect="production")
+        kb.claim_task(conn, tid)
+
+    with kbc.connect_closing() as conn:
+        kb.complete_task(
+            conn, tid,
+            result="shipped without evidence",
+            summary="shipped without evidence",
+        )
+
+    with kbc.connect_closing() as conn:
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+    blocked = [e for e in events if e["kind"] == "completion_blocked_production_effect"]
+    assert len(blocked) == 1, f"expected exactly one blocked event, got {events!r}"
+    payload = json.loads(blocked[0]["payload"])
+    assert payload["effect"] == "production"
+    assert payload["classification"] == "missing"
+    assert "production artifact" in payload["detail"]
+
+
+def test_complete_task_raises_when_opted_in(_prod_effect_db):
+    """Callers that want the structured receipt (CLI, tool) pass
+    ``raise_on_production_effect=True`` and get a
+    :class:`kb.ProductionEffectError` carrying the receipt dict.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="prod deploy", assignee="dev", production_effect="production")
+        kb.claim_task(conn, tid)
+
+    with kbc.connect_closing() as conn:
+        with pytest.raises(kb.ProductionEffectError) as excinfo:
+            kb.complete_task(
+                conn, tid,
+                result="shipped",
+                summary="shipped",
+                raise_on_production_effect=True,
+            )
+    receipt = excinfo.value.receipt
+    assert receipt["ok"] is False
+    assert receipt["effect"] == "production"
+    assert receipt["classification"] == "missing"
+
+
+def test_cli_complete_surfaces_production_receipt(_prod_effect_db, capsys):
+    """``hermes kanban complete <production card>`` must print the structured
+    production_effect refusal so the operator can fix the receipt. Without
+    the integration test the CLI path could regress to a generic
+    'cannot complete (unknown id or terminal state)' even when
+    ``complete_task`` gates correctly.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="prod deploy", assignee="dev", production_effect="production")
+        kb.claim_task(conn, tid)
+
+    from hermes_cli import kanban as kanban_cli
+    args = argparse.Namespace(
+        task_ids=[tid], summary=None, metadata=None, result="shipped",
+    )
+    rc = kanban_cli._cmd_complete(args)
+    assert rc != 0, f"CLI must exit non-zero on refusal, got rc={rc}"
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "production_effect" in combined, (
+        f"CLI must surface the gate name in its error channel; got: {captured!r}"
+    )
+    assert "production artifact" in combined, (
+        f"CLI must surface the gate's detail; got: {captured!r}"
+    )
+
+
+def test_tool_complete_surfaces_production_receipt(_prod_effect_db, monkeypatch, tmp_path):
+    """The agent tool path (``tools.kanban_tools._handle_complete``) must
+    keep its existing user-facing ``tool_error`` shape after the gate moved
+    from the tool into ``complete_task``. The tool now opts into the
+    exception via ``raise_on_production_effect=True``.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="prod deploy", assignee="dev", production_effect="production")
+        kb.claim_task(conn, tid)
+
+    # Worker-env stubs the tool requires (worker session + run id).
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "dev")
+
+    # Use a receipt-shaped summary + a real artifact path so the upstream
+    # ``_enforce_receipt_on_complete`` gate does not pre-empt our test of
+    # the production_effect gate. The summary must NOT contain
+    # ``deploy_id:``, ``release_tag:``, or ``live_url:`` tokens — those
+    # satisfy the production_effect gate.
+    artifact = tmp_path / "deploy.log"
+    artifact.write_text("released\n")
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": f"VERIFIED done shipped to production\n$ cat {artifact}",
+        "result": f"VERIFIED done shipped to production\n$ cat {artifact}",
+        "metadata": {},
+    })
+    parsed = json.loads(out)
+    assert "error" in parsed, f"expected refusal, got: {parsed}"
+    err = parsed["error"]
+    assert "production_effect" in err, f"expected production_effect in error, got: {err!r}"
+    assert "production" in err
+    assert "missing" in err  # classification
+
+    # Confirm the card was NOT moved to done (gate ran, did not silently pass).
+    with kbc.connect_closing() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] != "done", f"card must remain non-done after refusal; status={row['status']!r}"
+
+
+def test_dispatcher_salvage_path_gated(_prod_effect_db):
+    """The dispatcher salvage path in ``kanban_db_dispatch`` calls
+    ``_kb.complete_task`` directly; with the gate in ``complete_task`` it
+    is now gated too. A production card with no deploy evidence must NOT
+    be salvage-completable.
+
+    This is the third caller — without the gate in ``complete_task``
+    itself, a dispatcher salvage of a production card could bypass
+    the deploy-evidence requirement.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="prod deploy", assignee="dev", production_effect="production")
+        kb.claim_task(conn, tid)
+
+    with kbc.connect_closing() as conn:
+        # complete_task default (raise_on_production_effect=False) returns False.
+        ok = kb.complete_task(
+            conn, tid,
+            result="salvaged_clean_exit run_id=1 source=salvage",
+            summary="salvaged_clean_exit run_id=1 source=salvage",
+            metadata={"source": "salvage", "salvaged_clean_exit": True, "salvaged_run_id": 1},
+        )
+    assert not ok, "salvage path must NOT close a production card with no deploy evidence."
+
+    with kbc.connect_closing() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] != "done", "card must remain non-done after salvage-time gate refusal."
 
 
 if __name__ == "__main__":

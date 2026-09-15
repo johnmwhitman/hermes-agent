@@ -1166,36 +1166,24 @@ def _handle_complete(args: dict, **kw) -> str:
         )
         if receipt_err:
             return receipt_err
-        # production_effect gate (t_066aaaae): a production card must cite a
-        # deploy_id / release_tag / live_url / phase05_receipt; an enabling
-        # card must name the production card it unblocks. NULL/internal and
-        # HERMES_KANBAN_PRODUCTION_EFFECT=off skip this gate (old path).
-        from hermes_cli.kanban_production_effect import enforce_on_complete as _enforce_production_effect
-
-        def _lookup_task_for_pe(task_id: str):
-            row = kb.get_task(conn, task_id)
-            if row is None:
-                return None
-            return {"id": row.id, "production_effect": getattr(row, "production_effect", None)}
-
-        pe_receipt = _enforce_production_effect(
-            getattr(task, "production_effect", None) if task else None,
-            summary=summary or "",
-            result=result or "",
-            metadata=metadata if isinstance(metadata, dict) else {},
-            artifacts=artifacts,
-            lookup_task=_lookup_task_for_pe,
-        )
-        if not pe_receipt["ok"]:
-            return tool_error(
-                f"kanban_complete refused: production_effect={pe_receipt['effect']} "
-                f"{pe_receipt['classification']}: {pe_receipt['detail']} {pe_receipt.get('recovery', '')} "
-                "Card not moved to done."
-            )
+        # production_effect gate lives in hermes_cli.kanban_db.complete_task
+        # (t_3b87204e). The tool opts into the structured-receipt exception
+        # so the user-facing ``tool_error`` keeps its existing shape. The
+        # gate is therefore a single source of truth shared with the CLI
+        # and dispatcher paths.
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid),
+                raise_on_production_effect=True,
+            )
+        except kb.ProductionEffectError as pe_err:
+            receipt = pe_err.receipt
+            return tool_error(
+                f"kanban_complete refused: production_effect={receipt['effect']} "
+                f"{receipt['classification']}: {receipt['detail']} {receipt.get('recovery', '')} "
+                "Card not moved to done."
+            )
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the

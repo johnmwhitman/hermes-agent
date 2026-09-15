@@ -2679,8 +2679,22 @@ class HallucinatedCardsError(ValueError):
         )
 
 
-class ArtifactPreservationError(RuntimeError):
+class ArtifactPreservationError(Exception):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+class ProductionEffectError(Exception):
+    """Raised when a production/enabling card is completed without the required
+    deploy evidence or unblocks reference.
+
+    Carries the receipt dict from ``enforce_on_complete`` so callers (tool,
+    CLI, dispatcher) can surface the structured ``detail`` / ``recovery``
+    fields without re-running the check.
+    """
+
+    def __init__(self, receipt: dict):
+        self.receipt = receipt
+        super().__init__(receipt.get("detail") or "production_effect gate refused")
 
 
 def complete_task(
@@ -2688,6 +2702,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    raise_on_production_effect: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2703,6 +2718,78 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    # production_effect gate (t_3b87204e): moved here from tools/kanban_tools.py
+    # so every caller (CLI, dispatcher, tool) is gated. A production card must
+    # cite a deploy_id / release_tag / live_url / phase05_receipt; an enabling
+    # card must name the production card it unblocks. NULL/internal and
+    # HERMES_KANBAN_PRODUCTION_EFFECT=off skip this gate (old path).
+    #
+    # Default behavior: emit a ``completion_blocked_production_effect`` audit
+    # event and return ``False`` — matching the self-approval and min-runtime
+    # guards above so dispatchers and other non-interactive callers see a
+    # clean refused-completion. Callers that need the structured receipt dict
+    # (CLI / tool) pass ``raise_on_production_effect=True`` to get the
+    # ``ProductionEffectError`` carrying the full receipt.
+    _task_row = conn.execute(
+        "SELECT production_effect FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if _task_row is not None:
+        from hermes_cli.kanban_production_effect import enforce_on_complete as _enforce_pe
+        _effect = _task_row["production_effect"] if "production_effect" in _task_row.keys() else None
+        if _effect is not None:
+            _artifacts_list = []
+            if isinstance(metadata, dict):
+                _art = metadata.get("artifacts")
+                if isinstance(_art, list):
+                    _artifacts_list = [str(p) for p in _art if isinstance(p, str) and p]
+
+            def _lookup_task_for_pe(tid: str):
+                r = get_task(conn, tid)
+                if r is None:
+                    return None
+                return {"id": r.id, "production_effect": getattr(r, "production_effect", None)}
+
+            _pe_receipt = _enforce_pe(
+                _effect,
+                summary=summary or "",
+                result=result or "",
+                metadata=metadata if isinstance(metadata, dict) else {},
+                artifacts=_artifacts_list,
+                lookup_task=_lookup_task_for_pe,
+            )
+            if not _pe_receipt["ok"]:
+                _log.info(
+                    "kanban complete_task: production_effect gate refused task %s "
+                    "(effect=%s, classification=%s): %s",
+                    task_id, _pe_receipt.get("effect"), _pe_receipt.get("classification"),
+                    _pe_receipt.get("detail"),
+                )
+                try:
+                    with write_txn(conn):
+                        _append_event(
+                            conn,
+                            task_id,
+                            "completion_blocked_production_effect",
+                            {
+                                "effect": _pe_receipt.get("effect"),
+                                "classification": _pe_receipt.get("classification"),
+                                "detail": _pe_receipt.get("detail"),
+                                "recovery": _pe_receipt.get("recovery"),
+                                "summary_preview": (
+                                    (summary or result or "").strip().splitlines()[0][:200]
+                                    if (summary or result)
+                                    else None
+                                ),
+                            },
+                        )
+                except Exception:
+                    # Audit-write failure is non-fatal for the gate; the refusal
+                    # is still authoritative. Dispatchers and CLI paths will
+                    # surface the message in their normal failure channel.
+                    pass
+                if raise_on_production_effect:
+                    raise ProductionEffectError(_pe_receipt)
+                return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
