@@ -938,8 +938,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to ``blocked`` for a human. Preserved across unblock so a re-block for
     -- the SAME kind can be recognised as a loop.
     block_kind           TEXT,
-    -- Unblock-loop counter. Incremented each time a task is re-blocked for the
-    -- same truly-blocked reason after having been unblocked. When it reaches
+    -- Unblock-loop counter. Incremented on every re-block of the same task
+    -- (keyed on task_id, not on free-text reason or prev_kind==kind) so the
+    -- breaker fires regardless of how the worker rewords the block reason or
+    -- whether retype_block_kind mutated block_kind. When it reaches
     -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
@@ -3491,19 +3493,34 @@ def _route_block(
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
     as something to "unblock". Every other kind counts unblock-loop
-    recurrences: block_task fires from running/ready/review (AFTER an
-    unblock returned the task to the pool), so a stored ``block_kind``
-    equal to the incoming one means blocked -> unblocked -> re-block for
-    the same cause (un-typed None compares equal to a prior un-typed
-    block). At ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage``
-    for a human.
+    recurrences.
+
+    Recurrence is keyed on ``(task_id, re-block)`` — not on free-text
+    ``reason`` and not on a ``prev_kind == kind`` match. Any re-block of
+    the same task increments the counter; the loop breaker then routes the
+    card to ``triage`` at ``BLOCK_RECURRENCE_LIMIT``. The previous
+    ``prev_kind == kind`` reset was the loophole that let the
+    Overwatch-guardian-verification family bypass the breaker (different
+    ``reason`` strings each cycle, and ``retype_block_kind`` mutating the
+    stored ``block_kind`` would silently zero the counter); see
+    ``tests/hermes_cli/test_kanban_block_loop_regression.py`` for the
+    reproduction. ``prev_kind`` is retained in the function signature and
+    surfaced in the payload so forensic tooling can still see when the
+    re-block's typed reason differs from the prior one.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+    recurrences = prev_recurrences + 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    payload = {
+        "reason": reason,
+        "kind": kind,
+        "prev_kind": prev_kind,
+        "kind_changed": prev_kind != kind,
+        "recurrences": recurrences,
+        "source_status": source_status,
+    }
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
