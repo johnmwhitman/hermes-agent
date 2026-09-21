@@ -1447,12 +1447,8 @@ def _local_openviking_bind(endpoint: str) -> tuple[str, int]:
 
 
 def _openviking_server_log_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        home = get_hermes_home()
-    except Exception:
-        home = Path(os.environ.get("HERMES_HOME", "")).expanduser() if os.environ.get("HERMES_HOME") else Path.home() / ".hermes"
-    return home / _OPENVIKING_SERVER_LOG_RELATIVE_PATH
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / _OPENVIKING_SERVER_LOG_RELATIVE_PATH
 
 
 def _local_openviking_port_is_open(host: str, port: int) -> bool:
@@ -2749,11 +2745,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._turn_count = 0
         hermes_home = str(kwargs.get("hermes_home") or "").strip()
         if not hermes_home:
-            try:
-                from hermes_constants import get_hermes_home
-                hermes_home = str(get_hermes_home())
-            except Exception:
-                hermes_home = str(Path.home() / ".hermes")
+            from hermes_constants import get_hermes_home
+            hermes_home = str(get_hermes_home())
         self._hermes_home = hermes_home
         self._acquire_run_lock()
         self._profile_prefetched_sessions.clear()
