@@ -7191,35 +7191,28 @@ class SlackAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        if os.getenv("SLACK_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        # Interactive fallback when the gateway auth callback is missing.
+        # Same fail-closed gate as gateway authz: a multiplex profile whose
+        # scope omits the allow-all / allowlist must not inherit the process
+        # env (another profile's first-writer value). Platform allow-all is
+        # checked before the allowlist, matching the previous order.
+        from gateway.authz_mixin import _platform_gate_env
+
+        if _platform_gate_env("SLACK_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
             return True
 
-        def _env(name: str) -> str:
-            # Multiplex: profile .env is in secret_scope, not process environ.
-            try:
-                from agent.secret_scope import get_secret
-
-                val = get_secret(name)
-                if val is not None and str(val).strip():
-                    return str(val).strip()
-            except Exception:
-                pass
-            return (os.getenv(name) or "").strip()
-
         allowed_ids = set()
-        platform_allowlist = _env("SLACK_ALLOWED_USERS")
+        platform_allowlist = _platform_gate_env("SLACK_ALLOWED_USERS")
         if platform_allowlist:
             allowed_ids.update(uid.strip() for uid in platform_allowlist.split(",") if uid.strip())
-        global_allowlist = _env("GATEWAY_ALLOWED_USERS")
+        global_allowlist = _platform_gate_env("GATEWAY_ALLOWED_USERS")
         if global_allowlist:
             allowed_ids.update(uid.strip() for uid in global_allowlist.split(",") if uid.strip())
 
         if allowed_ids:
             return "*" in allowed_ids or normalized_user_id in allowed_ids
 
-        if _env("SLACK_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
-            return True
-        return _env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
+        return _platform_gate_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""

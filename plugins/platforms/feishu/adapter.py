@@ -139,6 +139,17 @@ from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
 
 
+def _gate_env(name: str, default: str = "") -> str:
+    """Read a Feishu allow/deny gate through the profile secret scope.
+
+    Delegates to ``gateway.authz_mixin._platform_gate_env``. Under multiplex
+    a scoped miss returns ``default`` and does not borrow ``os.environ``.
+    """
+    from gateway.authz_mixin import _platform_gate_env
+
+    return _platform_gate_env(name, default)
+
+
 def _get_scoped_secret(name, default=None):
     """Scope-aware credential read with the default-profile startup fallback.
 
@@ -1591,7 +1602,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Env-only so adapter and gateway auth bypass share one source; yaml
         # feishu.allow_bots is bridged to this env var at config load.
-        allow_bots = os.getenv("FEISHU_ALLOW_BOTS", "none").strip().lower()
+        allow_bots = _gate_env("FEISHU_ALLOW_BOTS", "none").lower()
         if allow_bots not in {"none", "mentions", "all"}:
             logger.warning(
                 "[Feishu] Unknown allow_bots=%r, falling back to 'none'. Valid: none, mentions, all.",
@@ -1610,10 +1621,10 @@ class FeishuAdapter(BasePlatformAdapter):
             verification_token=str(
                 extra.get("verification_token") or _get_scoped_secret("FEISHU_VERIFICATION_TOKEN", "")
             ).strip(),
-            group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
+            group_policy=_gate_env("FEISHU_GROUP_POLICY", "allowlist").lower(),
             allowed_group_users=frozenset(
                 item.strip()
-                for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
+                for item in _gate_env("FEISHU_ALLOWED_USERS").split(",")
                 if item.strip()
             ),
             bot_open_id=os.getenv("FEISHU_BOT_OPEN_ID", "").strip(),
@@ -4371,9 +4382,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
-            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if _gate_env("FEISHU_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
                 return None
-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if _gate_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
                 return None
             # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
             # forward DMs to gateway intake so the pairing handshake can run.
