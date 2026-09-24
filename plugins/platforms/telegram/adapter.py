@@ -7390,7 +7390,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("Failed to write update response from callback: %s", exc)
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
-    # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback
+    # Scripts live in <hermes-home>/scripts/gmail-triage/. `arg` from the callback
     # data is always passed as the first positional arg.
     # is_state=True means the verb is a sticky sender-rule change (mute, trust,
     # vip) that should leave the keyboard tappable for follow-on actions.
@@ -7408,6 +7408,10 @@ class TelegramAdapter(BasePlatformAdapter):
         "vip":          ("vip-add.sh",         ["email"],  "✓ marked VIP",         True),
         "vip-domain":   ("vip-add.sh",         ["domain"], "✓ marked VIP domain",  True),
     }
+
+    def _gmail_triage_script_path(self, script_name: str) -> _Path:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "scripts" / "gmail-triage" / script_name
 
     async def _handle_gmail_triage_callback(
         self,
@@ -7443,7 +7447,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         script_name, extra_args, success_label, is_state_verb = entry
 
-        script_path = _Path.home() / ".hermes" / "scripts" / "gmail-triage" / script_name
+        script_path = self._gmail_triage_script_path(script_name)
         if not script_path.exists():
             await query.answer(text=f"❌ {script_name} missing")
             logger.error("[%s] gmail-triage script missing: %s", self.name, script_path)
